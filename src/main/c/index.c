@@ -458,6 +458,54 @@ static unsigned long write_tree_recursive(gut_oid *out, gut_index_entry *entries
     return 0;
 }
 
+/* Recursive helper for index_read_tree */
+static unsigned long read_tree_recursive(gut_index *idx, gut_odb *odb,
+                                         gut_oid *tree_oid, const char *prefix) {
+    gut_object obj;
+    gut_tree tree;
+    u64 i;
+    unsigned long rc;
+
+    rc = odb_read(&obj, odb, tree_oid);
+    if (rc) return __LINE__;
+    if (obj.type != GUT_OBJ_TREE) { object_destroy(&obj); return __LINE__; }
+
+    rc = tree_parse(&tree, obj.data.data, obj.data.len);
+    object_destroy(&obj);
+    if (rc) return __LINE__;
+
+    for (i = 0; i < tree.count; i++) {
+        if (tree.entries[i].mode == 040000) {
+            /* Subtree: recurse with extended prefix */
+            char sub_prefix[2048];
+            snprintf(sub_prefix, sizeof(sub_prefix), "%s%s/", prefix, tree.entries[i].name);
+            rc = read_tree_recursive(idx, odb, &tree.entries[i].oid, sub_prefix);
+            if (rc) { tree_destroy(&tree); return __LINE__; }
+        } else {
+            /* File entry: add to index */
+            char full_path[2048];
+            snprintf(full_path, sizeof(full_path), "%s%s", prefix, tree.entries[i].name);
+            rc = index_add(idx, full_path, &tree.entries[i].oid,
+                           tree.entries[i].mode, 0, 0);
+            if (rc) { tree_destroy(&tree); return __LINE__; }
+        }
+    }
+
+    tree_destroy(&tree);
+    return 0;
+}
+
+unsigned long index_read_tree(gut_index *out, gut_odb *odb, gut_oid *tree_oid) {
+    if (!out) return __LINE__;
+    if (!odb) return __LINE__;
+    if (!tree_oid) return __LINE__;
+
+    /* Initialize fresh index (caller must destroy old index if needed) */
+    index_init(out);
+
+    return read_tree_recursive(out, odb, tree_oid, "");
+}
+
 unsigned long index_write_tree(gut_oid *out, gut_index *idx, const char *objects_dir) {
     if (!out) return __LINE__;
     if (!idx) return __LINE__;

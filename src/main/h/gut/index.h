@@ -3,6 +3,7 @@
 
 #include "gut/types.h"
 #include "gut/oid.h"
+#include "gut/odb.h"
 
 /*
  * Git index (version 2) binary format:
@@ -60,6 +61,10 @@ unsigned long index_find(u64 *pos, gut_index *idx, const char *path);
 
 /* Free all index memory */
 unsigned long index_destroy(gut_index *idx);
+
+/* Populate index from a tree OID by recursively walking subtrees.
+ * Clears any existing entries first. */
+unsigned long index_read_tree(gut_index *out, gut_odb *odb, gut_oid *tree_oid);
 
 /* Build a tree hierarchy from the index and write to ODB.
  * Returns the root tree OID. */

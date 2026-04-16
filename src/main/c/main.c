@@ -2,6 +2,7 @@
 #include "gut/oid.h"
 #include "gut/object.h"
 #include "gut/index.h"
+#include "gut/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,13 @@ static void usage(void) {
         "Commands:\n"
         "   init        Create an empty gut repository\n"
         "   add         Add file contents to the index\n"
+        "   unadd       Remove file from the index (keep working tree)\n"
+        "   rm          Remove file from index and working tree\n"
+        "   branch      Create or delete a branch\n"
+        "   branches    List all branches\n"
+        "   tag         Create a lightweight tag\n"
+        "   tags        List all tags\n"
+        "   checkout    Switch branches\n"
         "   commit      Record changes to the repository\n"
         "   log         Show commit logs\n"
         "   status      Show the working tree status\n"
@@ -32,12 +40,36 @@ static void usage(void) {
     );
 }
 
-/* Normalize path separators to forward slashes and make relative to repo root */
+/* Normalize path separators to forward slashes */
 static void normalize_path(char *path) {
     char *p;
     for (p = path; *p; p++) {
         if (*p == '\\') *p = '/';
     }
+}
+
+/* Compute a path relative to repo root from an argv argument */
+static void make_relative(char *rel_out, size_t rel_size,
+                          const char *arg, const char *cwd,
+                          const char *root_dir) {
+    char full[2048];
+    if (arg[0] == '/' || (arg[0] != '\0' && arg[1] == ':')) {
+        snprintf(full, sizeof(full), "%s", arg);
+    } else {
+        snprintf(full, sizeof(full), "%s/%s", cwd, arg);
+    }
+    normalize_path(full);
+    {
+        size_t root_len = strlen(root_dir);
+        if (strncmp(full, root_dir, root_len) == 0) {
+            const char *rel = full + root_len;
+            if (*rel == '/' || *rel == '\\') rel++;
+            snprintf(rel_out, rel_size, "%s", rel);
+        } else {
+            snprintf(rel_out, rel_size, "%s", arg);
+        }
+    }
+    normalize_path(rel_out);
 }
 
 static int cmd_init(int argc, char **argv) {
@@ -238,6 +270,610 @@ static int cmd_cat_file(int argc, char **argv) {
 
 /* ---- gut add ---- */
 
+/* ---- helpers ---- */
+
+#include <dirent.h>
+
+typedef void (*dir_callback)(const char *name, void *ctx);
+
+static void list_dir(const char *dir_path, dir_callback cb, void *ctx) {
+    DIR *d = opendir(dir_path);
+    struct dirent *ent;
+    if (!d) return;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        cb(ent->d_name, ctx);
+    }
+    closedir(d);
+}
+
+/* ---- gut unadd / unstage ---- */
+
+static int cmd_unadd(int argc, char **argv) {
+    gut_repo repo;
+    gut_index idx;
+    char cwd[2048];
+    char index_path[2048];
+    unsigned long rc;
+    int i;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut unadd <file>...\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&idx, index_path);
+    if (rc) {
+        fprintf(stderr, "error: cannot read index (line %lu)\n", rc);
+        return 1;
+    }
+
+    for (i = 0; i < argc; i++) {
+        char rel_path[2048];
+        make_relative(rel_path, sizeof(rel_path), argv[i], cwd, repo.root_dir);
+
+        rc = index_remove(&idx, rel_path);
+        if (rc) {
+            fprintf(stderr, "error: pathspec '%s' did not match any known files\n", argv[i]);
+            index_destroy(&idx);
+            return 1;
+        }
+    }
+
+    rc = index_write(&idx, index_path);
+    index_destroy(&idx);
+    if (rc) {
+        fprintf(stderr, "error: cannot write index (line %lu)\n", rc);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ---- gut rm ---- */
+
+static int cmd_rm(int argc, char **argv) {
+    gut_repo repo;
+    gut_index idx;
+    char cwd[2048];
+    char index_path[2048];
+    unsigned long rc;
+    int i;
+    int cached_only = 0;
+    int file_start = 0;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut rm [--cached] <file>...\n");
+        return 1;
+    }
+
+    /* Parse --cached flag */
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--cached") == 0) {
+            cached_only = 1;
+        } else {
+            break;
+        }
+    }
+    file_start = i;
+
+    if (file_start >= argc) {
+        fprintf(stderr, "usage: gut rm [--cached] <file>...\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&idx, index_path);
+    if (rc) {
+        fprintf(stderr, "error: cannot read index (line %lu)\n", rc);
+        return 1;
+    }
+
+    for (i = file_start; i < argc; i++) {
+        char rel_path[2048];
+        make_relative(rel_path, sizeof(rel_path), argv[i], cwd, repo.root_dir);
+
+        rc = index_remove(&idx, rel_path);
+        if (rc) {
+            fprintf(stderr, "error: pathspec '%s' did not match any known files\n", argv[i]);
+            index_destroy(&idx);
+            return 1;
+        }
+
+        if (!cached_only) {
+            char full_path[2048];
+            snprintf(full_path, sizeof(full_path), "%s/%s", repo.root_dir, rel_path);
+            remove(full_path);
+        }
+    }
+
+    rc = index_write(&idx, index_path);
+    index_destroy(&idx);
+    if (rc) {
+        fprintf(stderr, "error: cannot write index (line %lu)\n", rc);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ---- gut branch ---- */
+
+static int cmd_branch(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid head_oid;
+    char cwd[2048];
+    char ref_path[2048];
+    char head_ref[256];
+    char hex[GUT_OID_HEX_SIZE + 2];
+    unsigned long rc;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut branch [-d] <name>\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    /* Delete branch */
+    if (argc >= 2 && strcmp(argv[0], "-d") == 0) {
+        const char *name = argv[1];
+
+        /* Refuse to delete current branch */
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc == 0) {
+            char current_ref[256];
+            snprintf(current_ref, sizeof(current_ref), "refs/heads/%s", name);
+            if (strcmp(head_ref, current_ref) == 0) {
+                fprintf(stderr, "error: cannot delete branch '%s' checked out at HEAD\n", name);
+                return 1;
+            }
+        }
+
+        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, name);
+        if (remove(ref_path) != 0) {
+            fprintf(stderr, "error: branch '%s' not found\n", name);
+            return 1;
+        }
+        printf("Deleted branch %s\n", name);
+        return 0;
+    }
+
+    /* Create branch */
+    {
+        const char *name = argv[0];
+        struct stat st;
+
+        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, name);
+        if (stat(ref_path, &st) == 0) {
+            fprintf(stderr, "fatal: a branch named '%s' already exists\n", name);
+            return 1;
+        }
+
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc) {
+            fprintf(stderr, "error: cannot read HEAD\n");
+            return 1;
+        }
+        rc = repo_resolve_ref(&head_oid, &repo, head_ref);
+        if (rc) {
+            fprintf(stderr, "fatal: not a valid object name: 'HEAD'\n");
+            return 1;
+        }
+
+        rc = oid_to_hex(hex, &head_oid);
+        if (rc) return 1;
+        hex[GUT_OID_HEX_SIZE] = '\n';
+        hex[GUT_OID_HEX_SIZE + 1] = '\0';
+
+        {
+            FILE *fp = fopen(ref_path, "w");
+            if (!fp) {
+                fprintf(stderr, "error: cannot create branch '%s'\n", name);
+                return 1;
+            }
+            fputs(hex, fp);
+            fclose(fp);
+        }
+    }
+
+    return 0;
+}
+
+/* ---- gut branches ---- */
+
+struct branches_ctx {
+    const char *current;  /* e.g. "main" */
+};
+
+static void print_branch(const char *name, void *ctx) {
+    struct branches_ctx *bc = (struct branches_ctx *)ctx;
+    if (bc->current && strcmp(name, bc->current) == 0) {
+        printf("* %s\n", name);
+    } else {
+        printf("  %s\n", name);
+    }
+}
+
+static int cmd_branches(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char heads_dir[2048];
+    char head_ref[256];
+    struct branches_ctx ctx;
+    unsigned long rc;
+
+    (void)argc; (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    ctx.current = NULL;
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc == 0 && strncmp(head_ref, "refs/heads/", 11) == 0) {
+        ctx.current = head_ref + 11;
+    }
+
+    snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.git_dir);
+    list_dir(heads_dir, print_branch, &ctx);
+
+    return 0;
+}
+
+/* ---- gut tag ---- */
+
+static int cmd_tag(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid target;
+    char cwd[2048];
+    char ref_path[2048];
+    char hex[GUT_OID_HEX_SIZE + 2];
+    unsigned long rc;
+    struct stat st;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut tag <name> [<commit>]\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    snprintf(ref_path, sizeof(ref_path), "%s/refs/tags/%s", repo.git_dir, argv[0]);
+    if (stat(ref_path, &st) == 0) {
+        fprintf(stderr, "fatal: tag '%s' already exists\n", argv[0]);
+        return 1;
+    }
+
+    if (argc >= 2) {
+        /* Tag specific commit */
+        rc = oid_from_hex(&target, argv[1]);
+        if (rc) {
+            fprintf(stderr, "error: invalid object name '%s'\n", argv[1]);
+            return 1;
+        }
+    } else {
+        /* Tag HEAD */
+        char head_ref[256];
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+        rc = repo_resolve_ref(&target, &repo, head_ref);
+        if (rc) { fprintf(stderr, "fatal: not a valid object name: 'HEAD'\n"); return 1; }
+    }
+
+    rc = oid_to_hex(hex, &target);
+    if (rc) return 1;
+    hex[GUT_OID_HEX_SIZE] = '\n';
+    hex[GUT_OID_HEX_SIZE + 1] = '\0';
+
+    {
+        FILE *fp = fopen(ref_path, "w");
+        if (!fp) {
+            fprintf(stderr, "error: cannot create tag '%s'\n", argv[0]);
+            return 1;
+        }
+        fputs(hex, fp);
+        fclose(fp);
+    }
+
+    return 0;
+}
+
+/* ---- gut tags ---- */
+
+static void print_tag(const char *name, void *ctx) {
+    (void)ctx;
+    printf("%s\n", name);
+}
+
+static int cmd_tags(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char tags_dir[2048];
+    unsigned long rc;
+
+    (void)argc; (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    snprintf(tags_dir, sizeof(tags_dir), "%s/refs/tags", repo.git_dir);
+    list_dir(tags_dir, print_tag, NULL);
+
+    return 0;
+}
+
+/* ---- working tree helpers ---- */
+
+static unsigned long ensure_parent_dirs(const char *file_path) {
+    char tmp[2048];
+    size_t len, i;
+    len = strlen(file_path);
+    if (len >= sizeof(tmp)) return __LINE__;
+    memcpy(tmp, file_path, len + 1);
+    for (i = 1; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+#ifdef _WIN32
+            _mkdir(tmp);
+#else
+            mkdir(tmp, 0755);
+#endif
+            tmp[i] = '/';
+        }
+    }
+    return 0;
+}
+
+static int workdir_write_from_index(gut_repo *repo, gut_index *idx) {
+    u64 i;
+    for (i = 0; i < idx->count; i++) {
+        gut_object obj;
+        char full_path[2048];
+        FILE *fp;
+        unsigned long rc;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s",
+                 repo->root_dir, idx->entries[i].path);
+
+        rc = odb_read(&obj, &repo->odb, &idx->entries[i].oid);
+        if (rc) return 1;
+
+        ensure_parent_dirs(full_path);
+
+        fp = fopen(full_path, "wb");
+        if (!fp) { object_destroy(&obj); return 1; }
+
+        if (obj.data.len > 0) {
+            fwrite(obj.data.data, 1, (size_t)obj.data.len, fp);
+        }
+        fclose(fp);
+        object_destroy(&obj);
+
+        /* Update index stat info */
+        {
+            struct stat st;
+            if (stat(full_path, &st) == 0) {
+                idx->entries[i].mtime_sec = (u32)st.st_mtime;
+                idx->entries[i].file_size = (u32)st.st_size;
+            }
+        }
+    }
+    return 0;
+}
+
+static int workdir_is_dirty(gut_repo *repo, gut_index *idx) {
+    u64 i;
+    for (i = 0; i < idx->count; i++) {
+        char full_path[2048];
+        struct stat st;
+        snprintf(full_path, sizeof(full_path), "%s/%s",
+                 repo->root_dir, idx->entries[i].path);
+        if (stat(full_path, &st) != 0) return 1;
+        if ((u32)st.st_mtime != idx->entries[i].mtime_sec ||
+            (u32)st.st_size != idx->entries[i].file_size) return 1;
+    }
+    return 0;
+}
+
+/* Remove working tree files in old index but not in new index */
+static void workdir_remove_stale(gut_repo *repo, gut_index *old_idx, gut_index *new_idx) {
+    u64 i;
+    for (i = 0; i < old_idx->count; i++) {
+        u64 pos;
+        if (index_find(&pos, new_idx, old_idx->entries[i].path) == 0) {
+            if (pos >= new_idx->count ||
+                strcmp(new_idx->entries[pos].path, old_idx->entries[i].path) != 0) {
+                char full_path[2048];
+                snprintf(full_path, sizeof(full_path), "%s/%s",
+                         repo->root_dir, old_idx->entries[i].path);
+                remove(full_path);
+            }
+        }
+    }
+}
+
+/* ---- gut checkout ---- */
+
+static int cmd_checkout(int argc, char **argv) {
+    gut_repo repo;
+    gut_index old_idx, new_idx;
+    gut_oid target_oid, tree_oid;
+    gut_object commit_obj;
+    gut_commit commit;
+    char cwd[2048];
+    char index_path[2048];
+    char ref_path[2048];
+    char head_path[2048];
+    char head_content[256];
+    unsigned long rc;
+    struct stat st;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut checkout <branch>\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    /* Verify target branch exists */
+    snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, argv[0]);
+    if (stat(ref_path, &st) != 0) {
+        fprintf(stderr, "error: branch '%s' not found\n", argv[0]);
+        return 1;
+    }
+
+    /* Resolve target branch to commit */
+    {
+        char ref_name[256];
+        snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", argv[0]);
+        rc = repo_resolve_ref(&target_oid, &repo, ref_name);
+        if (rc) {
+            fprintf(stderr, "error: cannot resolve branch '%s'\n", argv[0]);
+            return 1;
+        }
+    }
+
+    /* Read target commit to get tree */
+    rc = odb_read(&commit_obj, &repo.odb, &target_oid);
+    if (rc) {
+        fprintf(stderr, "error: cannot read commit (line %lu)\n", rc);
+        return 1;
+    }
+    rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+    object_destroy(&commit_obj);
+    if (rc) {
+        fprintf(stderr, "error: cannot parse commit\n");
+        return 1;
+    }
+    memcpy(tree_oid.bytes, commit.tree_oid.bytes, GUT_OID_RAW_SIZE);
+    commit_destroy(&commit);
+
+    /* Read current index and check for dirty working tree */
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&old_idx, index_path);
+    if (rc) {
+        fprintf(stderr, "error: cannot read index\n");
+        return 1;
+    }
+
+    if (workdir_is_dirty(&repo, &old_idx)) {
+        fprintf(stderr, "error: your local changes would be overwritten by checkout\n");
+        fprintf(stderr, "Please commit or stash them before switching branches.\n");
+        index_destroy(&old_idx);
+        return 1;
+    }
+
+    /* Build new index from target tree */
+    rc = index_read_tree(&new_idx, &repo.odb, &tree_oid);
+    if (rc) {
+        fprintf(stderr, "error: cannot read tree (line %lu)\n", rc);
+        index_destroy(&old_idx);
+        return 1;
+    }
+
+    /* Remove stale files, then write new files */
+    workdir_remove_stale(&repo, &old_idx, &new_idx);
+    index_destroy(&old_idx);
+
+    if (workdir_write_from_index(&repo, &new_idx)) {
+        fprintf(stderr, "error: cannot write working tree\n");
+        index_destroy(&new_idx);
+        return 1;
+    }
+
+    /* Write new index */
+    rc = index_write(&new_idx, index_path);
+    index_destroy(&new_idx);
+    if (rc) {
+        fprintf(stderr, "error: cannot write index\n");
+        return 1;
+    }
+
+    /* Update HEAD */
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", repo.git_dir);
+    snprintf(head_content, sizeof(head_content), "ref: refs/heads/%s\n", argv[0]);
+    {
+        FILE *fp = fopen(head_path, "w");
+        if (!fp) {
+            fprintf(stderr, "error: cannot update HEAD\n");
+            return 1;
+        }
+        fputs(head_content, fp);
+        fclose(fp);
+    }
+
+    printf("Switched to branch '%s'\n", argv[0]);
+    return 0;
+}
+
+/* ---- gut add ---- */
+
 static int cmd_add(int argc, char **argv) {
     gut_repo repo;
     gut_index idx;
@@ -275,32 +911,14 @@ static int cmd_add(int argc, char **argv) {
         char rel_path[2048];
         char full_path[2048];
 
-        /* Build full path */
-        if (argv[i][0] == '/' || (argv[i][0] != '\0' && argv[i][1] == ':')) {
-            snprintf(full_path, sizeof(full_path), "%s", argv[i]);
-        } else {
-            snprintf(full_path, sizeof(full_path), "%s/%s", cwd, argv[i]);
-        }
-        normalize_path(full_path);
+        make_relative(rel_path, sizeof(rel_path), argv[i], cwd, repo.root_dir);
+        snprintf(full_path, sizeof(full_path), "%s/%s", repo.root_dir, rel_path);
 
         if (stat(full_path, &st) != 0) {
             fprintf(stderr, "error: pathspec '%s' did not match any files\n", argv[i]);
             index_destroy(&idx);
             return 1;
         }
-
-        /* Compute relative path from repo root */
-        {
-            size_t root_len = strlen(repo.root_dir);
-            if (strncmp(full_path, repo.root_dir, root_len) == 0) {
-                const char *rel = full_path + root_len;
-                if (*rel == '/' || *rel == '\\') rel++;
-                snprintf(rel_path, sizeof(rel_path), "%s", rel);
-            } else {
-                snprintf(rel_path, sizeof(rel_path), "%s", argv[i]);
-            }
-        }
-        normalize_path(rel_path);
 
         /* Hash and write blob */
         rc = odb_write_file(&oid, &repo.odb, full_path);
@@ -409,13 +1027,30 @@ static int cmd_commit(int argc, char **argv) {
         has_parent = 1;
     }
 
-    /* Build commit object */
+    /* Resolve author: env vars > .git/config > fallback */
     author_name = getenv("GUT_AUTHOR_NAME");
     if (!author_name) author_name = getenv("GIT_AUTHOR_NAME");
-    if (!author_name) author_name = "Unknown";
-
     author_email = getenv("GUT_AUTHOR_EMAIL");
     if (!author_email) author_email = getenv("GIT_AUTHOR_EMAIL");
+    if (!author_name || !author_email) {
+        gut_config cfg;
+        char config_path[2048];
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        if (config_read(&cfg, config_path) == 0) {
+            if (!author_name) {
+                const char *v;
+                if (config_get(&v, &cfg, "user", "name") == 0)
+                    author_name = v;
+            }
+            if (!author_email) {
+                const char *v;
+                if (config_get(&v, &cfg, "user", "email") == 0)
+                    author_email = v;
+            }
+            /* Note: cfg lifetime covers commit build below; destroyed after use */
+        }
+    }
+    if (!author_name) author_name = "Unknown";
     if (!author_email) author_email = "unknown@example.com";
 
     now = time(NULL);
@@ -702,6 +1337,27 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "unadd") == 0 || strcmp(argv[1], "unstage") == 0) {
+        return cmd_unadd(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "rm") == 0) {
+        return cmd_rm(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "branch") == 0) {
+        return cmd_branch(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "branches") == 0) {
+        return cmd_branches(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "tag") == 0) {
+        return cmd_tag(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "tags") == 0) {
+        return cmd_tags(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "checkout") == 0) {
+        return cmd_checkout(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "commit") == 0) {
         return cmd_commit(argc - 2, argv + 2);
