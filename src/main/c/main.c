@@ -4,7 +4,7 @@
 #include "gut/index.h"
 #include "gut/config.h"
 #include "gut/ignore.h"
-#include "gut/diff.h"
+#include "apennines/diff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +34,7 @@ static void usage(void) {
         "   tag         Create a lightweight tag\n"
         "   tags        List all tags\n"
         "   checkout    Switch branches\n"
+        "   merge       Merge a branch into the current branch\n"
         "   diff        Show changes between working tree and index\n"
         "   commit      Record changes to the repository\n"
         "   log         Show commit logs\n"
@@ -1222,26 +1223,58 @@ static int cmd_log(int argc, char **argv) {
 
 /* ---- gut diff ---- */
 
+/* Print a unified diff hunk using apennines diff_result.
+ * The apennines diff_result has edits with off_a/off_b (line indices) and len. */
 static void diff_file_pair(const char *path, const u8 *old_data, u64 old_len,
                            const u8 *new_data, u64 new_len) {
-    char **old_lines = NULL, **new_lines = NULL;
-    u8 *old_buf = NULL, *new_buf = NULL;
-    u64 old_count = 0, new_count = 0;
     diff_result result;
+    unsigned long rc;
 
-    diff_split_lines(&old_lines, &old_count, &old_buf, old_data, old_len);
-    diff_split_lines(&new_lines, &new_count, &new_buf, new_data, new_len);
+    /* Use apennines patience diff (git's default algorithm) */
+    rc = diff_patience(&result,
+                       (const char *)old_data, old_len,
+                       (const char *)new_data, new_len);
+    if (rc) return;
 
-    if (diff_myers(&result, old_lines, old_count, new_lines, new_count) == 0) {
-        diff_print_unified(path, path, &result,
-                           old_lines, old_count, new_lines, new_count, 3);
-        diff_destroy(&result);
+    /* Check if there are any actual changes */
+    {
+        int has_changes = 0;
+        u64 i;
+        for (i = 0; i < result.len; i++) {
+            if (result.edits[i].op != DIFF_EQUAL) { has_changes = 1; break; }
+        }
+        if (!has_changes) { diff_destroy(&result); return; }
     }
 
-    free(old_lines);
-    free(old_buf);
-    free(new_lines);
-    free(new_buf);
+    /* Use apennines format_unified for output.
+     * It writes to a pre-allocated buffer, so estimate size. */
+    {
+        u64 buf_size = old_len + new_len + result.len * 80 + 256;
+        char *buf = (char *)malloc((size_t)buf_size);
+        u64 out_len = 0;
+        if (!buf) { diff_destroy(&result); return; }
+
+        /* Write header ourselves (apennines uses generic "a"/"b" labels) */
+        printf("--- a/%s\n+++ b/%s\n", path, path);
+
+        rc = diff_format_unified(buf, buf_size, &out_len,
+                                 (const char *)old_data, old_len,
+                                 (const char *)new_data, new_len,
+                                 &result, 3);
+        if (rc == 0 && out_len > 0) {
+            /* Skip the "--- a\n+++ b\n" that apennines prepends */
+            char *body = buf;
+            char *hunk = strstr(body, "@@ ");
+            if (hunk) {
+                fwrite(hunk, 1, out_len - (u64)(hunk - body), stdout);
+            } else {
+                fwrite(buf, 1, (size_t)out_len, stdout);
+            }
+        }
+        free(buf);
+    }
+
+    diff_destroy(&result);
 }
 
 static int cmd_diff(int argc, char **argv) {
@@ -2054,6 +2087,466 @@ static int cmd_reset(int argc, char **argv) {
     return 0;
 }
 
+/* ---- merge base finder ---- */
+
+/* Collect all ancestor OIDs from a commit by walking first-parents.
+ * Returns a malloc'd array of OIDs. */
+static gut_oid *collect_ancestors(gut_odb *odb, gut_oid *start, u64 *count) {
+    u64 cap = 64;
+    u64 n = 0;
+    gut_oid *list = (gut_oid *)malloc(cap * sizeof(gut_oid));
+    gut_oid current;
+    if (!list) return NULL;
+
+    memcpy(current.bytes, start->bytes, GUT_OID_RAW_SIZE);
+
+    while (1) {
+        gut_object obj;
+        gut_commit commit;
+        unsigned long rc;
+
+        if (n >= cap) {
+            cap *= 2;
+            list = (gut_oid *)realloc(list, cap * sizeof(gut_oid));
+            if (!list) return NULL;
+        }
+        memcpy(list[n].bytes, current.bytes, GUT_OID_RAW_SIZE);
+        n++;
+
+        rc = odb_read(&obj, odb, &current);
+        if (rc) break;
+        rc = commit_parse(&commit, obj.data.data, obj.data.len);
+        object_destroy(&obj);
+        if (rc) break;
+
+        if (commit.parent_count == 0) { commit_destroy(&commit); break; }
+        memcpy(current.bytes, commit.parent_oids[0].bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&commit);
+    }
+
+    *count = n;
+    return list;
+}
+
+/* Find merge base: first common ancestor between two commits */
+static int find_merge_base(gut_oid *out, gut_odb *odb,
+                           gut_oid *ours, gut_oid *theirs) {
+    gut_oid *a_list;
+    u64 a_count, i;
+    gut_oid current;
+
+    a_list = collect_ancestors(odb, ours, &a_count);
+    if (!a_list) return 1;
+
+    /* Walk theirs chain, checking against ours set */
+    memcpy(current.bytes, theirs->bytes, GUT_OID_RAW_SIZE);
+    while (1) {
+        gut_object obj;
+        gut_commit commit;
+        unsigned long rc;
+        long cmp;
+
+        for (i = 0; i < a_count; i++) {
+            oid_compare(&cmp, &current, &a_list[i]);
+            if (cmp == 0) {
+                memcpy(out->bytes, current.bytes, GUT_OID_RAW_SIZE);
+                free(a_list);
+                return 0;
+            }
+        }
+
+        rc = odb_read(&obj, odb, &current);
+        if (rc) break;
+        rc = commit_parse(&commit, obj.data.data, obj.data.len);
+        object_destroy(&obj);
+        if (rc) break;
+
+        if (commit.parent_count == 0) { commit_destroy(&commit); break; }
+        memcpy(current.bytes, commit.parent_oids[0].bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&commit);
+    }
+
+    free(a_list);
+    return 1; /* no common ancestor */
+}
+
+/* ---- gut merge ---- */
+
+static int cmd_merge(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid our_oid, their_oid, base_oid;
+    char cwd[2048];
+    char head_ref[256];
+    char hex[GUT_OID_HEX_SIZE + 1];
+    unsigned long rc;
+    long cmp;
+    const char *branch_name;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut merge <branch>\n");
+        return 1;
+    }
+    branch_name = argv[0];
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    /* Resolve HEAD */
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    rc = repo_resolve_ref(&our_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: HEAD not valid\n"); return 1; }
+
+    /* Resolve target branch */
+    {
+        char ref[256];
+        snprintf(ref, sizeof(ref), "refs/heads/%s", branch_name);
+        rc = repo_resolve_ref(&their_oid, &repo, ref);
+        if (rc) {
+            fprintf(stderr, "fatal: branch '%s' not found\n", branch_name);
+            return 1;
+        }
+    }
+
+    /* Already up to date? */
+    oid_compare(&cmp, &our_oid, &their_oid);
+    if (cmp == 0) {
+        printf("Already up to date.\n");
+        return 0;
+    }
+
+    /* Find merge base */
+    if (find_merge_base(&base_oid, &repo.odb, &our_oid, &their_oid)) {
+        fprintf(stderr, "fatal: no common ancestor\n");
+        return 1;
+    }
+
+    /* Fast-forward: if base == ours, just move HEAD to theirs */
+    oid_compare(&cmp, &base_oid, &our_oid);
+    if (cmp == 0) {
+        gut_index new_idx;
+        gut_object commit_obj;
+        gut_commit commit;
+        gut_index old_idx;
+        char index_path[2048];
+
+        /* Read theirs commit tree */
+        rc = odb_read(&commit_obj, &repo.odb, &their_oid);
+        if (rc) { fprintf(stderr, "error: cannot read commit\n"); return 1; }
+        rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+        object_destroy(&commit_obj);
+        if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+        snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+        index_read(&old_idx, index_path);
+
+        rc = index_read_tree(&new_idx, &repo.odb, &commit.tree_oid);
+        commit_destroy(&commit);
+        if (rc) { index_destroy(&old_idx); return 1; }
+
+        workdir_remove_stale(&repo, &old_idx, &new_idx);
+        index_destroy(&old_idx);
+        workdir_write_from_index(&repo, &new_idx);
+
+        index_write(&new_idx, index_path);
+        index_destroy(&new_idx);
+
+        repo_update_ref(&repo, head_ref, &their_oid);
+
+        oid_to_hex(hex, &their_oid);
+        printf("Fast-forward to %.*s\n", 7, hex);
+        return 0;
+    }
+
+    /* Fast-forward: if base == theirs, already up to date */
+    oid_compare(&cmp, &base_oid, &their_oid);
+    if (cmp == 0) {
+        printf("Already up to date.\n");
+        return 0;
+    }
+
+    /* True three-way merge */
+    {
+        gut_object base_commit_obj, our_commit_obj, their_commit_obj;
+        gut_commit base_commit, our_commit, their_commit;
+        gut_oid base_tree, our_tree, their_tree;
+        gut_index base_idx, our_idx, their_idx, merged_idx;
+        char index_path[2048];
+        char obj_dir[2048];
+        gut_oid merge_tree_oid, merge_commit_oid;
+        int has_conflicts = 0;
+        u64 i;
+
+        /* Get trees for all three commits */
+        rc = odb_read(&base_commit_obj, &repo.odb, &base_oid);
+        if (rc) { fprintf(stderr, "error: cannot read base commit\n"); return 1; }
+        commit_parse(&base_commit, base_commit_obj.data.data, base_commit_obj.data.len);
+        object_destroy(&base_commit_obj);
+        memcpy(base_tree.bytes, base_commit.tree_oid.bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&base_commit);
+
+        rc = odb_read(&our_commit_obj, &repo.odb, &our_oid);
+        if (rc) { fprintf(stderr, "error: cannot read our commit\n"); return 1; }
+        commit_parse(&our_commit, our_commit_obj.data.data, our_commit_obj.data.len);
+        object_destroy(&our_commit_obj);
+        memcpy(our_tree.bytes, our_commit.tree_oid.bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&our_commit);
+
+        rc = odb_read(&their_commit_obj, &repo.odb, &their_oid);
+        if (rc) { fprintf(stderr, "error: cannot read their commit\n"); return 1; }
+        commit_parse(&their_commit, their_commit_obj.data.data, their_commit_obj.data.len);
+        object_destroy(&their_commit_obj);
+        memcpy(their_tree.bytes, their_commit.tree_oid.bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&their_commit);
+
+        /* Expand all three trees into indexes */
+        index_read_tree(&base_idx, &repo.odb, &base_tree);
+        index_read_tree(&our_idx, &repo.odb, &our_tree);
+        index_read_tree(&their_idx, &repo.odb, &their_tree);
+
+        /* Build merged index: for each file, three-way merge */
+        index_init(&merged_idx);
+
+        /* Process all files from ours */
+        for (i = 0; i < our_idx.count; i++) {
+            const char *path = our_idx.entries[i].path;
+            u64 base_pos, their_pos;
+            int in_base, in_theirs;
+            gut_oid *our_blob = &our_idx.entries[i].oid;
+
+            index_find(&base_pos, &base_idx, path);
+            in_base = (base_pos < base_idx.count && strcmp(base_idx.entries[base_pos].path, path) == 0);
+            index_find(&their_pos, &their_idx, path);
+            in_theirs = (their_pos < their_idx.count && strcmp(their_idx.entries[their_pos].path, path) == 0);
+
+            if (!in_theirs) {
+                if (in_base) {
+                    /* Deleted by theirs — check if we modified it */
+                    long c;
+                    oid_compare(&c, our_blob, &base_idx.entries[base_pos].oid);
+                    if (c == 0) continue; /* unmodified, accept deletion */
+                    /* Modified by us but deleted by them — conflict */
+                    fprintf(stderr, "CONFLICT (modify/delete): %s\n", path);
+                    has_conflicts = 1;
+                    index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                } else {
+                    /* Added by us only */
+                    index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                }
+                continue;
+            }
+
+            {
+                gut_oid *their_blob = &their_idx.entries[their_pos].oid;
+                long c_ours_theirs, c_ours_base;
+
+                oid_compare(&c_ours_theirs, our_blob, their_blob);
+                if (c_ours_theirs == 0) {
+                    /* Both same — just use ours */
+                    index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                    continue;
+                }
+
+                if (!in_base) {
+                    /* Both added same file differently — conflict */
+                    fprintf(stderr, "CONFLICT (add/add): %s\n", path);
+                    has_conflicts = 1;
+                    index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                    continue;
+                }
+
+                oid_compare(&c_ours_base, our_blob, &base_idx.entries[base_pos].oid);
+                if (c_ours_base == 0) {
+                    /* We didn't change, theirs did — take theirs */
+                    index_add(&merged_idx, path, their_blob, their_idx.entries[their_pos].mode, 0, 0);
+                    continue;
+                }
+
+                {
+                    long c_theirs_base;
+                    oid_compare(&c_theirs_base, their_blob, &base_idx.entries[base_pos].oid);
+                    if (c_theirs_base == 0) {
+                        /* Theirs didn't change, ours did — take ours */
+                        index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+                }
+
+                /* Both modified — three-way content merge */
+                {
+                    gut_object b_obj, o_obj, t_obj;
+                    diff_merge_result mr;
+
+                    if (odb_read(&b_obj, &repo.odb, &base_idx.entries[base_pos].oid) ||
+                        odb_read(&o_obj, &repo.odb, our_blob) ||
+                        odb_read(&t_obj, &repo.odb, their_blob)) {
+                        fprintf(stderr, "error: cannot read blobs for %s\n", path);
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+
+                    rc = diff_three_way(&mr,
+                        (const char *)b_obj.data.data, b_obj.data.len,
+                        (const char *)o_obj.data.data, o_obj.data.len,
+                        (const char *)t_obj.data.data, t_obj.data.len,
+                        "HEAD", branch_name,
+                        DIFF_MERGE_STYLE_STANDARD);
+
+                    object_destroy(&b_obj);
+                    object_destroy(&o_obj);
+                    object_destroy(&t_obj);
+
+                    if (rc) {
+                        fprintf(stderr, "error: merge failed for %s\n", path);
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob, our_idx.entries[i].mode, 0, 0);
+                    } else {
+                        /* Write merged content as blob */
+                        gut_oid merged_blob;
+                        odb_write(&merged_blob, &repo.odb, GUT_OBJ_BLOB,
+                                  (u8 *)mr.data, mr.len);
+                        index_add(&merged_idx, path, &merged_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        if (mr.has_conflicts) {
+                            fprintf(stderr, "CONFLICT (content): merge conflict in %s\n", path);
+                            has_conflicts = 1;
+                        }
+                        diff_merge_destroy(&mr);
+                    }
+                }
+            }
+        }
+
+        /* Files only in theirs (new files they added) */
+        for (i = 0; i < their_idx.count; i++) {
+            const char *path = their_idx.entries[i].path;
+            u64 our_pos;
+            index_find(&our_pos, &our_idx, path);
+            if (our_pos < our_idx.count && strcmp(our_idx.entries[our_pos].path, path) == 0)
+                continue; /* already handled */
+            /* Theirs-only file */
+            index_add(&merged_idx, path, &their_idx.entries[i].oid,
+                      their_idx.entries[i].mode, 0, 0);
+        }
+
+        index_destroy(&base_idx);
+        index_destroy(&our_idx);
+        index_destroy(&their_idx);
+
+        /* Write merged index and working tree */
+        snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+        {
+            gut_index old_idx;
+            index_read(&old_idx, index_path);
+            workdir_remove_stale(&repo, &old_idx, &merged_idx);
+            index_destroy(&old_idx);
+        }
+        workdir_write_from_index(&repo, &merged_idx);
+
+        if (has_conflicts) {
+            index_write(&merged_idx, index_path);
+            index_destroy(&merged_idx);
+            fprintf(stderr, "Automatic merge failed; fix conflicts and commit.\n");
+            return 1;
+        }
+
+        /* Write merge tree and commit */
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+        index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
+        index_write(&merged_idx, index_path);
+        index_destroy(&merged_idx);
+
+        /* Build merge commit (two parents) */
+        {
+            buf commit_buf;
+            const char *author_name, *author_email;
+            char timestamp[128];
+            time_t now = time(NULL);
+
+            author_name = getenv("GUT_AUTHOR_NAME");
+            if (!author_name) author_name = getenv("GIT_AUTHOR_NAME");
+            author_email = getenv("GUT_AUTHOR_EMAIL");
+            if (!author_email) author_email = getenv("GIT_AUTHOR_EMAIL");
+            if (!author_name || !author_email) {
+                gut_config cfg;
+                char config_path[2048];
+                snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+                if (config_read(&cfg, config_path) == 0) {
+                    const char *v;
+                    if (!author_name && config_get(&v, &cfg, "user", "name") == 0)
+                        author_name = v;
+                    if (!author_email && config_get(&v, &cfg, "user", "email") == 0)
+                        author_email = v;
+                }
+            }
+            if (!author_name) author_name = "Unknown";
+            if (!author_email) author_email = "unknown@example.com";
+
+            {
+                long tz_offset = 0;
+#ifdef _WIN32
+                TIME_ZONE_INFORMATION tzi;
+                if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID)
+                    tz_offset = -(long)tzi.Bias;
+#endif
+                snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
+                         (long long)now, tz_offset / 60, labs(tz_offset) % 60);
+            }
+
+            buf_create(&commit_buf, 512);
+
+            oid_to_hex(hex, &merge_tree_oid);
+            buf_append(&commit_buf, (u8 *)"tree ", 5);
+            buf_append(&commit_buf, (u8 *)hex, GUT_OID_HEX_SIZE);
+            buf_append_byte(&commit_buf, '\n');
+
+            /* Two parents */
+            oid_to_hex(hex, &our_oid);
+            buf_append(&commit_buf, (u8 *)"parent ", 7);
+            buf_append(&commit_buf, (u8 *)hex, GUT_OID_HEX_SIZE);
+            buf_append_byte(&commit_buf, '\n');
+
+            oid_to_hex(hex, &their_oid);
+            buf_append(&commit_buf, (u8 *)"parent ", 7);
+            buf_append(&commit_buf, (u8 *)hex, GUT_OID_HEX_SIZE);
+            buf_append_byte(&commit_buf, '\n');
+
+            {
+                char line[512];
+                int n = snprintf(line, sizeof(line), "author %s <%s> %s\n",
+                                 author_name, author_email, timestamp);
+                buf_append(&commit_buf, (u8 *)line, (u64)n);
+                n = snprintf(line, sizeof(line), "committer %s <%s> %s\n",
+                             author_name, author_email, timestamp);
+                buf_append(&commit_buf, (u8 *)line, (u64)n);
+            }
+
+            {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "\nMerge branch '%s'\n", branch_name);
+                buf_append(&commit_buf, (u8 *)msg, (u64)strlen(msg));
+            }
+
+            odb_write(&merge_commit_oid, &repo.odb, GUT_OBJ_COMMIT,
+                      commit_buf.data, commit_buf.len);
+            buf_destroy(&commit_buf);
+        }
+
+        repo_update_ref(&repo, head_ref, &merge_commit_oid);
+
+        oid_to_hex(hex, &merge_commit_oid);
+        printf("Merge made by the 'recursive' strategy.\n");
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage();
@@ -2086,6 +2579,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "checkout") == 0) {
         return cmd_checkout(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "merge") == 0) {
+        return cmd_merge(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "diff") == 0) {
         return cmd_diff(argc - 2, argv + 2);

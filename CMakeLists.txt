@@ -10,6 +10,7 @@ set(VENDOR_SOURCES
     lib/apennines/c/buf.c
     lib/apennines/c/zlib_wrap.c
     lib/apennines/c/deflate.c
+    lib/apennines/c/diff.c
 )
 
 # --- Gut library sources (everything except main.c) ---
