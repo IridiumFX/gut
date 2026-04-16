@@ -391,7 +391,283 @@ unsigned long deflate_decompress(buf *out, u8 *data, u64 len) {
                 }
             }
         } else if (btype == 2) {
-            return __LINE__; /* dynamic Huffman not yet supported */
+            /* Dynamic Huffman (RFC 1951 section 3.2.7) */
+            u32 hlit, hdist, hclen;
+
+            rc = br_read(&br, 5, &hlit);   if (rc) return __LINE__;
+            rc = br_read(&br, 5, &hdist);  if (rc) return __LINE__;
+            rc = br_read(&br, 4, &hclen);  if (rc) return __LINE__;
+            hlit  += 257;
+            hdist += 1;
+            hclen += 4;
+
+            if (hlit > 286 || hdist > 32) return __LINE__;
+
+            {
+                static const u8 cl_order[19] = {
+                    16,17,18, 0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
+                };
+
+                u8 cl_lens[19];
+                u32 ci;
+                memset(cl_lens, 0, sizeof(cl_lens));
+                for (ci = 0; ci < hclen; ci++) {
+                    u32 v;
+                    rc = br_read(&br, 3, &v);
+                    if (rc) return __LINE__;
+                    cl_lens[cl_order[ci]] = (u8)v;
+                }
+
+                /* Build canonical Huffman codes for the code length alphabet */
+                #define DYN_MAX_BITS 15
+
+                u32 bl_count[DYN_MAX_BITS + 1];
+                u32 next_code[DYN_MAX_BITS + 1];
+                u32 max_cl = 0;
+                u32 code;
+
+                memset(bl_count, 0, sizeof(bl_count));
+                for (ci = 0; ci < 19; ci++) {
+                    bl_count[cl_lens[ci]]++;
+                    if (cl_lens[ci] > max_cl) max_cl = cl_lens[ci];
+                }
+                bl_count[0] = 0;
+
+                code = 0;
+                memset(next_code, 0, sizeof(next_code));
+                for (ci = 1; ci <= max_cl; ci++) {
+                    code = (code + bl_count[ci - 1]) << 1;
+                    next_code[ci] = code;
+                }
+
+                u16 cl_codes[19];
+                u8  cl_code_lens[19];
+                memset(cl_codes, 0, sizeof(cl_codes));
+                memset(cl_code_lens, 0, sizeof(cl_code_lens));
+                for (ci = 0; ci < 19; ci++) {
+                    if (cl_lens[ci] > 0) {
+                        cl_codes[ci] = (u16)next_code[cl_lens[ci]]++;
+                        cl_code_lens[ci] = cl_lens[ci];
+                    }
+                }
+
+                /* Decode lit/len + distance code lengths using CL tree */
+                u32 total_codes = hlit + hdist;
+                u8 *all_lens = (u8 *)calloc(total_codes, 1);
+                if (!all_lens) return __LINE__;
+
+                u32 ai = 0;
+                while (ai < total_codes) {
+                    u32 decoded = 0;
+                    int found = 0;
+                    u32 bits_read;
+
+                    for (bits_read = 1; bits_read <= max_cl && !found; bits_read++) {
+                        u32 bit;
+                        rc = br_read(&br, 1, &bit);
+                        if (rc) { free(all_lens); return __LINE__; }
+                        decoded = (decoded << 1) | bit;
+
+                        for (ci = 0; ci < 19; ci++) {
+                            if (cl_code_lens[ci] == bits_read &&
+                                cl_codes[ci] == decoded) {
+                                found = 1;
+                                if (ci < 16) {
+                                    all_lens[ai++] = (u8)ci;
+                                } else if (ci == 16) {
+                                    u32 rep;
+                                    rc = br_read(&br, 2, &rep);
+                                    if (rc) { free(all_lens); return __LINE__; }
+                                    rep += 3;
+                                    if (ai == 0) { free(all_lens); return __LINE__; }
+                                    { u8 prev = all_lens[ai - 1];
+                                    while (rep-- && ai < total_codes)
+                                        all_lens[ai++] = prev; }
+                                } else if (ci == 17) {
+                                    u32 rep;
+                                    rc = br_read(&br, 3, &rep);
+                                    if (rc) { free(all_lens); return __LINE__; }
+                                    rep += 3;
+                                    while (rep-- && ai < total_codes)
+                                        all_lens[ai++] = 0;
+                                } else {
+                                    u32 rep;
+                                    rc = br_read(&br, 7, &rep);
+                                    if (rc) { free(all_lens); return __LINE__; }
+                                    rep += 11;
+                                    while (rep-- && ai < total_codes)
+                                        all_lens[ai++] = 0;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if (!found) { free(all_lens); return __LINE__; }
+                }
+
+                /* Split into lit/len and distance code lengths */
+                u8 lit_lens[286];
+                u8 dst_lens[32];
+                memset(lit_lens, 0, sizeof(lit_lens));
+                memset(dst_lens, 0, sizeof(dst_lens));
+                memcpy(lit_lens, all_lens, hlit);
+                memcpy(dst_lens, all_lens + hlit, hdist);
+                free(all_lens);
+
+                /* Build canonical codes for lit/len */
+                u16 lit_codes[286];
+                u8  lit_code_lens[286];
+                memset(lit_codes, 0, sizeof(lit_codes));
+                memset(lit_code_lens, 0, sizeof(lit_code_lens));
+                {
+                    u32 bl[DYN_MAX_BITS + 1];
+                    u32 nc[DYN_MAX_BITS + 1];
+                    u32 ml = 0;
+                    memset(bl, 0, sizeof(bl));
+                    for (ci = 0; ci < hlit; ci++) {
+                        bl[lit_lens[ci]]++;
+                        if (lit_lens[ci] > ml) ml = lit_lens[ci];
+                    }
+                    bl[0] = 0;
+                    code = 0;
+                    memset(nc, 0, sizeof(nc));
+                    for (ci = 1; ci <= ml; ci++) {
+                        code = (code + bl[ci - 1]) << 1;
+                        nc[ci] = code;
+                    }
+                    for (ci = 0; ci < hlit; ci++) {
+                        if (lit_lens[ci] > 0) {
+                            lit_codes[ci] = (u16)nc[lit_lens[ci]]++;
+                            lit_code_lens[ci] = lit_lens[ci];
+                        }
+                    }
+                }
+
+                /* Build canonical codes for distance */
+                u16 dst_codes[32];
+                u8  dst_code_lens[32];
+                memset(dst_codes, 0, sizeof(dst_codes));
+                memset(dst_code_lens, 0, sizeof(dst_code_lens));
+                {
+                    u32 bl[DYN_MAX_BITS + 1];
+                    u32 nc[DYN_MAX_BITS + 1];
+                    u32 ml = 0;
+                    memset(bl, 0, sizeof(bl));
+                    for (ci = 0; ci < hdist; ci++) {
+                        bl[dst_lens[ci]]++;
+                        if (dst_lens[ci] > ml) ml = dst_lens[ci];
+                    }
+                    bl[0] = 0;
+                    code = 0;
+                    memset(nc, 0, sizeof(nc));
+                    for (ci = 1; ci <= ml; ci++) {
+                        code = (code + bl[ci - 1]) << 1;
+                        nc[ci] = code;
+                    }
+                    for (ci = 0; ci < hdist; ci++) {
+                        if (dst_lens[ci] > 0) {
+                            dst_codes[ci] = (u16)nc[dst_lens[ci]]++;
+                            dst_code_lens[ci] = dst_lens[ci];
+                        }
+                    }
+                }
+
+                /* Decode data using dynamic trees */
+                {
+                    u32 lit_max = 0, dst_max = 0;
+                    for (ci = 0; ci < hlit; ci++)
+                        if (lit_code_lens[ci] > lit_max) lit_max = lit_code_lens[ci];
+                    for (ci = 0; ci < hdist; ci++)
+                        if (dst_code_lens[ci] > dst_max) dst_max = dst_code_lens[ci];
+
+                    for (;;) {
+                        u32 sym = 0;
+                        u32 decoded_val = 0;
+                        int sym_found = 0;
+                        u32 bk;
+
+                        for (bk = 1; bk <= lit_max && !sym_found; bk++) {
+                            u32 bit;
+                            rc = br_read(&br, 1, &bit);
+                            if (rc) return __LINE__;
+                            decoded_val = (decoded_val << 1) | bit;
+                            for (ci = 0; ci < hlit; ci++) {
+                                if (lit_code_lens[ci] == bk &&
+                                    lit_codes[ci] == decoded_val) {
+                                    sym = ci;
+                                    sym_found = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!sym_found) return __LINE__;
+
+                        if (sym < 256) {
+                            u8 b = (u8)sym;
+                            rc = buf_append_byte(out, b);
+                            if (rc) return __LINE__;
+                        } else if (sym == 256) {
+                            break;
+                        } else {
+                            u32 lc = sym - 257;
+                            u32 length, distance;
+
+                            if (lc >= 29) return __LINE__;
+                            length = len_base[lc];
+                            if (len_extra[lc] > 0) {
+                                u32 extra;
+                                rc = br_read(&br, len_extra[lc], &extra);
+                                if (rc) return __LINE__;
+                                length += extra;
+                            }
+
+                            /* Decode distance symbol */
+                            {
+                                u32 dsym = 0;
+                                decoded_val = 0;
+                                sym_found = 0;
+                                for (bk = 1; bk <= dst_max && !sym_found; bk++) {
+                                    u32 bit;
+                                    rc = br_read(&br, 1, &bit);
+                                    if (rc) return __LINE__;
+                                    decoded_val = (decoded_val << 1) | bit;
+                                    for (ci = 0; ci < hdist; ci++) {
+                                        if (dst_code_lens[ci] == bk &&
+                                            dst_codes[ci] == decoded_val) {
+                                            dsym = ci;
+                                            sym_found = 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!sym_found) return __LINE__;
+
+                                if (dsym >= 30) return __LINE__;
+                                distance = dist_base[dsym];
+                                if (dist_extra[dsym] > 0) {
+                                    u32 extra;
+                                    rc = br_read(&br, dist_extra[dsym], &extra);
+                                    if (rc) return __LINE__;
+                                    distance += extra;
+                                }
+                            }
+
+                            if (out->len < distance) return __LINE__;
+                            {
+                                u64 src_pos = out->len - distance;
+                                u32 i;
+                                for (i = 0; i < length; i++) {
+                                    u8 b = out->data[src_pos + i];
+                                    rc = buf_append_byte(out, b);
+                                    if (rc) return __LINE__;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                #undef DYN_MAX_BITS
+            }
         } else {
             return __LINE__;
         }
