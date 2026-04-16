@@ -6,12 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # --- Vendored apennines sources ---
-set(VENDOR_SOURCES
-    lib/apennines/c/buf.c
-    lib/apennines/c/zlib_wrap.c
-    lib/apennines/c/deflate.c
-    lib/apennines/c/diff.c
-)
+file(GLOB VENDOR_SOURCES lib/apennines/c/*.c)
 
 # --- Gut library sources (everything except main.c) ---
 file(GLOB_RECURSE GUT_ALL_SOURCES src/main/c/*.c)
