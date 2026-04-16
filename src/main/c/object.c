@@ -1,4 +1,5 @@
 #include "gut/object.h"
+#include "gut/odb.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -361,6 +362,55 @@ unsigned long commit_destroy(gut_commit *commit) {
     free(commit->message);
     memset(commit, 0, sizeof(*commit));
     return 0;
+}
+
+unsigned long tree_lookup_path(gut_oid *out, gut_odb *odb,
+                               gut_oid *tree_oid, const char *path) {
+    gut_object obj;
+    gut_tree tree;
+    u64 i;
+    unsigned long rc;
+    const char *slash;
+
+    if (!out) return __LINE__;
+    if (!odb) return __LINE__;
+    if (!tree_oid) return __LINE__;
+    if (!path) return __LINE__;
+
+    rc = odb_read(&obj, odb, tree_oid);
+    if (rc) return __LINE__;
+    if (obj.type != GUT_OBJ_TREE) { object_destroy(&obj); return __LINE__; }
+
+    rc = tree_parse(&tree, obj.data.data, obj.data.len);
+    object_destroy(&obj);
+    if (rc) return __LINE__;
+
+    slash = strchr(path, '/');
+
+    for (i = 0; i < tree.count; i++) {
+        if (slash) {
+            /* Match directory component */
+            size_t dir_len = (size_t)(slash - path);
+            if (strlen(tree.entries[i].name) == dir_len &&
+                memcmp(tree.entries[i].name, path, dir_len) == 0 &&
+                tree.entries[i].mode == 040000) {
+                /* Recurse into subtree */
+                rc = tree_lookup_path(out, odb, &tree.entries[i].oid, slash + 1);
+                tree_destroy(&tree);
+                return rc;
+            }
+        } else {
+            /* Match filename */
+            if (strcmp(tree.entries[i].name, path) == 0) {
+                memcpy(out->bytes, tree.entries[i].oid.bytes, GUT_OID_RAW_SIZE);
+                tree_destroy(&tree);
+                return 0;
+            }
+        }
+    }
+
+    tree_destroy(&tree);
+    return __LINE__; /* not found */
 }
 
 unsigned long object_destroy(gut_object *obj) {

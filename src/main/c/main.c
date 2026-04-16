@@ -3,6 +3,8 @@
 #include "gut/object.h"
 #include "gut/index.h"
 #include "gut/config.h"
+#include "gut/ignore.h"
+#include "gut/diff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +34,15 @@ static void usage(void) {
         "   tag         Create a lightweight tag\n"
         "   tags        List all tags\n"
         "   checkout    Switch branches\n"
+        "   diff        Show changes between working tree and index\n"
         "   commit      Record changes to the repository\n"
         "   log         Show commit logs\n"
         "   status      Show the working tree status\n"
+        "   last        Show the last commit\n"
+        "   amend       Amend the last commit\n"
+        "   undo        Undo the last commit (keep changes)\n"
+        "   restore     Restore working tree or index files\n"
+        "   reset       Reset HEAD to a different commit\n"
         "   hash-object Hash a file and optionally write to object database\n"
         "   cat-file    Display object contents\n"
     );
@@ -1212,6 +1220,169 @@ static int cmd_log(int argc, char **argv) {
     return 0;
 }
 
+/* ---- gut diff ---- */
+
+static void diff_file_pair(const char *path, const u8 *old_data, u64 old_len,
+                           const u8 *new_data, u64 new_len) {
+    char **old_lines = NULL, **new_lines = NULL;
+    u8 *old_buf = NULL, *new_buf = NULL;
+    u64 old_count = 0, new_count = 0;
+    diff_result result;
+
+    diff_split_lines(&old_lines, &old_count, &old_buf, old_data, old_len);
+    diff_split_lines(&new_lines, &new_count, &new_buf, new_data, new_len);
+
+    if (diff_myers(&result, old_lines, old_count, new_lines, new_count) == 0) {
+        diff_print_unified(path, path, &result,
+                           old_lines, old_count, new_lines, new_count, 3);
+        diff_destroy(&result);
+    }
+
+    free(old_lines);
+    free(old_buf);
+    free(new_lines);
+    free(new_buf);
+}
+
+static int cmd_diff(int argc, char **argv) {
+    gut_repo repo;
+    gut_index idx;
+    char cwd[2048];
+    char index_path[2048];
+    unsigned long rc;
+    int staged = 0;
+    u64 i;
+
+    for (i = 0; i < (u64)argc; i++) {
+        if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--cached") == 0)
+            staged = 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&idx, index_path);
+    if (rc) {
+        fprintf(stderr, "error: cannot read index\n");
+        return 1;
+    }
+
+    if (staged) {
+        /* Compare index vs HEAD */
+        char head_ref[256];
+        gut_oid head_oid;
+        gut_object head_obj;
+        gut_commit head_commit;
+
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc) { index_destroy(&idx); return 0; }
+        rc = repo_resolve_ref(&head_oid, &repo, head_ref);
+        if (rc) { index_destroy(&idx); return 0; }
+
+        rc = odb_read(&head_obj, &repo.odb, &head_oid);
+        if (rc) { index_destroy(&idx); return 0; }
+        rc = commit_parse(&head_commit, head_obj.data.data, head_obj.data.len);
+        object_destroy(&head_obj);
+        if (rc) { index_destroy(&idx); return 0; }
+
+        for (i = 0; i < idx.count; i++) {
+            gut_oid head_blob_oid;
+            long cmp;
+
+            rc = tree_lookup_path(&head_blob_oid, &repo.odb,
+                                  &head_commit.tree_oid, idx.entries[i].path);
+            if (rc) {
+                /* New file in index, not in HEAD */
+                gut_object blob;
+                rc = odb_read(&blob, &repo.odb, &idx.entries[i].oid);
+                if (rc == 0) {
+                    diff_file_pair(idx.entries[i].path, NULL, 0,
+                                   blob.data.data, blob.data.len);
+                    object_destroy(&blob);
+                }
+                continue;
+            }
+
+            oid_compare(&cmp, &head_blob_oid, &idx.entries[i].oid);
+            if (cmp != 0) {
+                gut_object old_blob, new_blob;
+                rc = odb_read(&old_blob, &repo.odb, &head_blob_oid);
+                if (rc) continue;
+                rc = odb_read(&new_blob, &repo.odb, &idx.entries[i].oid);
+                if (rc) { object_destroy(&old_blob); continue; }
+
+                diff_file_pair(idx.entries[i].path,
+                               old_blob.data.data, old_blob.data.len,
+                               new_blob.data.data, new_blob.data.len);
+                object_destroy(&old_blob);
+                object_destroy(&new_blob);
+            }
+        }
+        commit_destroy(&head_commit);
+    } else {
+        /* Compare working tree vs index */
+        for (i = 0; i < idx.count; i++) {
+            char full_path[2048];
+            struct stat st;
+
+            snprintf(full_path, sizeof(full_path), "%s/%s",
+                     repo.root_dir, idx.entries[i].path);
+
+            if (stat(full_path, &st) != 0) continue;
+            if ((u32)st.st_mtime == idx.entries[i].mtime_sec &&
+                (u32)st.st_size == idx.entries[i].file_size) continue;
+
+            /* File changed — diff it */
+            {
+                gut_object old_blob;
+                FILE *fp;
+                u8 *new_data;
+                long size;
+
+                rc = odb_read(&old_blob, &repo.odb, &idx.entries[i].oid);
+                if (rc) continue;
+
+                fp = fopen(full_path, "rb");
+                if (!fp) { object_destroy(&old_blob); continue; }
+                fseek(fp, 0, SEEK_END);
+                size = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+
+                new_data = NULL;
+                if (size > 0) {
+                    new_data = (u8 *)malloc((size_t)size);
+                    if (new_data) {
+                        if (fread(new_data, 1, (size_t)size, fp) != (size_t)size) {
+                            free(new_data);
+                            new_data = NULL;
+                            size = 0;
+                        }
+                    }
+                }
+                fclose(fp);
+
+                diff_file_pair(idx.entries[i].path,
+                               old_blob.data.data, old_blob.data.len,
+                               new_data, (u64)(size > 0 ? size : 0));
+                free(new_data);
+                object_destroy(&old_blob);
+            }
+        }
+    }
+
+    index_destroy(&idx);
+    return 0;
+}
+
 /* ---- gut status ---- */
 
 static int cmd_status(int argc, char **argv) {
@@ -1321,8 +1492,565 @@ static int cmd_status(int argc, char **argv) {
         }
     }
 
+    /* Walk working tree for untracked files */
+    {
+        gut_ignore ign;
+        char ign_path[2048];
+        int has_untracked = 0;
+
+        snprintf(ign_path, sizeof(ign_path), "%s/.gitignore", repo.root_dir);
+        ignore_read(&ign, ign_path);
+
+        /* Recursive walk */
+        {
+            typedef struct { const char *dir; const char *prefix; } walk_frame;
+            walk_frame stack[64];
+            int sp = 0;
+
+            stack[sp].dir = repo.root_dir;
+            stack[sp].prefix = "";
+            sp++;
+
+            while (sp > 0) {
+                char dir_path[2048];
+                char prefix_buf[2048];
+                DIR *d;
+                struct dirent *ent;
+
+                sp--;
+                snprintf(dir_path, sizeof(dir_path), "%s", stack[sp].dir);
+                snprintf(prefix_buf, sizeof(prefix_buf), "%s", stack[sp].prefix);
+
+                d = opendir(dir_path);
+                if (!d) continue;
+
+                while ((ent = readdir(d)) != NULL) {
+                    char full[2048];
+                    char rel[2048];
+                    struct stat st;
+                    unsigned long ign_result;
+
+                    if (strcmp(ent->d_name, ".") == 0 ||
+                        strcmp(ent->d_name, "..") == 0 ||
+                        strcmp(ent->d_name, ".git") == 0) continue;
+
+                    snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+                    if (prefix_buf[0])
+                        snprintf(rel, sizeof(rel), "%s/%s", prefix_buf, ent->d_name);
+                    else
+                        snprintf(rel, sizeof(rel), "%s", ent->d_name);
+
+                    if (stat(full, &st) != 0) continue;
+
+                    if (S_ISDIR(st.st_mode)) {
+                        ignore_match(&ign_result, &ign, rel, 1);
+                        if (ign_result) continue;
+                        if (sp < 64) {
+                            /* Push directory for later traversal */
+                            static char dir_bufs[64][2048];
+                            static char pre_bufs[64][2048];
+                            snprintf(dir_bufs[sp], sizeof(dir_bufs[sp]), "%s", full);
+                            snprintf(pre_bufs[sp], sizeof(pre_bufs[sp]), "%s", rel);
+                            stack[sp].dir = dir_bufs[sp];
+                            stack[sp].prefix = pre_bufs[sp];
+                            sp++;
+                        }
+                    } else {
+                        ignore_match(&ign_result, &ign, rel, 0);
+                        if (ign_result) continue;
+
+                        /* Check if tracked in index */
+                        {
+                            u64 pos;
+                            index_find(&pos, &idx, rel);
+                            if (pos < idx.count &&
+                                strcmp(idx.entries[pos].path, rel) == 0)
+                                continue; /* tracked */
+                        }
+
+                        if (!has_untracked) {
+                            printf("\nUntracked files:\n");
+                            has_untracked = 1;
+                        }
+                        printf("  %s\n", rel);
+                    }
+                }
+                closedir(d);
+            }
+        }
+
+        ignore_destroy(&ign);
+    }
+
     index_destroy(&idx);
     printf("\n");
+    return 0;
+}
+
+/* ---- gut last ---- */
+
+static int cmd_last(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid head_oid;
+    gut_object obj;
+    gut_commit commit;
+    char cwd[2048];
+    char head_ref[256];
+    char hex[GUT_OID_HEX_SIZE + 1];
+    unsigned long rc;
+
+    (void)argc; (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+
+    rc = repo_resolve_ref(&head_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: bad default revision 'HEAD'\n"); return 1; }
+
+    rc = odb_read(&obj, &repo.odb, &head_oid);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD commit\n"); return 1; }
+
+    rc = commit_parse(&commit, obj.data.data, obj.data.len);
+    object_destroy(&obj);
+    if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+    oid_to_hex(hex, &head_oid);
+    printf("commit %s\n", hex);
+    if (commit.author) printf("Author: %s\n", commit.author);
+    printf("\n");
+    if (commit.message) printf("    %s\n", commit.message);
+    printf("\n");
+
+    commit_destroy(&commit);
+    return 0;
+}
+
+/* ---- gut amend ---- */
+
+static int cmd_amend(int argc, char **argv) {
+    gut_repo repo;
+    gut_index idx;
+    gut_oid tree_oid, new_commit_oid, old_head_oid;
+    gut_object old_obj;
+    gut_commit old_commit;
+    char cwd[2048];
+    char index_path[2048];
+    char obj_dir[2048];
+    char head_ref[256];
+    char hex[GUT_OID_HEX_SIZE + 1];
+    const char *message = NULL;
+    unsigned long rc;
+    buf commit_buf;
+    int i;
+
+    /* Parse -m <message> (optional for amend — reuse old message if not given) */
+    for (i = 0; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-m") == 0) {
+            message = argv[i + 1];
+            break;
+        }
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    /* Read old HEAD commit */
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    rc = repo_resolve_ref(&old_head_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: no commits to amend\n"); return 1; }
+
+    rc = odb_read(&old_obj, &repo.odb, &old_head_oid);
+    if (rc) { fprintf(stderr, "error: cannot read commit\n"); return 1; }
+    rc = commit_parse(&old_commit, old_obj.data.data, old_obj.data.len);
+    object_destroy(&old_obj);
+    if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+    if (!message) message = old_commit.message;
+
+    /* Build tree from current index */
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&idx, index_path);
+    if (rc) { commit_destroy(&old_commit); return 1; }
+
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+    rc = index_write_tree(&tree_oid, &idx, obj_dir);
+    index_destroy(&idx);
+    if (rc) { commit_destroy(&old_commit); return 1; }
+
+    rc = buf_create(&commit_buf, 512);
+    if (rc) { commit_destroy(&old_commit); return 1; }
+
+    oid_to_hex(hex, &tree_oid);
+    buf_append(&commit_buf, (u8 *)"tree ", 5);
+    buf_append(&commit_buf, (u8 *)hex, GUT_OID_HEX_SIZE);
+    buf_append_byte(&commit_buf, '\n');
+
+    {
+        u64 pi;
+        for (pi = 0; pi < old_commit.parent_count; pi++) {
+            oid_to_hex(hex, &old_commit.parent_oids[pi]);
+            buf_append(&commit_buf, (u8 *)"parent ", 7);
+            buf_append(&commit_buf, (u8 *)hex, GUT_OID_HEX_SIZE);
+            buf_append_byte(&commit_buf, '\n');
+        }
+    }
+
+    /* Reuse original author, update committer timestamp */
+    {
+        char line[512];
+        int n = snprintf(line, sizeof(line), "author %s\n", old_commit.author);
+        buf_append(&commit_buf, (u8 *)line, (u64)n);
+        n = snprintf(line, sizeof(line), "committer %s\n", old_commit.committer);
+        buf_append(&commit_buf, (u8 *)line, (u64)n);
+    }
+
+    buf_append_byte(&commit_buf, '\n');
+    buf_append(&commit_buf, (u8 *)message, (u64)strlen(message));
+    if (message[strlen(message) - 1] != '\n')
+        buf_append_byte(&commit_buf, '\n');
+
+    rc = odb_write(&new_commit_oid, &repo.odb, GUT_OBJ_COMMIT,
+                   commit_buf.data, commit_buf.len);
+    buf_destroy(&commit_buf);
+    commit_destroy(&old_commit);
+    if (rc) { fprintf(stderr, "error: cannot write commit\n"); return 1; }
+
+    rc = repo_update_ref(&repo, head_ref, &new_commit_oid);
+    if (rc) { fprintf(stderr, "error: cannot update ref\n"); return 1; }
+
+    oid_to_hex(hex, &new_commit_oid);
+    printf("[%.*s] %s\n", 7, hex, message);
+    return 0;
+}
+
+/* ---- gut undo ---- */
+
+static int cmd_undo(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid head_oid;
+    gut_object obj;
+    gut_commit commit;
+    char cwd[2048];
+    char head_ref[256];
+    char hex[GUT_OID_HEX_SIZE + 1];
+    unsigned long rc;
+
+    (void)argc; (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+
+    rc = repo_resolve_ref(&head_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: no commits to undo\n"); return 1; }
+
+    rc = odb_read(&obj, &repo.odb, &head_oid);
+    if (rc) { fprintf(stderr, "error: cannot read commit\n"); return 1; }
+
+    rc = commit_parse(&commit, obj.data.data, obj.data.len);
+    object_destroy(&obj);
+    if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+    if (commit.parent_count == 0) {
+        /* Root commit — remove the ref to go back to unborn state */
+        char ref_path[2048];
+        snprintf(ref_path, sizeof(ref_path), "%s/%s", repo.git_dir, head_ref);
+        remove(ref_path);
+        commit_destroy(&commit);
+        printf("Undone root commit. Branch is now empty.\n");
+        return 0;
+    }
+
+    /* Move HEAD to parent */
+    rc = repo_update_ref(&repo, head_ref, &commit.parent_oids[0]);
+    oid_to_hex(hex, &commit.parent_oids[0]);
+    commit_destroy(&commit);
+
+    if (rc) { fprintf(stderr, "error: cannot update ref\n"); return 1; }
+
+    printf("HEAD is now at %.*s\n", 7, hex);
+    return 0;
+}
+
+/* ---- rev-spec parser ---- */
+
+static int resolve_rev(gut_oid *out, gut_repo *repo, const char *rev) {
+    char head_ref[256];
+    gut_oid oid;
+    unsigned long rc;
+    int steps = 0;
+    const char *tilde;
+
+    if (!out || !repo || !rev) return 1;
+
+    /* Parse HEAD~N */
+    tilde = strchr(rev, '~');
+    if (tilde) {
+        steps = atoi(tilde + 1);
+        if (steps < 1) steps = 1;
+    }
+
+    /* Resolve base */
+    if (strncmp(rev, "HEAD", 4) == 0) {
+        rc = repo_head_ref(head_ref, sizeof(head_ref), repo);
+        if (rc) return 1;
+        rc = repo_resolve_ref(&oid, repo, head_ref);
+        if (rc) return 1;
+    } else {
+        rc = oid_from_hex(&oid, rev);
+        if (rc) return 1;
+    }
+
+    /* Walk parents */
+    while (steps > 0) {
+        gut_object obj;
+        gut_commit commit;
+        rc = odb_read(&obj, &repo->odb, &oid);
+        if (rc) return 1;
+        rc = commit_parse(&commit, obj.data.data, obj.data.len);
+        object_destroy(&obj);
+        if (rc) return 1;
+        if (commit.parent_count == 0) {
+            commit_destroy(&commit);
+            return 1; /* no more parents */
+        }
+        memcpy(oid.bytes, commit.parent_oids[0].bytes, GUT_OID_RAW_SIZE);
+        commit_destroy(&commit);
+        steps--;
+    }
+
+    memcpy(out->bytes, oid.bytes, GUT_OID_RAW_SIZE);
+    return 0;
+}
+
+/* ---- gut restore ---- */
+
+static int cmd_restore(int argc, char **argv) {
+    gut_repo repo;
+    gut_index idx;
+    char cwd[2048];
+    char index_path[2048];
+    unsigned long rc;
+    int staged = 0;
+    int file_start = 0;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--staged") == 0) {
+            staged = 1;
+            file_start = i + 1;
+        }
+    }
+    if (file_start == 0 && argc > 0 && argv[0][0] != '-') file_start = 0;
+    if (file_start >= argc) {
+        fprintf(stderr, "usage: gut restore [--staged] <file>...\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+    rc = index_read(&idx, index_path);
+    if (rc) { fprintf(stderr, "error: cannot read index\n"); return 1; }
+
+    if (staged) {
+        /* Restore index from HEAD tree */
+        char head_ref[256];
+        gut_oid head_oid;
+        gut_object head_obj;
+        gut_commit head_commit;
+
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc) { index_destroy(&idx); return 1; }
+        rc = repo_resolve_ref(&head_oid, &repo, head_ref);
+        if (rc) { index_destroy(&idx); return 1; }
+        rc = odb_read(&head_obj, &repo.odb, &head_oid);
+        if (rc) { index_destroy(&idx); return 1; }
+        rc = commit_parse(&head_commit, head_obj.data.data, head_obj.data.len);
+        object_destroy(&head_obj);
+        if (rc) { index_destroy(&idx); return 1; }
+
+        for (i = file_start; i < argc; i++) {
+            char rel_path[2048];
+            gut_oid blob_oid;
+
+            make_relative(rel_path, sizeof(rel_path), argv[i], cwd, repo.root_dir);
+
+            rc = tree_lookup_path(&blob_oid, &repo.odb,
+                                  &head_commit.tree_oid, rel_path);
+            if (rc) {
+                /* Not in HEAD: remove from index */
+                index_remove(&idx, rel_path);
+            } else {
+                /* Restore index entry from HEAD */
+                index_add(&idx, rel_path, &blob_oid, 0100644, 0, 0);
+            }
+        }
+        commit_destroy(&head_commit);
+    } else {
+        /* Restore working tree from index */
+        for (i = file_start; i < argc; i++) {
+            char rel_path[2048];
+            u64 pos;
+
+            make_relative(rel_path, sizeof(rel_path), argv[i], cwd, repo.root_dir);
+
+            rc = index_find(&pos, &idx, rel_path);
+            if (rc || pos >= idx.count ||
+                strcmp(idx.entries[pos].path, rel_path) != 0) {
+                fprintf(stderr, "error: pathspec '%s' not in index\n", argv[i]);
+                continue;
+            }
+
+            {
+                gut_object blob;
+                char full_path[2048];
+                FILE *fp;
+
+                rc = odb_read(&blob, &repo.odb, &idx.entries[pos].oid);
+                if (rc) { fprintf(stderr, "error: cannot read '%s'\n", argv[i]); continue; }
+
+                snprintf(full_path, sizeof(full_path), "%s/%s", repo.root_dir, rel_path);
+                ensure_parent_dirs(full_path);
+
+                fp = fopen(full_path, "wb");
+                if (!fp) { object_destroy(&blob); continue; }
+                if (blob.data.len > 0)
+                    fwrite(blob.data.data, 1, (size_t)blob.data.len, fp);
+                fclose(fp);
+                object_destroy(&blob);
+
+                /* Update index stat */
+                {
+                    struct stat st;
+                    if (stat(full_path, &st) == 0) {
+                        idx.entries[pos].mtime_sec = (u32)st.st_mtime;
+                        idx.entries[pos].file_size = (u32)st.st_size;
+                    }
+                }
+            }
+        }
+    }
+
+    rc = index_write(&idx, index_path);
+    index_destroy(&idx);
+    if (rc) { fprintf(stderr, "error: cannot write index\n"); return 1; }
+
+    return 0;
+}
+
+/* ---- gut reset ---- */
+
+static int cmd_reset(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char head_ref[256];
+    unsigned long rc;
+    int hard = 0;
+    const char *rev_spec = NULL;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--soft") == 0) { /* default behavior */ }
+        else if (strcmp(argv[i], "--hard") == 0) { hard = 1; }
+        else { rev_spec = argv[i]; }
+    }
+
+    if (!rev_spec) {
+        fprintf(stderr, "usage: gut reset [--soft|--hard] <rev>\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    {
+        gut_oid target_oid;
+        char hex[GUT_OID_HEX_SIZE + 1];
+
+        if (resolve_rev(&target_oid, &repo, rev_spec)) {
+            fprintf(stderr, "fatal: invalid revision '%s'\n", rev_spec);
+            return 1;
+        }
+
+        /* Move ref */
+        rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+        if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+
+        rc = repo_update_ref(&repo, head_ref, &target_oid);
+        if (rc) { fprintf(stderr, "error: cannot update ref\n"); return 1; }
+
+        if (hard) {
+            /* Reset index and working tree */
+            gut_object commit_obj;
+            gut_commit commit;
+            gut_index old_idx, new_idx;
+            char index_path[2048];
+
+            rc = odb_read(&commit_obj, &repo.odb, &target_oid);
+            if (rc) { fprintf(stderr, "error: cannot read target commit\n"); return 1; }
+            rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+            object_destroy(&commit_obj);
+            if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+            snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+
+            /* Read current index for stale file removal */
+            rc = index_read(&old_idx, index_path);
+            if (rc) { commit_destroy(&commit); return 1; }
+
+            /* Build new index from target tree */
+            rc = index_read_tree(&new_idx, &repo.odb, &commit.tree_oid);
+            commit_destroy(&commit);
+            if (rc) { index_destroy(&old_idx); return 1; }
+
+            /* Remove stale files and write new ones */
+            workdir_remove_stale(&repo, &old_idx, &new_idx);
+            index_destroy(&old_idx);
+
+            workdir_write_from_index(&repo, &new_idx);
+
+            rc = index_write(&new_idx, index_path);
+            index_destroy(&new_idx);
+            if (rc) { fprintf(stderr, "error: cannot write index\n"); return 1; }
+        }
+
+        oid_to_hex(hex, &target_oid);
+        printf("HEAD is now at %.*s\n", 7, hex);
+    }
+
     return 0;
 }
 
@@ -1359,6 +2087,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "checkout") == 0) {
         return cmd_checkout(argc - 2, argv + 2);
     }
+    if (strcmp(argv[1], "diff") == 0) {
+        return cmd_diff(argc - 2, argv + 2);
+    }
     if (strcmp(argv[1], "commit") == 0) {
         return cmd_commit(argc - 2, argv + 2);
     }
@@ -1367,6 +2098,21 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "status") == 0) {
         return cmd_status(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "last") == 0) {
+        return cmd_last(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "amend") == 0) {
+        return cmd_amend(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "undo") == 0) {
+        return cmd_undo(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "restore") == 0) {
+        return cmd_restore(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "reset") == 0) {
+        return cmd_reset(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "hash-object") == 0) {
         return cmd_hash_object(argc - 2, argv + 2);
