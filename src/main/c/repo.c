@@ -7,10 +7,52 @@
 #ifdef _WIN32
 #include <direct.h>
 #define gut_mkdir(p) _mkdir(p)
+#define gut_getcwd(b, s) _getcwd(b, s)
 #else
 #include <unistd.h>
 #define gut_mkdir(p) mkdir(p, 0755)
+#define gut_getcwd(b, s) getcwd(b, s)
 #endif
+
+/* Resolve a path to absolute, normalizing separators */
+static unsigned long resolve_path(char *out, u64 out_size, const char *path) {
+    char *p;
+    if (!out) return __LINE__;
+    if (!path) return __LINE__;
+
+    if (path[0] == '/' || (path[0] != '\0' && path[1] == ':')) {
+        /* Already absolute */
+        if (strlen(path) >= out_size) return __LINE__;
+        memcpy(out, path, strlen(path) + 1);
+    } else {
+        /* Relative — prepend cwd */
+        char cwd[1024];
+        int n;
+        if (!gut_getcwd(cwd, sizeof(cwd))) return __LINE__;
+        if (strcmp(path, ".") == 0) {
+            if (strlen(cwd) >= out_size) return __LINE__;
+            memcpy(out, cwd, strlen(cwd) + 1);
+        } else {
+            n = snprintf(out, (size_t)out_size, "%s/%s", cwd, path);
+            if (n < 0 || (u64)n >= out_size) return __LINE__;
+        }
+    }
+
+    /* Normalize backslashes to forward slashes */
+    for (p = out; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+
+    /* Strip trailing slash */
+    {
+        u64 len = strlen(out);
+        while (len > 1 && out[len - 1] == '/') {
+            out[--len] = '\0';
+        }
+    }
+
+    return 0;
+}
 
 static unsigned long mkdirs(const char *path) {
     char tmp[2048];
@@ -51,6 +93,7 @@ static unsigned long write_file(const char *path, const char *content) {
 }
 
 unsigned long repo_init(gut_repo *out, const char *path) {
+    char abs_path[1024];
     char git_dir[1024];
     char sub[2048];
     unsigned long rc;
@@ -59,7 +102,10 @@ unsigned long repo_init(gut_repo *out, const char *path) {
     if (!out) return __LINE__;
     if (!path) return __LINE__;
 
-    n = snprintf(git_dir, sizeof(git_dir), "%s/.git", path);
+    rc = resolve_path(abs_path, sizeof(abs_path), path);
+    if (rc) return __LINE__;
+
+    n = snprintf(git_dir, sizeof(git_dir), "%s/.git", abs_path);
     if (n < 0 || (u64)n >= sizeof(git_dir)) return __LINE__;
 
     /* Create directory structure */
@@ -99,8 +145,8 @@ unsigned long repo_init(gut_repo *out, const char *path) {
     if (rc) return __LINE__;
 
     /* Fill out repo struct */
-    if (strlen(path) >= sizeof(out->root_dir)) return __LINE__;
-    memcpy(out->root_dir, path, strlen(path) + 1);
+    if (strlen(abs_path) >= sizeof(out->root_dir)) return __LINE__;
+    memcpy(out->root_dir, abs_path, strlen(abs_path) + 1);
 
     if (strlen(git_dir) >= sizeof(out->git_dir)) return __LINE__;
     memcpy(out->git_dir, git_dir, strlen(git_dir) + 1);
@@ -113,6 +159,7 @@ unsigned long repo_init(gut_repo *out, const char *path) {
 }
 
 unsigned long repo_open(gut_repo *out, const char *path) {
+    char abs_path[1024];
     char candidate[2048];
     char obj_dir[2048];
     struct stat st;
@@ -121,11 +168,14 @@ unsigned long repo_open(gut_repo *out, const char *path) {
     if (!out) return __LINE__;
     if (!path) return __LINE__;
 
+    rc = resolve_path(abs_path, sizeof(abs_path), path);
+    if (rc) return __LINE__;
+
     /* Try path/.git first */
-    snprintf(candidate, sizeof(candidate), "%s/.git", path);
+    snprintf(candidate, sizeof(candidate), "%s/.git", abs_path);
     if (stat(candidate, &st) == 0) {
-        if (strlen(path) >= sizeof(out->root_dir)) return __LINE__;
-        memcpy(out->root_dir, path, strlen(path) + 1);
+        if (strlen(abs_path) >= sizeof(out->root_dir)) return __LINE__;
+        memcpy(out->root_dir, abs_path, strlen(abs_path) + 1);
 
         if (strlen(candidate) >= sizeof(out->git_dir)) return __LINE__;
         memcpy(out->git_dir, candidate, strlen(candidate) + 1);
@@ -139,8 +189,8 @@ unsigned long repo_open(gut_repo *out, const char *path) {
     /* Walk up parent directories */
     {
         char work[2048];
-        if (strlen(path) >= sizeof(work)) return __LINE__;
-        memcpy(work, path, strlen(path) + 1);
+        if (strlen(abs_path) >= sizeof(work)) return __LINE__;
+        memcpy(work, abs_path, strlen(abs_path) + 1);
 
         for (;;) {
             char *last_sep;

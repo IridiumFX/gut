@@ -12,11 +12,12 @@ set(VENDOR_SOURCES
     lib/apennines/c/deflate.c
 )
 
-# --- Gut library sources ---
-file(GLOB_RECURSE GUT_SOURCES src/main/c/*.c)
+# --- Gut library sources (everything except main.c) ---
+file(GLOB_RECURSE GUT_ALL_SOURCES src/main/c/*.c)
+list(FILTER GUT_ALL_SOURCES EXCLUDE REGEX "main\\.c$")
 
 # --- Gut static library ---
-add_library(gut_lib STATIC ${GUT_SOURCES} ${VENDOR_SOURCES})
+add_library(gut_lib STATIC ${GUT_ALL_SOURCES} ${VENDOR_SOURCES})
 
 target_include_directories(gut_lib PUBLIC
     src/main/h
@@ -34,6 +35,12 @@ endif()
 # --- Gut CLI executable ---
 add_executable(gut_cli src/main/c/main.c)
 target_link_libraries(gut_cli PRIVATE gut_lib)
+
+if(MSVC)
+    target_compile_options(gut_cli PRIVATE /W4)
+else()
+    target_compile_options(gut_cli PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 set_target_properties(gut_cli PROPERTIES OUTPUT_NAME gut)
 

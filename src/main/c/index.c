@@ -1,0 +1,475 @@
+#include "gut/index.h"
+#include "gut/sha1.h"
+#include "gut/odb.h"
+#include "gut/object.h"
+#include "apennines/buf.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+/* Big-endian read/write helpers */
+static u32 read_u32(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static u16 read_u16(const u8 *p) {
+    return (u16)(((u16)p[0] << 8) | (u16)p[1]);
+}
+
+static void write_u32(u8 *p, u32 v) {
+    p[0] = (u8)(v >> 24);
+    p[1] = (u8)(v >> 16);
+    p[2] = (u8)(v >> 8);
+    p[3] = (u8)(v);
+}
+
+static void write_u16(u8 *p, u16 v) {
+    p[0] = (u8)(v >> 8);
+    p[1] = (u8)(v);
+}
+
+unsigned long index_init(gut_index *out) {
+    if (!out) return __LINE__;
+    out->entries = NULL;
+    out->count = 0;
+    out->capacity = 0;
+    return 0;
+}
+
+unsigned long index_read(gut_index *out, const char *path) {
+    FILE *fp;
+    long file_size;
+    u8 *data;
+    u64 pos;
+    u32 sig, ver, entry_count;
+    u32 i;
+    u8 computed_hash[GUT_SHA1_DIGEST_SIZE];
+    unsigned long rc;
+
+    if (!out) return __LINE__;
+    if (!path) return __LINE__;
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+        /* No index file yet — return empty index */
+        return index_init(out);
+    }
+
+    fseek(fp, 0, SEEK_END);
+    file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (file_size < 12 + GUT_SHA1_DIGEST_SIZE) {
+        fclose(fp);
+        return __LINE__;
+    }
+
+    data = (u8 *)malloc((size_t)file_size);
+    if (!data) { fclose(fp); return __LINE__; }
+
+    if (fread(data, 1, (size_t)file_size, fp) != (size_t)file_size) {
+        free(data);
+        fclose(fp);
+        return __LINE__;
+    }
+    fclose(fp);
+
+    /* Verify checksum */
+    rc = sha1_digest(computed_hash, data, (u64)file_size - GUT_SHA1_DIGEST_SIZE);
+    if (rc) { free(data); return __LINE__; }
+    if (memcmp(computed_hash, data + file_size - GUT_SHA1_DIGEST_SIZE,
+               GUT_SHA1_DIGEST_SIZE) != 0) {
+        free(data);
+        return __LINE__;
+    }
+
+    /* Parse header */
+    sig = read_u32(data);
+    ver = read_u32(data + 4);
+    entry_count = read_u32(data + 8);
+
+    if (sig != GUT_INDEX_SIGNATURE) { free(data); return __LINE__; }
+    if (ver != GUT_INDEX_VERSION) { free(data); return __LINE__; }
+
+    rc = index_init(out);
+    if (rc) { free(data); return __LINE__; }
+
+    pos = 12;
+
+    for (i = 0; i < entry_count; i++) {
+        gut_index_entry entry;
+        u64 path_start;
+        u64 path_len;
+
+        if (pos + 62 > (u64)file_size - GUT_SHA1_DIGEST_SIZE) {
+            free(data);
+            index_destroy(out);
+            return __LINE__;
+        }
+
+        entry.ctime_sec  = read_u32(data + pos);
+        entry.ctime_nsec = read_u32(data + pos + 4);
+        entry.mtime_sec  = read_u32(data + pos + 8);
+        entry.mtime_nsec = read_u32(data + pos + 12);
+        entry.dev        = read_u32(data + pos + 16);
+        entry.ino        = read_u32(data + pos + 20);
+        entry.mode       = read_u32(data + pos + 24);
+        entry.uid        = read_u32(data + pos + 28);
+        entry.gid        = read_u32(data + pos + 32);
+        entry.file_size  = read_u32(data + pos + 36);
+        memcpy(entry.oid.bytes, data + pos + 40, GUT_OID_RAW_SIZE);
+        entry.flags      = read_u16(data + pos + 60);
+
+        path_start = pos + 62;
+        path_len = entry.flags & 0x0FFF;
+
+        /* Find actual NUL terminator in case path_len was truncated */
+        {
+            u64 scan = path_start;
+            while (scan < (u64)file_size - GUT_SHA1_DIGEST_SIZE && data[scan] != '\0') {
+                scan++;
+            }
+            path_len = scan - path_start;
+        }
+
+        entry.path = (char *)malloc((size_t)(path_len + 1));
+        if (!entry.path) {
+            free(data);
+            index_destroy(out);
+            return __LINE__;
+        }
+        memcpy(entry.path, data + path_start, (size_t)path_len);
+        entry.path[path_len] = '\0';
+
+        /* Entries padded with 1-8 NUL bytes to 8-byte boundary */
+        pos += (62 + path_len + 8) & ~(u64)7;
+
+        /* Add to index */
+        if (out->count >= out->capacity) {
+            u64 new_cap = out->capacity == 0 ? 16 : out->capacity * 2;
+            gut_index_entry *new_entries = (gut_index_entry *)realloc(
+                out->entries, (size_t)(new_cap * sizeof(gut_index_entry)));
+            if (!new_entries) {
+                free(entry.path);
+                free(data);
+                index_destroy(out);
+                return __LINE__;
+            }
+            out->entries = new_entries;
+            out->capacity = new_cap;
+        }
+        out->entries[out->count++] = entry;
+    }
+
+    free(data);
+    return 0;
+}
+
+unsigned long index_write(gut_index *idx, const char *path) {
+    buf b;
+    u8 header[12];
+    u8 checksum[GUT_SHA1_DIGEST_SIZE];
+    FILE *fp;
+    unsigned long rc;
+    u64 i;
+
+    if (!idx) return __LINE__;
+    if (!path) return __LINE__;
+
+    rc = buf_create(&b, 4096);
+    if (rc) return __LINE__;
+
+    /* Header */
+    write_u32(header, GUT_INDEX_SIGNATURE);
+    write_u32(header + 4, GUT_INDEX_VERSION);
+    write_u32(header + 8, (u32)idx->count);
+    rc = buf_append(&b, header, 12);
+    if (rc) { buf_destroy(&b); return __LINE__; }
+
+    /* Entries */
+    for (i = 0; i < idx->count; i++) {
+        gut_index_entry *e = &idx->entries[i];
+        u8 entry_data[62];
+        u64 path_len = strlen(e->path);
+        u64 entry_len;
+        u64 padded;
+        u16 flags;
+
+        write_u32(entry_data,      e->ctime_sec);
+        write_u32(entry_data + 4,  e->ctime_nsec);
+        write_u32(entry_data + 8,  e->mtime_sec);
+        write_u32(entry_data + 12, e->mtime_nsec);
+        write_u32(entry_data + 16, e->dev);
+        write_u32(entry_data + 20, e->ino);
+        write_u32(entry_data + 24, e->mode);
+        write_u32(entry_data + 28, e->uid);
+        write_u32(entry_data + 32, e->gid);
+        write_u32(entry_data + 36, e->file_size);
+        memcpy(entry_data + 40, e->oid.bytes, GUT_OID_RAW_SIZE);
+
+        flags = (u16)(path_len < 0x0FFF ? path_len : 0x0FFF);
+        write_u16(entry_data + 60, flags);
+
+        rc = buf_append(&b, entry_data, 62);
+        if (rc) { buf_destroy(&b); return __LINE__; }
+
+        rc = buf_append(&b, (u8 *)e->path, path_len);
+        if (rc) { buf_destroy(&b); return __LINE__; }
+
+        /* NUL + padding to 8-byte alignment */
+        entry_len = 62 + path_len;
+        padded = (entry_len + 8) & ~(u64)7;
+        {
+            u64 pad_count = padded - entry_len;
+            u8 zeros[8] = {0};
+            rc = buf_append(&b, zeros, pad_count);
+            if (rc) { buf_destroy(&b); return __LINE__; }
+        }
+    }
+
+    /* Compute SHA-1 checksum over everything */
+    rc = sha1_digest(checksum, b.data, b.len);
+    if (rc) { buf_destroy(&b); return __LINE__; }
+
+    rc = buf_append(&b, checksum, GUT_SHA1_DIGEST_SIZE);
+    if (rc) { buf_destroy(&b); return __LINE__; }
+
+    /* Write to file */
+    fp = fopen(path, "wb");
+    if (!fp) { buf_destroy(&b); return __LINE__; }
+
+    if (fwrite(b.data, 1, (size_t)b.len, fp) != (size_t)b.len) {
+        fclose(fp);
+        buf_destroy(&b);
+        return __LINE__;
+    }
+
+    fclose(fp);
+    buf_destroy(&b);
+    return 0;
+}
+
+unsigned long index_add(gut_index *idx, const char *path, gut_oid *oid,
+                        u32 mode, u32 file_size, u32 mtime_sec) {
+    u64 pos;
+    unsigned long rc;
+    gut_index_entry entry;
+
+    if (!idx) return __LINE__;
+    if (!path) return __LINE__;
+    if (!oid) return __LINE__;
+
+    /* Check if entry already exists */
+    rc = index_find(&pos, idx, path);
+    if (rc) return __LINE__;
+
+    if (pos < idx->count && strcmp(idx->entries[pos].path, path) == 0) {
+        /* Update existing entry */
+        memcpy(idx->entries[pos].oid.bytes, oid->bytes, GUT_OID_RAW_SIZE);
+        idx->entries[pos].mode = mode;
+        idx->entries[pos].file_size = file_size;
+        idx->entries[pos].mtime_sec = mtime_sec;
+        idx->entries[pos].flags = (u16)(strlen(path) < 0x0FFF ? strlen(path) : 0x0FFF);
+        return 0;
+    }
+
+    /* Create new entry */
+    memset(&entry, 0, sizeof(entry));
+    entry.mode = mode;
+    entry.file_size = file_size;
+    entry.mtime_sec = mtime_sec;
+    memcpy(entry.oid.bytes, oid->bytes, GUT_OID_RAW_SIZE);
+    entry.flags = (u16)(strlen(path) < 0x0FFF ? strlen(path) : 0x0FFF);
+    entry.path = (char *)malloc(strlen(path) + 1);
+    if (!entry.path) return __LINE__;
+    memcpy(entry.path, path, strlen(path) + 1);
+
+    /* Grow if needed */
+    if (idx->count >= idx->capacity) {
+        u64 new_cap = idx->capacity == 0 ? 16 : idx->capacity * 2;
+        gut_index_entry *new_entries = (gut_index_entry *)realloc(
+            idx->entries, (size_t)(new_cap * sizeof(gut_index_entry)));
+        if (!new_entries) {
+            free(entry.path);
+            return __LINE__;
+        }
+        idx->entries = new_entries;
+        idx->capacity = new_cap;
+    }
+
+    /* Insert at sorted position */
+    if (pos < idx->count) {
+        memmove(&idx->entries[pos + 1], &idx->entries[pos],
+                (size_t)((idx->count - pos) * sizeof(gut_index_entry)));
+    }
+    idx->entries[pos] = entry;
+    idx->count++;
+
+    return 0;
+}
+
+unsigned long index_remove(gut_index *idx, const char *path) {
+    u64 pos;
+    unsigned long rc;
+
+    if (!idx) return __LINE__;
+    if (!path) return __LINE__;
+
+    rc = index_find(&pos, idx, path);
+    if (rc) return __LINE__;
+
+    if (pos >= idx->count || strcmp(idx->entries[pos].path, path) != 0) {
+        return __LINE__; /* not found */
+    }
+
+    free(idx->entries[pos].path);
+
+    if (pos < idx->count - 1) {
+        memmove(&idx->entries[pos], &idx->entries[pos + 1],
+                (size_t)((idx->count - pos - 1) * sizeof(gut_index_entry)));
+    }
+    idx->count--;
+    return 0;
+}
+
+unsigned long index_find(u64 *pos, gut_index *idx, const char *path) {
+    u64 lo, hi;
+
+    if (!pos) return __LINE__;
+    if (!idx) return __LINE__;
+    if (!path) return __LINE__;
+
+    lo = 0;
+    hi = idx->count;
+
+    while (lo < hi) {
+        u64 mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(idx->entries[mid].path, path);
+        if (cmp < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    *pos = lo;
+    return 0;
+}
+
+unsigned long index_destroy(gut_index *idx) {
+    u64 i;
+    if (!idx) return __LINE__;
+    for (i = 0; i < idx->count; i++) {
+        free(idx->entries[i].path);
+    }
+    free(idx->entries);
+    idx->entries = NULL;
+    idx->count = 0;
+    idx->capacity = 0;
+    return 0;
+}
+
+/* Recursive helper: write a tree for entries sharing a common directory prefix */
+static unsigned long write_tree_recursive(gut_oid *out, gut_index_entry *entries,
+                                          u64 count, const char *prefix,
+                                          u64 prefix_len, const char *objects_dir) {
+    gut_odb odb;
+    buf tree_data;
+    u64 i;
+    unsigned long rc;
+
+    (void)prefix;
+
+    rc = odb_open(&odb, objects_dir);
+    if (rc) return __LINE__;
+
+    rc = buf_create(&tree_data, 256);
+    if (rc) return __LINE__;
+
+    i = 0;
+    while (i < count) {
+        const char *entry_path = entries[i].path + prefix_len;
+        const char *slash = strchr(entry_path, '/');
+
+        if (!slash) {
+            /* Leaf entry (file) */
+            char mode_str[16];
+            int mode_len = snprintf(mode_str, sizeof(mode_str), "%o", entries[i].mode);
+            if (mode_len < 0) { buf_destroy(&tree_data); return __LINE__; }
+
+            rc = buf_append(&tree_data, (u8 *)mode_str, (u64)mode_len);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append_byte(&tree_data, ' ');
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append(&tree_data, (u8 *)entry_path, (u64)strlen(entry_path));
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append_byte(&tree_data, '\0');
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append(&tree_data, entries[i].oid.bytes, GUT_OID_RAW_SIZE);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+
+            i++;
+        } else {
+            /* Subtree: collect all entries under this directory */
+            u64 dir_len = (u64)(slash - entry_path);
+            char dir_name[1024];
+            char sub_prefix[2048];
+            u64 sub_start = i;
+            u64 sub_count;
+            gut_oid subtree_oid;
+
+            if (dir_len >= sizeof(dir_name)) { buf_destroy(&tree_data); return __LINE__; }
+            memcpy(dir_name, entry_path, (size_t)dir_len);
+            dir_name[dir_len] = '\0';
+
+            snprintf(sub_prefix, sizeof(sub_prefix), "%.*s%s/",
+                     (int)prefix_len, entries[0].path, dir_name);
+
+            /* Count entries in this subtree */
+            while (i < count) {
+                const char *p = entries[i].path + prefix_len;
+                if (strncmp(p, dir_name, (size_t)dir_len) != 0 || p[dir_len] != '/') break;
+                i++;
+            }
+            sub_count = i - sub_start;
+
+            /* Recurse */
+            rc = write_tree_recursive(&subtree_oid, entries + sub_start, sub_count,
+                                      sub_prefix, (u64)strlen(sub_prefix), objects_dir);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+
+            /* Write "40000 dirname\0<oid>" */
+            rc = buf_append(&tree_data, (u8 *)"40000 ", 6);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append(&tree_data, (u8 *)dir_name, dir_len);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append_byte(&tree_data, '\0');
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+            rc = buf_append(&tree_data, subtree_oid.bytes, GUT_OID_RAW_SIZE);
+            if (rc) { buf_destroy(&tree_data); return __LINE__; }
+        }
+    }
+
+    /* Write this tree object to ODB */
+    rc = odb_write(out, &odb, GUT_OBJ_TREE, tree_data.data, tree_data.len);
+    buf_destroy(&tree_data);
+    if (rc) return __LINE__;
+
+    return 0;
+}
+
+unsigned long index_write_tree(gut_oid *out, gut_index *idx, const char *objects_dir) {
+    if (!out) return __LINE__;
+    if (!idx) return __LINE__;
+    if (!objects_dir) return __LINE__;
+
+    if (idx->count == 0) {
+        /* Empty tree */
+        gut_odb odb;
+        unsigned long rc = odb_open(&odb, objects_dir);
+        if (rc) return __LINE__;
+        return odb_write(out, &odb, GUT_OBJ_TREE, NULL, 0);
+    }
+
+    return write_tree_recursive(out, idx->entries, idx->count, "", 0, objects_dir);
+}
