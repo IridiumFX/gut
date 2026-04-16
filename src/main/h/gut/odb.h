@@ -8,8 +8,13 @@
 
 /* Object database: reads/writes loose objects under .git/objects/ */
 
+#define GUT_ODB_MAX_PACKS 16
+
 typedef struct {
     char objects_dir[1024];
+    void *packs[GUT_ODB_MAX_PACKS]; /* gut_pack pointers, cast in odb.c */
+    u32 pack_count;
+    u32 packs_loaded;
 } gut_odb;
 
 /* Initialize ODB with the path to the objects directory (e.g., ".git/objects") */

@@ -1,9 +1,11 @@
 #include "gut/odb.h"
+#include "gut/pack.h"
 #include "apennines/zlib_wrap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -18,7 +20,67 @@ unsigned long odb_open(gut_odb *out, const char *objects_dir) {
     if (!objects_dir) return __LINE__;
     if (strlen(objects_dir) >= sizeof(out->objects_dir)) return __LINE__;
     memcpy(out->objects_dir, objects_dir, strlen(objects_dir) + 1);
+    out->pack_count = 0;
+    out->packs_loaded = 0;
     return 0;
+}
+
+/* Lazy-load packfiles from objects/pack/ on first need */
+static unsigned long odb_load_packs(gut_odb *odb) {
+    char pack_dir[2048];
+    DIR *d;
+    struct dirent *ent;
+
+    if (odb->packs_loaded) return 0;
+    odb->packs_loaded = 1;
+
+    snprintf(pack_dir, sizeof(pack_dir), "%s/pack", odb->objects_dir);
+    d = opendir(pack_dir);
+    if (!d) return 0; /* no pack dir is fine */
+
+    while ((ent = readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->d_name);
+        if (nlen > 5 && strcmp(ent->d_name + nlen - 5, ".pack") == 0) {
+            if (odb->pack_count >= GUT_ODB_MAX_PACKS) break;
+            {
+                char pack_path[2048];
+                gut_pack *p = (gut_pack *)malloc(sizeof(gut_pack));
+                if (!p) continue;
+                snprintf(pack_path, sizeof(pack_path), "%s/%s", pack_dir, ent->d_name);
+                if (pack_open(p, pack_path) == 0) {
+                    odb->packs[odb->pack_count++] = (void *)p;
+                } else {
+                    free(p);
+                }
+            }
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+/* Try to read an object from packfiles */
+static unsigned long odb_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid) {
+    u32 i;
+    unsigned long rc;
+
+    rc = odb_load_packs(odb);
+    if (rc) return __LINE__;
+
+    for (i = 0; i < odb->pack_count; i++) {
+        gut_pack *p = (gut_pack *)odb->packs[i];
+        u64 offset;
+        unsigned long found;
+
+        rc = pack_idx_lookup(&offset, &found, &p->idx, oid);
+        if (rc) continue;
+        if (!found) continue;
+
+        rc = pack_read_object(out, p, offset);
+        if (rc == 0) return 0;
+    }
+
+    return __LINE__; /* not found in any pack */
 }
 
 unsigned long odb_object_path(char *out, u64 out_size, gut_odb *odb, gut_oid *oid) {
@@ -54,7 +116,27 @@ unsigned long odb_exists(unsigned long *found, gut_odb *odb, gut_oid *oid) {
     rc = odb_object_path(path, sizeof(path), odb, oid);
     if (rc) return __LINE__;
 
-    *found = (stat(path, &st) == 0) ? 1 : 0;
+    if (stat(path, &st) == 0) {
+        *found = 1;
+        return 0;
+    }
+
+    /* Check packfiles */
+    {
+        u32 i;
+        odb_load_packs(odb);
+        for (i = 0; i < odb->pack_count; i++) {
+            gut_pack *p = (gut_pack *)odb->packs[i];
+            u64 offset;
+            unsigned long pack_found;
+            if (pack_idx_lookup(&offset, &pack_found, &p->idx, oid) == 0 && pack_found) {
+                *found = 1;
+                return 0;
+            }
+        }
+    }
+
+    *found = 0;
     return 0;
 }
 
@@ -77,7 +159,10 @@ unsigned long odb_read(gut_object *out, gut_odb *odb, gut_oid *oid) {
     if (rc) return __LINE__;
 
     fp = fopen(path, "rb");
-    if (!fp) return __LINE__;
+    if (!fp) {
+        /* Loose object not found — try packfiles */
+        return odb_read_packed(out, odb, oid);
+    }
 
     fseek(fp, 0, SEEK_END);
     file_size = ftell(fp);
