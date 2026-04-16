@@ -27,7 +27,7 @@ static void usage(void) {
         "Commands:\n"
         "   init        Create an empty gut repository\n"
         "   add         Add file contents to the index\n"
-        "   unadd       Remove file from the index (keep working tree)\n"
+        "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
         "   branch      Create or delete a branch\n"
         "   branches    List all branches\n"
@@ -295,9 +295,9 @@ static void list_dir(const char *dir_path, dir_callback cb, void *ctx) {
     closedir(d);
 }
 
-/* ---- gut unadd / unstage ---- */
+/* ---- gut unstage ---- */
 
-static int cmd_unadd(int argc, char **argv) {
+static int cmd_unstage(int argc, char **argv) {
     gut_repo repo;
     gut_index idx;
     char cwd[2048];
@@ -306,7 +306,7 @@ static int cmd_unadd(int argc, char **argv) {
     int i;
 
     if (argc < 1) {
-        fprintf(stderr, "usage: gut unadd <file>...\n");
+        fprintf(stderr, "usage: gut unstage <file>...\n");
         return 1;
     }
 
@@ -2066,8 +2066,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);
     }
-    if (strcmp(argv[1], "unadd") == 0 || strcmp(argv[1], "unstage") == 0) {
-        return cmd_unadd(argc - 2, argv + 2);
+    if (strcmp(argv[1], "unstage") == 0) {
+        return cmd_unstage(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "rm") == 0) {
         return cmd_rm(argc - 2, argv + 2);
