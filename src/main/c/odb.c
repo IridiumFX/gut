@@ -7,6 +7,10 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+static u32 rd32_be(const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
 #ifdef _WIN32
 #include <direct.h>
 #define gut_mkdir(p) _mkdir(p)
@@ -275,6 +279,109 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
     buf_destroy(&compressed);
 
     if (out) memcpy(out->bytes, oid.bytes, GUT_OID_RAW_SIZE);
+    return 0;
+}
+
+unsigned long odb_resolve_prefix(gut_oid *out, gut_odb *odb, const char *prefix) {
+    u64 prefix_len;
+    u8 prefix_bytes[GUT_OID_RAW_SIZE];
+    int found_count = 0;
+    gut_oid found_oid;
+    u32 i;
+
+    if (!out) return __LINE__;
+    if (!odb) return __LINE__;
+    if (!prefix) return __LINE__;
+
+    prefix_len = strlen(prefix);
+    if (prefix_len < 4 || prefix_len > GUT_OID_HEX_SIZE) return __LINE__;
+
+    /* If full length, just parse directly */
+    if (prefix_len == GUT_OID_HEX_SIZE) {
+        return oid_from_hex(out, prefix);
+    }
+
+    /* Parse prefix bytes */
+    memset(prefix_bytes, 0, sizeof(prefix_bytes));
+    {
+        u64 k;
+        for (k = 0; k < prefix_len / 2; k++) {
+            int hi, lo;
+            char c;
+            c = prefix[k * 2];
+            hi = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? 10 + c - 'a' : (c >= 'A' && c <= 'F') ? 10 + c - 'A' : -1;
+            c = prefix[k * 2 + 1];
+            lo = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? 10 + c - 'a' : (c >= 'A' && c <= 'F') ? 10 + c - 'A' : -1;
+            if (hi < 0 || lo < 0) return __LINE__;
+            prefix_bytes[k] = (u8)((hi << 4) | lo);
+        }
+    }
+
+    /* Search loose objects: scan the fan-out directory */
+    {
+        char dir_path[2048];
+        char hex2[3];
+        DIR *d;
+        struct dirent *ent;
+
+        hex2[0] = prefix[0];
+        hex2[1] = prefix[1];
+        hex2[2] = '\0';
+
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", odb->objects_dir, hex2);
+        d = opendir(dir_path);
+        if (d) {
+            while ((ent = readdir(d)) != NULL) {
+                char full_hex[GUT_OID_HEX_SIZE + 1];
+                if (ent->d_name[0] == '.') continue;
+                snprintf(full_hex, sizeof(full_hex), "%s%s", hex2, ent->d_name);
+                if (strlen(full_hex) == GUT_OID_HEX_SIZE &&
+                    strncmp(full_hex, prefix, (size_t)prefix_len) == 0) {
+                    if (found_count == 0) {
+                        oid_from_hex(&found_oid, full_hex);
+                    }
+                    found_count++;
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    /* Search pack indexes */
+    odb_load_packs(odb);
+    for (i = 0; i < odb->pack_count; i++) {
+        gut_pack *p = (gut_pack *)odb->packs[i];
+        u32 lo, hi, first_byte;
+        first_byte = prefix_bytes[0];
+
+        lo = (first_byte > 0) ? rd32_be((u8 *)p->idx.fanout + (first_byte - 1) * 4) : 0;
+        hi = rd32_be((u8 *)p->idx.fanout + first_byte * 4);
+
+        while (lo < hi) {
+            u8 *entry_oid = p->idx.oids + (u64)lo * GUT_OID_RAW_SIZE;
+            char entry_hex[GUT_OID_HEX_SIZE + 1];
+            oid_to_hex(entry_hex, (gut_oid *)entry_oid);
+            if (strncmp(entry_hex, prefix, (size_t)prefix_len) == 0) {
+                if (found_count == 0) {
+                    memcpy(found_oid.bytes, entry_oid, GUT_OID_RAW_SIZE);
+                } else {
+                    /* Check if it's a different OID */
+                    if (memcmp(found_oid.bytes, entry_oid, GUT_OID_RAW_SIZE) != 0) {
+                        found_count++;
+                    }
+                }
+                if (found_count == 0) found_count = 1;
+            } else if (found_count > 0 && strncmp(entry_hex, prefix, (size_t)prefix_len) != 0) {
+                break; /* sorted, past the prefix range */
+            }
+            lo++;
+        }
+    }
+
+    if (found_count == 0) return __LINE__;
+    if (found_count > 1) return __LINE__; /* ambiguous */
+
+    memcpy(out->bytes, found_oid.bytes, GUT_OID_RAW_SIZE);
     return 0;
 }
 

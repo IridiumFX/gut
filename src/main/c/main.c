@@ -49,6 +49,9 @@ static void usage(void) {
     );
 }
 
+/* Forward declarations */
+static int resolve_object(gut_oid *out, gut_repo *repo, const char *ref);
+
 /* Normalize path separators to forward slashes */
 static void normalize_path(char *path) {
     char *p;
@@ -227,8 +230,7 @@ static int cmd_cat_file(int argc, char **argv) {
         return 1;
     }
 
-    rc = oid_from_hex(&oid, object_ref);
-    if (rc) {
+    if (resolve_object(&oid, &repo, object_ref)) {
         fprintf(stderr, "error: invalid object name '%s'\n", object_ref);
         return 1;
     }
@@ -294,6 +296,49 @@ static void list_dir(const char *dir_path, dir_callback cb, void *ctx) {
         cb(ent->d_name, ctx);
     }
     closedir(d);
+}
+
+/* Resolve an object ref: try full hex, then short prefix, then ref name */
+static int resolve_object(gut_oid *out, gut_repo *repo, const char *ref) {
+    unsigned long rc;
+
+    /* Try as full hex OID */
+    if (strlen(ref) == GUT_OID_HEX_SIZE) {
+        rc = oid_from_hex(out, ref);
+        if (rc == 0) return 0;
+    }
+
+    /* Try as short SHA prefix */
+    if (strlen(ref) >= 4 && strlen(ref) < GUT_OID_HEX_SIZE) {
+        rc = odb_resolve_prefix(out, &repo->odb, ref);
+        if (rc == 0) return 0;
+    }
+
+    /* Try as ref name (HEAD, branch, tag) */
+    if (strcmp(ref, "HEAD") == 0) {
+        char head_ref[256];
+        rc = repo_head_ref(head_ref, sizeof(head_ref), repo);
+        if (rc == 0) {
+            rc = repo_resolve_ref(out, repo, head_ref);
+            if (rc == 0) return 0;
+        }
+    }
+
+    {
+        char full_ref[256];
+        snprintf(full_ref, sizeof(full_ref), "refs/heads/%s", ref);
+        rc = repo_resolve_ref(out, repo, full_ref);
+        if (rc == 0) return 0;
+    }
+
+    {
+        char full_ref[256];
+        snprintf(full_ref, sizeof(full_ref), "refs/tags/%s", ref);
+        rc = repo_resolve_ref(out, repo, full_ref);
+        if (rc == 0) return 0;
+    }
+
+    return 1;
 }
 
 /* ---- gut unstage ---- */

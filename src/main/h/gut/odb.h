@@ -35,6 +35,10 @@ unsigned long odb_write_file(gut_oid *out, gut_odb *odb, const char *path);
 /* Build the filesystem path for a loose object */
 unsigned long odb_object_path(char *out, u64 out_size, gut_odb *odb, gut_oid *oid);
 
+/* Resolve a short hex prefix (minimum 4 chars) to a full OID.
+ * Returns 0 on unique match, error if ambiguous or not found. */
+unsigned long odb_resolve_prefix(gut_oid *out, gut_odb *odb, const char *prefix);
+
 /* Look up a blob OID by path in a tree hierarchy */
 unsigned long tree_lookup_path(gut_oid *out, gut_odb *odb,
                                gut_oid *tree_oid, const char *path);
