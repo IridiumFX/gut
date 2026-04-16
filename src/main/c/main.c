@@ -4,6 +4,8 @@
 #include "gut/index.h"
 #include "gut/config.h"
 #include "gut/ignore.h"
+#include "gut/remote.h"
+#include "gut/pack.h"
 #include "apennines/diff.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,7 @@ static void usage(void) {
         "\n"
         "Commands:\n"
         "   init        Create an empty gut repository\n"
+        "   clone       Clone a repository via HTTP(S)\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -51,6 +54,8 @@ static void usage(void) {
 
 /* Forward declarations */
 static int resolve_object(gut_oid *out, gut_repo *repo, const char *ref);
+static unsigned long ensure_parent_dirs(const char *file_path);
+static int workdir_write_from_index(gut_repo *repo, gut_index *idx);
 
 /* Normalize path separators to forward slashes */
 static void normalize_path(char *path) {
@@ -107,6 +112,252 @@ static int cmd_init(int argc, char **argv) {
     }
 
     printf("Initialized empty gut repository in %s/.git/\n", path);
+    return 0;
+}
+
+/* ---- gut clone ---- */
+
+static int cmd_clone(int argc, char **argv) {
+    const char *url;
+    const char *dir = NULL;
+    gut_remote_refs refs;
+    gut_repo repo;
+    char dest[2048];
+    char pack_path[2048];
+    char idx_cmd[4096];
+    unsigned long rc;
+    u64 i;
+    int found_head_target = 0;
+    char head_target_ref[256];
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut clone <url> [<directory>]\n");
+        return 1;
+    }
+
+    url = argv[0];
+    if (argc >= 2) {
+        dir = argv[1];
+    } else {
+        const char *last_slash = strrchr(url, '/');
+        if (last_slash) {
+            static char name_buf[256];
+            size_t nlen;
+            snprintf(name_buf, sizeof(name_buf), "%s", last_slash + 1);
+            nlen = strlen(name_buf);
+            if (nlen > 4 && strcmp(name_buf + nlen - 4, ".git") == 0)
+                name_buf[nlen - 4] = '\0';
+            dir = name_buf;
+        }
+    }
+
+    if (!dir || dir[0] == '\0') {
+        fprintf(stderr, "error: cannot determine directory name from URL\n");
+        return 1;
+    }
+
+    printf("Cloning into '%s'...\n", dir);
+
+    {
+        char cwd[2048];
+        if (!gut_getcwd(cwd, sizeof(cwd))) return 1;
+        snprintf(dest, sizeof(dest), "%s/%s", cwd, dir);
+    }
+
+#ifdef _WIN32
+    _mkdir(dest);
+#else
+    mkdir(dest, 0755);
+#endif
+
+    rc = repo_init(&repo, dest);
+    if (rc) {
+        fprintf(stderr, "fatal: cannot init repository in '%s'\n", dir);
+        return 1;
+    }
+
+    printf("Discovering refs...\n");
+    rc = remote_discover_refs(&refs, url);
+    if (rc) {
+        fprintf(stderr, "fatal: cannot discover refs from '%s' (line %lu)\n", url, rc);
+        return 1;
+    }
+
+    if (refs.count == 0) {
+        printf("warning: remote has no refs (empty repository)\n");
+        return 0;
+    }
+
+    printf("Found %llu refs\n", (unsigned long long)refs.count);
+
+    /* Collect unique want OIDs */
+    {
+        gut_oid *wants;
+        u64 want_count = 0;
+        u64 j;
+
+        wants = (gut_oid *)malloc(refs.count * sizeof(gut_oid));
+        if (!wants) return 1;
+
+        for (i = 0; i < refs.count; i++) {
+            if (strcmp(refs.refs[i].name, "HEAD") == 0) continue;
+            {
+                int dup = 0;
+                for (j = 0; j < want_count; j++) {
+                    long cmp;
+                    oid_compare(&cmp, &wants[j], &refs.refs[i].oid);
+                    if (cmp == 0) { dup = 1; break; }
+                }
+                if (!dup) {
+                    memcpy(wants[want_count].bytes, refs.refs[i].oid.bytes, GUT_OID_RAW_SIZE);
+                    want_count++;
+                }
+            }
+        }
+
+        if (want_count == 0) {
+            free(wants);
+            printf("warning: nothing to fetch\n");
+            return 0;
+        }
+
+        printf("Fetching objects (%llu wants)...\n", (unsigned long long)want_count);
+        snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-clone.pack",
+                 repo.git_dir);
+
+        rc = remote_fetch_pack(url, wants, want_count, NULL, 0, pack_path);
+        free(wants);
+
+        if (rc) {
+            fprintf(stderr, "fatal: fetch failed (line %lu)\n", rc);
+            return 1;
+        }
+    }
+
+    /* Index the pack (use git index-pack until we have our own) */
+    printf("Indexing pack...\n");
+    snprintf(idx_cmd, sizeof(idx_cmd),
+             "git index-pack \"%s/objects/pack/gut-clone.pack\"", repo.git_dir);
+    if (system(idx_cmd) != 0) {
+        fprintf(stderr, "warning: git index-pack failed\n");
+    }
+
+    /* Create refs */
+    for (i = 0; i < refs.count; i++) {
+        if (strcmp(refs.refs[i].name, "HEAD") == 0) continue;
+
+        if (strncmp(refs.refs[i].name, "refs/heads/", 11) == 0) {
+            char ref_path[2048];
+            char ref_dir[2048];
+            char ref_content[GUT_OID_HEX_SIZE + 2];
+            FILE *fp;
+
+            /* Remote tracking ref */
+            snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+            ensure_parent_dirs(ref_dir);
+#ifdef _WIN32
+            _mkdir(ref_dir);
+#else
+            mkdir(ref_dir, 0755);
+#endif
+
+            snprintf(ref_path, sizeof(ref_path), "%s/refs/remotes/origin/%s",
+                     repo.git_dir, refs.refs[i].name + 11);
+            oid_to_hex(ref_content, &refs.refs[i].oid);
+            ref_content[GUT_OID_HEX_SIZE] = '\n';
+            ref_content[GUT_OID_HEX_SIZE + 1] = '\0';
+            fp = fopen(ref_path, "w");
+            if (fp) { fputs(ref_content, fp); fclose(fp); }
+
+            /* Find default branch (matches HEAD OID) */
+            if (!found_head_target) {
+                u64 hi;
+                for (hi = 0; hi < refs.count; hi++) {
+                    if (strcmp(refs.refs[hi].name, "HEAD") == 0) {
+                        long cmp;
+                        oid_compare(&cmp, &refs.refs[hi].oid, &refs.refs[i].oid);
+                        if (cmp == 0) {
+                            found_head_target = 1;
+                            snprintf(head_target_ref, sizeof(head_target_ref),
+                                     "%s", refs.refs[i].name + 11);
+                            /* Create local branch */
+                            snprintf(ref_path, sizeof(ref_path), "%s/%s",
+                                     repo.git_dir, refs.refs[i].name);
+                            fp = fopen(ref_path, "w");
+                            if (fp) { fputs(ref_content, fp); fclose(fp); }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (strncmp(refs.refs[i].name, "refs/tags/", 10) == 0) {
+            char ref_path[2048];
+            char ref_content[GUT_OID_HEX_SIZE + 2];
+            FILE *fp;
+
+            snprintf(ref_path, sizeof(ref_path), "%s/%s", repo.git_dir, refs.refs[i].name);
+            oid_to_hex(ref_content, &refs.refs[i].oid);
+            ref_content[GUT_OID_HEX_SIZE] = '\n';
+            ref_content[GUT_OID_HEX_SIZE + 1] = '\0';
+            fp = fopen(ref_path, "w");
+            if (fp) { fputs(ref_content, fp); fclose(fp); }
+        }
+    }
+
+    /* Update HEAD */
+    if (found_head_target) {
+        char head_path[2048];
+        char head_content[256];
+        FILE *fp;
+        snprintf(head_path, sizeof(head_path), "%s/HEAD", repo.git_dir);
+        snprintf(head_content, sizeof(head_content), "ref: refs/heads/%s\n", head_target_ref);
+        fp = fopen(head_path, "w");
+        if (fp) { fputs(head_content, fp); fclose(fp); }
+    }
+
+    /* Save remote config */
+    {
+        char config_path[2048];
+        FILE *fp;
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        fp = fopen(config_path, "a");
+        if (fp) {
+            fprintf(fp, "[remote \"origin\"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n", url);
+            fclose(fp);
+        }
+    }
+
+    /* Checkout HEAD */
+    if (found_head_target) {
+        gut_oid head_oid;
+        gut_index new_idx;
+        gut_object commit_obj;
+        gut_commit commit;
+        char index_path[2048];
+        char ref_name[256];
+
+        snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", head_target_ref);
+        rc = repo_resolve_ref(&head_oid, &repo, ref_name);
+        if (rc == 0) {
+            rc = odb_read(&commit_obj, &repo.odb, &head_oid);
+            if (rc == 0) {
+                rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+                object_destroy(&commit_obj);
+                if (rc == 0) {
+                    rc = index_read_tree(&new_idx, &repo.odb, &commit.tree_oid);
+                    commit_destroy(&commit);
+                    if (rc == 0) {
+                        workdir_write_from_index(&repo, &new_idx);
+                        snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+                        index_write(&new_idx, index_path);
+                        index_destroy(&new_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    printf("done.\n");
     return 0;
 }
 
@@ -2600,6 +2851,9 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "init") == 0) {
         return cmd_init(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "clone") == 0) {
+        return cmd_clone(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);

@@ -40,6 +40,11 @@ endif()
 
 set_target_properties(gut_cli PROPERTIES OUTPUT_NAME gut)
 
+# Platform libraries for networking
+if(WIN32)
+    target_link_libraries(gut_cli PRIVATE ws2_32 bcrypt)
+endif()
+
 # --- Tests ---
 file(GLOB_RECURSE TEST_SOURCES src/test/c/*.c)
 if(TEST_SOURCES)
