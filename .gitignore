@@ -1,0 +1,12 @@
+build/
+target/
+*.o
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+cmake-build-*/
+.idea/
+compile_commands.json

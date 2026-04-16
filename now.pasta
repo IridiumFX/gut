@@ -1,0 +1,37 @@
+{
+  group:    "dev.iridium",
+  artifact: "gut",
+  version:  "0.1.0",
+  name:     "Gut",
+  description: "Clean git reimplementation in C",
+  license:  "MIT",
+  lang:     "c",
+
+  sources: {
+    dir:     "src/main/c",
+    headers: "src/main/h"
+  },
+
+  output: { type: "executable", name: "gut" },
+
+  compile: {
+    std:      "c11",
+    warnings: ["Wall", "Wextra", "Wpedantic"],
+    includes: ["lib/apennines/h"],
+    defines:  ["GUT_BUILDING"]
+  },
+
+  link: {
+    libs: []
+  },
+
+  tests: {
+    dir: "src/test/c"
+  },
+
+  profiles: {
+    debug:   { compile: { flags: ["-g", "-O0"], defines: ["DEBUG"] } },
+    release: { compile: { flags: ["-O2"] }, link: { flags: ["-s"] } },
+    posix:   { link: { !libs: ["pthread", "m"] } }
+  }
+}
