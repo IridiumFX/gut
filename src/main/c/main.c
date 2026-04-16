@@ -719,6 +719,11 @@ int main(int argc, char **argv) {
         return cmd_cat_file(argc - 2, argv + 2);
     }
 
+    if (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0) {
+        printf("gut version 0.1.0\n");
+        return 0;
+    }
+
     fprintf(stderr, "gut: '%s' is not a gut command\n", argv[1]);
     return 1;
 }
