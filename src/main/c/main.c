@@ -35,6 +35,7 @@ static void usage(void) {
         "   repack      Pack all loose objects and remove them\n"
         "   listen      Broadcast ref change events via WebSocket\n"
         "   leech       Subscribe to a peer's gut listen events\n"
+        "   leechers    Query a listener for its connected peers\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -398,6 +399,18 @@ static int cmd_listen(int argc, char **argv) {
 
     rc = leech_listen(&repo, port, poll_ms, token);
     return rc ? 1 : 0;
+}
+
+/* ---- gut leechers ---- */
+
+static int cmd_leechers(int argc, char **argv) {
+    const char *host;
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut leechers <host:port>\n");
+        return 1;
+    }
+    host = argv[0];
+    return leech_list_peers(host) ? 1 : 0;
 }
 
 /* ---- gut leech ---- */
@@ -3132,6 +3145,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "leech") == 0) {
         return cmd_leech(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "leechers") == 0) {
+        return cmd_leechers(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);

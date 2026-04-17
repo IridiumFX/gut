@@ -314,67 +314,6 @@ static const char *find_header(u64 *out_len, const u8 *req, u64 req_len, const c
     return NULL;
 }
 
-/* Perform the WebSocket upgrade handshake on an incoming TCP connection.
- * Reads the HTTP request, validates the token if required, builds and sends
- * the 101 response. Returns 0 on success. */
-static unsigned long ws_upgrade_server(tcp_conn *conn, const char *required_token) {
-    buf req;
-    const char *key_start;
-    u64 key_len;
-    char client_key[128];
-    u8 *response = NULL;
-    u64 response_len = 0;
-    unsigned long rc;
-    u64 n;
-
-    rc = buf_create(&req, 4096);
-    if (rc) return __LINE__;
-
-    rc = read_http_request(&req, conn);
-    if (rc) { buf_destroy(&req); return __LINE__; }
-
-    /* Validate token if required */
-    if (required_token && *required_token) {
-        u64 auth_len;
-        const char *auth = find_header(&auth_len, req.data, req.len, "Authorization");
-        const char *bearer_prefix = "Bearer ";
-        size_t bp_len = strlen(bearer_prefix);
-        size_t tok_len = strlen(required_token);
-
-        if (!auth || auth_len < bp_len + tok_len ||
-            gut_strncasecmp(auth, bearer_prefix, bp_len) != 0 ||
-            strncmp(auth + bp_len, required_token, tok_len) != 0) {
-            const char *reject =
-                "HTTP/1.1 401 Unauthorized\r\n"
-                "Content-Length: 0\r\n\r\n";
-            tcp_conn_write_all(&n, conn, (const u8 *)reject, strlen(reject));
-            buf_destroy(&req);
-            return __LINE__;
-        }
-    }
-
-    /* Extract Sec-WebSocket-Key */
-    key_start = find_header(&key_len, req.data, req.len, "Sec-WebSocket-Key");
-    if (!key_start || key_len >= sizeof(client_key)) {
-        buf_destroy(&req);
-        return __LINE__;
-    }
-    memcpy(client_key, key_start, key_len);
-    client_key[key_len] = '\0';
-
-    buf_destroy(&req);
-
-    /* Build accept response */
-    rc = ws_handshake_build_response(&response, &response_len, client_key);
-    if (rc) return __LINE__;
-
-    rc = tcp_conn_write_all(&n, conn, response, response_len);
-    free(response);
-    if (rc) return __LINE__;
-
-    return 0;
-}
-
 /* Send a text WebSocket frame (server → client, unmasked) */
 static unsigned long ws_send_text(tcp_conn *conn, const char *text, u64 len) {
     u8 *frame = NULL;
@@ -466,20 +405,326 @@ static void emit_via_ws(const char *json, u64 len, void *ctx_void) {
  *  Public: leech_listen
  * ==================================================================== */
 
+/* ====================================================================
+ *  Multi-peer state and select-based event loop
+ * ==================================================================== */
+
+#define GUT_LEECH_MAX_PEERS 64
+
+typedef enum {
+    PEER_SLOT_FREE = 0,
+    PEER_HANDSHAKING,      /* accumulating HTTP upgrade request */
+    PEER_CONNECTED,        /* WebSocket ready, broadcasting events */
+} peer_state;
+
+typedef struct {
+    peer_state state;
+    tcp_conn   conn;
+    buf        recv_buf;   /* accumulated handshake bytes */
+    char       addr_str[48];
+    time_t     connected_at;
+    u64        slot_id;    /* monotonic id for logging */
+} peer_slot;
+
+static peer_slot g_peers[GUT_LEECH_MAX_PEERS];
+static u64 g_next_slot_id = 1;
+
+/* Forward declaration — the discovery command reads these via a helper */
+static u64 peer_count_connected(void) {
+    u64 n = 0;
+    int i;
+    for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+        if (g_peers[i].state == PEER_CONNECTED) n++;
+    }
+    return n;
+}
+
+/* Find free slot; returns -1 if none. */
+static int peer_slot_alloc(void) {
+    int i;
+    for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+        if (g_peers[i].state == PEER_SLOT_FREE) return i;
+    }
+    return -1;
+}
+
+static void peer_slot_close(int idx) {
+    if (g_peers[idx].state == PEER_SLOT_FREE) return;
+    buf_destroy(&g_peers[idx].recv_buf);
+    tcp_conn_destroy(&g_peers[idx].conn);
+    memset(&g_peers[idx], 0, sizeof(g_peers[idx]));
+}
+
+/* Set a socket to non-blocking mode */
+static void set_nonblocking(socket_t fd) {
+#ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+/* Try to complete an upgrade handshake for a peer in PEER_HANDSHAKING.
+ * Reads more bytes into peer->recv_buf. If complete, transitions to
+ * PEER_CONNECTED (and sends 101 response). Returns 1 if still pending,
+ * 0 if transitioned, <0 if failed. */
+static int peer_handshake_step(int idx, const char *required_token) {
+    peer_slot *p = &g_peers[idx];
+    u8 chunk[2048];
+    u64 nr;
+    unsigned long rc;
+    u64 i;
+    u64 marker_pos = (u64)-1;
+
+    rc = tcp_conn_read(&nr, &p->conn, chunk, sizeof(chunk));
+    if (rc) {
+        /* Non-blocking read: if no data, treat as still pending.
+         * Our vendored tcp_conn_read returns error on EWOULDBLOCK, so
+         * we can't distinguish. Assume pending and try again. */
+        return 1;
+    }
+    if (nr == 0) return -1; /* peer closed */
+
+    buf_append(&p->recv_buf, chunk, nr);
+
+    if (p->recv_buf.len > 65536) return -1; /* too large */
+
+    /* Search for \r\n\r\n */
+    if (p->recv_buf.len >= 4) {
+        for (i = 0; i + 3 < p->recv_buf.len; i++) {
+            if (p->recv_buf.data[i] == '\r' && p->recv_buf.data[i+1] == '\n' &&
+                p->recv_buf.data[i+2] == '\r' && p->recv_buf.data[i+3] == '\n') {
+                marker_pos = i;
+                break;
+            }
+        }
+    }
+    if (marker_pos == (u64)-1) return 1; /* still need more */
+
+    /* Check if this is a WebSocket upgrade or a plain HTTP request */
+    {
+        u64 upgrade_len;
+        const char *upgrade = find_header(&upgrade_len, p->recv_buf.data, p->recv_buf.len, "Upgrade");
+        int is_websocket = (upgrade && upgrade_len >= 9 &&
+                            gut_strncasecmp(upgrade, "websocket", 9) == 0);
+
+        if (!is_websocket) {
+            /* Handle as plain HTTP — currently only GET /leechers */
+            const u8 *req_line_end;
+            const u8 *req = p->recv_buf.data;
+            u64 req_len = p->recv_buf.len;
+            u64 path_start = 0, path_end = 0;
+            u64 i2;
+
+            /* Extract path from "GET /path HTTP/1.1\r\n" */
+            for (i2 = 0; i2 + 1 < req_len; i2++) {
+                if (req[i2] == '\r' && req[i2+1] == '\n') { req_line_end = req + i2; break; }
+            }
+            (void)req_line_end;
+
+            /* Find first space (after method) then second space (before HTTP/1.1) */
+            {
+                u64 j;
+                int space_count = 0;
+                for (j = 0; j < req_len && req[j] != '\r'; j++) {
+                    if (req[j] == ' ') {
+                        if (space_count == 0) path_start = j + 1;
+                        else if (space_count == 1) { path_end = j; break; }
+                        space_count++;
+                    }
+                }
+            }
+
+            if (path_end > path_start &&
+                path_end - path_start == 9 &&
+                memcmp(req + path_start, "/leechers", 9) == 0) {
+                /* Build JSON response */
+                buf body;
+                int first = 1;
+                int i3;
+                char header[256];
+                u64 n;
+
+                buf_create(&body, 256);
+                buf_append_byte(&body, '[');
+                for (i3 = 0; i3 < GUT_LEECH_MAX_PEERS; i3++) {
+                    if (g_peers[i3].state != PEER_CONNECTED) continue;
+                    if (!first) buf_append_byte(&body, ',');
+                    first = 0;
+                    {
+                        char entry[128];
+                        int en = snprintf(entry, sizeof(entry),
+                            "{\"id\":%llu,\"connected_at\":%lld}",
+                            (unsigned long long)g_peers[i3].slot_id,
+                            (long long)g_peers[i3].connected_at);
+                        buf_append(&body, (u8 *)entry, (u64)en);
+                    }
+                }
+                buf_append_byte(&body, ']');
+                buf_append_byte(&body, '\n');
+
+                snprintf(header, sizeof(header),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %llu\r\n"
+                    "Connection: close\r\n\r\n",
+                    (unsigned long long)body.len);
+                tcp_conn_write_all(&n, &p->conn, (const u8 *)header, strlen(header));
+                tcp_conn_write_all(&n, &p->conn, body.data, body.len);
+                buf_destroy(&body);
+            } else {
+                const char *resp =
+                    "HTTP/1.1 404 Not Found\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n\r\n";
+                u64 n;
+                tcp_conn_write_all(&n, &p->conn, (const u8 *)resp, strlen(resp));
+            }
+            return -1; /* close after response */
+        }
+    }
+
+    /* Validate token if required */
+    if (required_token && *required_token) {
+        u64 auth_len;
+        const char *auth = find_header(&auth_len, p->recv_buf.data, p->recv_buf.len, "Authorization");
+        const char *bearer_prefix = "Bearer ";
+        size_t bp_len = strlen(bearer_prefix);
+        size_t tok_len = strlen(required_token);
+
+        if (!auth || auth_len < bp_len + tok_len ||
+            gut_strncasecmp(auth, bearer_prefix, bp_len) != 0 ||
+            strncmp(auth + bp_len, required_token, tok_len) != 0) {
+            const char *reject =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "Content-Length: 0\r\n\r\n";
+            u64 n;
+            tcp_conn_write_all(&n, &p->conn, (const u8 *)reject, strlen(reject));
+            return -1;
+        }
+    }
+
+    /* Extract Sec-WebSocket-Key */
+    {
+        u64 key_len;
+        const char *key_start = find_header(&key_len, p->recv_buf.data, p->recv_buf.len, "Sec-WebSocket-Key");
+        char client_key[128];
+        u8 *response = NULL;
+        u64 response_len = 0;
+        u64 n;
+
+        if (!key_start || key_len >= sizeof(client_key)) return -1;
+        memcpy(client_key, key_start, key_len);
+        client_key[key_len] = '\0';
+
+        rc = ws_handshake_build_response(&response, &response_len, client_key);
+        if (rc) return -1;
+
+        rc = tcp_conn_write_all(&n, &p->conn, response, response_len);
+        free(response);
+        if (rc) return -1;
+    }
+
+    /* Transition to connected. Clear recv_buf (no longer needed). */
+    buf_destroy(&p->recv_buf);
+    buf_create(&p->recv_buf, 0);
+    p->state = PEER_CONNECTED;
+    p->connected_at = time(NULL);
+
+    printf("peer #%llu upgraded (%llu connected)\n",
+           (unsigned long long)p->slot_id,
+           (unsigned long long)peer_count_connected());
+    fflush(stdout);
+    return 0;
+}
+
+/* Drain any incoming data from a connected peer (close/ping handling).
+ * We ignore application data — clients are receive-only.
+ * Returns -1 if the peer closed or errored. */
+static int peer_drain_connected(int idx) {
+    peer_slot *p = &g_peers[idx];
+    u8 chunk[2048];
+    u64 nr;
+    unsigned long rc;
+
+    rc = tcp_conn_read(&nr, &p->conn, chunk, sizeof(chunk));
+    if (rc) return 1; /* non-blocking: no data */
+    if (nr == 0) return -1; /* closed */
+
+    /* Ignore — we don't parse frames from clients */
+    return 0;
+}
+
+/* Broadcast a text message to all connected peers. Closes peers that fail. */
+static void broadcast_to_peers(const char *text, u64 len) {
+    int i;
+    u8 *frame = NULL;
+    u64 frame_len = 0;
+    u8 no_mask[4] = {0};
+
+    if (ws_frame_encode(&frame, &frame_len, WS_OPCODE_TEXT,
+                        (const u8 *)text, len, 0, no_mask) != 0) {
+        return;
+    }
+
+    for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+        if (g_peers[i].state != PEER_CONNECTED) continue;
+        {
+            u64 n;
+            if (tcp_conn_write_all(&n, &g_peers[i].conn, frame, frame_len) != 0) {
+                printf("peer #%llu write failed, closing\n",
+                       (unsigned long long)g_peers[i].slot_id);
+                fflush(stdout);
+                peer_slot_close(i);
+            }
+        }
+    }
+
+    free(frame);
+
+    /* Also echo to listener's stdout */
+    printf("[event] ");
+    fwrite(text, 1, (size_t)len, stdout);
+    printf("\n");
+    fflush(stdout);
+}
+
+/* Emit callback for diff_snapshots — broadcasts to all peers */
+static void emit_broadcast(const char *json, u64 len, void *ctx) {
+    (void)ctx;
+    broadcast_to_peers(json, len);
+}
+
+/* Current time in milliseconds (monotonic-ish) */
+static u64 now_ms(void) {
+#ifdef _WIN32
+    return (u64)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
+#endif
+}
+
+#ifndef _WIN32
+#include <sys/select.h>
+#include <fcntl.h>
+#endif
+
 unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
                            const char *token) {
     tcp_listener listener;
     net_sock_addr addr;
+    ref_snapshot prev_snap;
     unsigned long rc;
+    u64 last_poll;
 
     if (!repo) return __LINE__;
 
     memset(&addr, 0, sizeof(addr));
-    addr.family = 4;          /* IPv4 */
-    addr.addr.v4.octets[0] = 0;
-    addr.addr.v4.octets[1] = 0;
-    addr.addr.v4.octets[2] = 0;
-    addr.addr.v4.octets[3] = 0;
+    addr.family = 4;
     addr.port = port;
 
     rc = tcp_listener_create(&listener, &addr, 8);
@@ -488,71 +733,127 @@ unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
         return __LINE__;
     }
 
+    set_nonblocking(listener.fd);
+
     printf("gut listen on port %u (Ctrl-C to stop)\n", (unsigned)port);
     if (token && *token) {
         printf("  auth: bearer token required\n");
     } else {
         printf("  auth: none (any peer may connect)\n");
     }
+    printf("  multi-peer, max %d concurrent\n", GUT_LEECH_MAX_PEERS);
     fflush(stdout);
 
-    /* Single-peer MVP: accept one connection at a time, handle events */
+    memset(g_peers, 0, sizeof(g_peers));
+    snap_init(&prev_snap);
+    take_snapshot(&prev_snap, repo);
+    last_poll = now_ms();
+
     for (;;) {
-        tcp_conn conn;
-        ref_snapshot prev_snap, curr_snap;
-        struct emit_ctx ectx;
+        fd_set rfds;
+        socket_t maxfd;
+        struct timeval tv;
+        int ready;
+        int i;
+        u64 now;
 
-        printf("waiting for leecher...\n");
-        fflush(stdout);
+        FD_ZERO(&rfds);
+        FD_SET(listener.fd, &rfds);
+        maxfd = listener.fd;
 
-        rc = tcp_listener_accept(&conn, &listener);
-        if (rc) {
-            fprintf(stderr, "accept failed rc=%lu\n", rc);
-            continue;
+        for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+            if (g_peers[i].state != PEER_SLOT_FREE) {
+                FD_SET(g_peers[i].conn.fd, &rfds);
+                if (g_peers[i].conn.fd > maxfd) maxfd = g_peers[i].conn.fd;
+            }
         }
 
-        printf("leecher connected\n");
-        fflush(stdout);
-
-        /* Perform WebSocket upgrade */
-        rc = ws_upgrade_server(&conn, token);
-        if (rc) {
-            fprintf(stderr, "upgrade failed rc=%lu\n", rc);
-            tcp_conn_destroy(&conn);
-            continue;
+        /* Compute timeout remaining until next poll */
+        now = now_ms();
+        {
+            u64 elapsed = now - last_poll;
+            u64 remaining = (elapsed >= poll_ms) ? 0 : (poll_ms - elapsed);
+            tv.tv_sec = (long)(remaining / 1000);
+            tv.tv_usec = (long)((remaining % 1000) * 1000);
         }
 
-        printf("upgrade ok, streaming events\n");
-        fflush(stdout);
+#ifdef _WIN32
+        ready = select(0, &rfds, NULL, NULL, &tv);
+#else
+        ready = select((int)maxfd + 1, &rfds, NULL, NULL, &tv);
+#endif
+        (void)ready;
 
-        /* Take initial snapshot so we only report future changes */
-        snap_init(&prev_snap);
-        take_snapshot(&prev_snap, repo);
+        /* Accept new connections */
+        if (FD_ISSET(listener.fd, &rfds)) {
+            for (;;) {
+                tcp_conn new_conn;
+                int slot;
+                if (tcp_listener_accept(&new_conn, &listener) != 0) break;
 
-        ectx.conn = &conn;
-        ectx.error = 0;
+                slot = peer_slot_alloc();
+                if (slot < 0) {
+                    printf("refusing connection — peer table full\n");
+                    fflush(stdout);
+                    tcp_conn_destroy(&new_conn);
+                    continue;
+                }
 
-        /* Polling loop */
-        while (!ectx.error) {
-            gut_sleep_ms(poll_ms);
+                set_nonblocking(new_conn.fd);
+                g_peers[slot].state = PEER_HANDSHAKING;
+                g_peers[slot].conn = new_conn;
+                buf_create(&g_peers[slot].recv_buf, 1024);
+                g_peers[slot].connected_at = time(NULL);
+                g_peers[slot].slot_id = g_next_slot_id++;
+                snprintf(g_peers[slot].addr_str, sizeof(g_peers[slot].addr_str),
+                         "peer#%llu", (unsigned long long)g_peers[slot].slot_id);
 
+                printf("peer #%llu accepted (handshaking)\n",
+                       (unsigned long long)g_peers[slot].slot_id);
+                fflush(stdout);
+            }
+        }
+
+        /* Handle peer I/O */
+        for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+            if (g_peers[i].state == PEER_SLOT_FREE) continue;
+            if (!FD_ISSET(g_peers[i].conn.fd, &rfds)) continue;
+
+            if (g_peers[i].state == PEER_HANDSHAKING) {
+                int r = peer_handshake_step(i, token);
+                if (r < 0) {
+                    printf("peer #%llu handshake failed\n",
+                           (unsigned long long)g_peers[i].slot_id);
+                    fflush(stdout);
+                    peer_slot_close(i);
+                }
+            } else if (g_peers[i].state == PEER_CONNECTED) {
+                int r = peer_drain_connected(i);
+                if (r < 0) {
+                    printf("peer #%llu disconnected (%llu remaining)\n",
+                           (unsigned long long)g_peers[i].slot_id,
+                           (unsigned long long)(peer_count_connected() - 1));
+                    fflush(stdout);
+                    peer_slot_close(i);
+                }
+            }
+        }
+
+        /* Time to poll refs? */
+        now = now_ms();
+        if (now - last_poll >= poll_ms) {
+            ref_snapshot curr_snap;
             snap_init(&curr_snap);
             take_snapshot(&curr_snap, repo);
-
-            diff_snapshots(repo, &prev_snap, &curr_snap, emit_via_ws, &ectx);
-
+            diff_snapshots(repo, &prev_snap, &curr_snap, emit_broadcast, NULL);
             snap_destroy(&prev_snap);
             prev_snap = curr_snap;
-            memset(&curr_snap, 0, sizeof(curr_snap));
+            last_poll = now;
         }
-
-        snap_destroy(&prev_snap);
-        printf("leecher disconnected\n");
-        fflush(stdout);
-        tcp_conn_destroy(&conn);
     }
 
     /* unreachable */
+    snap_destroy(&prev_snap);
     tcp_listener_destroy(&listener);
     return 0;
 }
@@ -792,6 +1093,91 @@ unsigned long leech_connect(const char *url, const char *token) {
         }
 done:
         buf_destroy(&accum);
+    }
+
+    tcp_conn_destroy(&conn);
+    return 0;
+}
+
+/* ====================================================================
+ *  Public: leech_list_peers — GET /leechers
+ * ==================================================================== */
+
+unsigned long leech_list_peers(const char *host) {
+    char host_buf[128];
+    u16 port = 7900;
+    const char *colon;
+    net_sock_addr addr;
+    tcp_conn conn;
+    char req[256];
+    unsigned long rc;
+    u64 n;
+    int req_len;
+
+    if (!host) return __LINE__;
+
+    snprintf(host_buf, sizeof(host_buf), "%s", host);
+    colon = strchr(host_buf, ':');
+    if (colon) {
+        port = (u16)atoi(colon + 1);
+        host_buf[colon - host_buf] = '\0';
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.family = 4;
+    addr.port = port;
+    {
+        unsigned a, b, c, d;
+        if (sscanf(host_buf, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+            fprintf(stderr, "error: leechers requires IPv4 host, got '%s'\n", host_buf);
+            return __LINE__;
+        }
+        addr.addr.v4.octets[0] = (u8)a;
+        addr.addr.v4.octets[1] = (u8)b;
+        addr.addr.v4.octets[2] = (u8)c;
+        addr.addr.v4.octets[3] = (u8)d;
+    }
+
+    rc = tcp_conn_create(&conn, &addr);
+    if (rc) { fprintf(stderr, "error: cannot connect to %s:%u\n", host_buf, (unsigned)port); return __LINE__; }
+
+    req_len = snprintf(req, sizeof(req),
+        "GET /leechers HTTP/1.1\r\n"
+        "Host: %s:%u\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        host_buf, (unsigned)port);
+
+    tcp_conn_write_all(&n, &conn, (const u8 *)req, (u64)req_len);
+
+    /* Read response, skip headers, print body */
+    {
+        buf resp;
+        buf_create(&resp, 4096);
+        for (;;) {
+            u8 chunk[2048];
+            u64 nr;
+            if (tcp_conn_read(&nr, &conn, chunk, sizeof(chunk)) != 0) break;
+            if (nr == 0) break;
+            buf_append(&resp, chunk, nr);
+        }
+
+        /* Find header/body boundary */
+        {
+            u64 i;
+            u64 body_start = 0;
+            for (i = 0; i + 3 < resp.len; i++) {
+                if (resp.data[i] == '\r' && resp.data[i+1] == '\n' &&
+                    resp.data[i+2] == '\r' && resp.data[i+3] == '\n') {
+                    body_start = i + 4;
+                    break;
+                }
+            }
+            if (body_start > 0 && body_start <= resp.len) {
+                fwrite(resp.data + body_start, 1, (size_t)(resp.len - body_start), stdout);
+            }
+        }
+        buf_destroy(&resp);
     }
 
     tcp_conn_destroy(&conn);

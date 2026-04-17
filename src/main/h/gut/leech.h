@@ -41,4 +41,8 @@ unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
  * Blocks until the connection closes. */
 unsigned long leech_connect(const char *url, const char *token);
 
+/* Query a peer's listen server for its list of connected leechers.
+ * host: "host:port" (IPv4 literal for now). Prints JSON to stdout. */
+unsigned long leech_list_peers(const char *host);
+
 #endif /* GUT_LEECH_H */
