@@ -6,6 +6,7 @@
 #include "gut/ignore.h"
 #include "gut/remote.h"
 #include "gut/pack.h"
+#include <dirent.h>
 #include "apennines/diff.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@ static void usage(void) {
         "   init        Create an empty gut repository\n"
         "   clone       Clone a repository via HTTP(S)\n"
         "   pack-objects Create a pack from OIDs on stdin\n"
+        "   repack      Pack all loose objects and remove them\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -359,6 +361,137 @@ static int cmd_clone(int argc, char **argv) {
     }
 
     printf("done.\n");
+    return 0;
+}
+
+/* ---- gut repack ---- */
+/* Collects all loose objects and packs them into a single .pack + .idx, then
+ * deletes the loose objects. */
+static int cmd_repack(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char objects_dir[2048];
+    char pack_dir[2048];
+    char pack_hex[GUT_OID_HEX_SIZE + 1];
+    gut_oid *oids = NULL;
+    u64 count = 0;
+    u64 capacity = 128;
+    unsigned long rc;
+    DIR *d1, *d2;
+    struct dirent *ent1, *ent2;
+
+    (void)argc;
+    (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    snprintf(objects_dir, sizeof(objects_dir), "%s/objects", repo.git_dir);
+    snprintf(pack_dir, sizeof(pack_dir), "%s/pack", objects_dir);
+
+    /* Walk .git/objects/XX/YYY... directories collecting all loose OIDs */
+    oids = (gut_oid *)malloc(capacity * sizeof(gut_oid));
+    if (!oids) return 1;
+
+    d1 = opendir(objects_dir);
+    if (!d1) { free(oids); fprintf(stderr, "error: cannot open objects directory\n"); return 1; }
+
+    while ((ent1 = readdir(d1)) != NULL) {
+        char sub_dir[2048];
+
+        /* We only want two-char hex dir names */
+        if (strlen(ent1->d_name) != 2) continue;
+        if (!((ent1->d_name[0] >= '0' && ent1->d_name[0] <= '9') ||
+              (ent1->d_name[0] >= 'a' && ent1->d_name[0] <= 'f'))) continue;
+        if (!((ent1->d_name[1] >= '0' && ent1->d_name[1] <= '9') ||
+              (ent1->d_name[1] >= 'a' && ent1->d_name[1] <= 'f'))) continue;
+
+        snprintf(sub_dir, sizeof(sub_dir), "%s/%s", objects_dir, ent1->d_name);
+        d2 = opendir(sub_dir);
+        if (!d2) continue;
+
+        while ((ent2 = readdir(d2)) != NULL) {
+            char hex_full[GUT_OID_HEX_SIZE + 1];
+            gut_oid oid;
+
+            if (strlen(ent2->d_name) != 38) continue;
+
+            snprintf(hex_full, sizeof(hex_full), "%s%s", ent1->d_name, ent2->d_name);
+            if (oid_from_hex(&oid, hex_full) != 0) continue;
+
+            if (count >= capacity) {
+                gut_oid *tmp;
+                capacity *= 2;
+                tmp = (gut_oid *)realloc(oids, capacity * sizeof(gut_oid));
+                if (!tmp) { free(oids); closedir(d2); closedir(d1); return 1; }
+                oids = tmp;
+            }
+            memcpy(oids[count].bytes, oid.bytes, GUT_OID_RAW_SIZE);
+            count++;
+        }
+        closedir(d2);
+    }
+    closedir(d1);
+
+    if (count == 0) {
+        printf("Nothing to repack.\n");
+        free(oids);
+        return 0;
+    }
+
+    printf("Packing %llu loose objects...\n", (unsigned long long)count);
+
+    rc = pack_write(pack_hex, pack_dir, &repo.odb, oids, count);
+    if (rc) {
+        fprintf(stderr, "error: pack_write failed (line %lu)\n", rc);
+        free(oids);
+        return 1;
+    }
+
+    printf("Pack created: pack-%s.pack\n", pack_hex);
+
+    /* Delete the loose object files */
+    {
+        u64 i;
+        u64 removed = 0;
+        for (i = 0; i < count; i++) {
+            char path[2048];
+            char prefix[3];
+            char suffix[39];
+
+            oid_path_prefix(prefix, &oids[i]);
+            oid_path_suffix(suffix, &oids[i]);
+            snprintf(path, sizeof(path), "%s/%s/%s", objects_dir, prefix, suffix);
+
+            if (remove(path) == 0) removed++;
+        }
+        printf("Removed %llu loose objects.\n", (unsigned long long)removed);
+    }
+
+    /* Try to remove now-empty fan-out directories */
+    {
+        d1 = opendir(objects_dir);
+        if (d1) {
+            while ((ent1 = readdir(d1)) != NULL) {
+                char sub_dir[2048];
+                if (strlen(ent1->d_name) != 2) continue;
+                snprintf(sub_dir, sizeof(sub_dir), "%s/%s", objects_dir, ent1->d_name);
+#ifdef _WIN32
+                _rmdir(sub_dir);
+#else
+                rmdir(sub_dir);
+#endif
+            }
+            closedir(d1);
+        }
+    }
+
+    free(oids);
     return 0;
 }
 
@@ -2929,6 +3062,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "pack-objects") == 0) {
         return cmd_pack_objects(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "repack") == 0) {
+        return cmd_repack(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);

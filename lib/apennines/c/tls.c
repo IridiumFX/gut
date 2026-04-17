@@ -6,7 +6,6 @@
 #include "apennines/pki.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 /* ================================================================
  *  Internal constants — TLS 1.3 (RFC 8446)
@@ -1198,7 +1197,20 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     free(hs_msg); hs_msg = NULL;
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Step 11: Send client Finished */
+    /* Step 11: Derive application traffic keys.
+     *
+     * RFC 8446 §7.1: application_traffic_secret_0 is derived from the
+     * transcript ending at server Finished (NOT including client Finished).
+     * We derive BEFORE sending our own Finished and BEFORE appending it to
+     * the transcript. */
+    u8 app_c_key[16], app_c_iv[12];
+    u8 app_s_key[16], app_s_iv[12];
+    rc = derive_application_keys(app_c_key, app_c_iv,
+                                  app_s_key, app_s_iv,
+                                  handshake_secret, &ts);
+    if (rc) { rc = 4; goto fail_ts; }
+
+    /* Step 12: Send client Finished (still using handshake traffic keys) */
     rc = transcript_hash(th, &ts);
     if (rc) { rc = 4; goto fail_ts; }
     rc = build_finished(finished_buf, &finished_len, client_finished_key, th);
@@ -1207,17 +1219,8 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     rc = send_encrypted_record(conn, CT_HANDSHAKE, finished_buf, finished_len);
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Add client Finished to transcript for application key derivation */
-    transcript_append(&ts, finished_buf, finished_len);
-
-    /* Step 12: Derive application traffic keys */
+    /* Step 13: Install application traffic keys for subsequent records. */
     {
-        u8 app_c_key[16], app_c_iv[12];
-        u8 app_s_key[16], app_s_iv[12];
-        rc = derive_application_keys(app_c_key, app_c_iv,
-                                      app_s_key, app_s_iv,
-                                      handshake_secret, &ts);
-        if (rc) { rc = 4; goto fail_ts; }
 
         memcpy(conn->client_write_key, app_c_key, 16);
         memcpy(conn->client_write_iv,  app_c_iv,  12);
@@ -1712,7 +1715,18 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
     transcript_append(&ts, finished_buf, finished_len);
 
-    /* Step 10: Receive client Finished */
+    /* Step 10: Derive application traffic keys BEFORE receiving client
+     * Finished. RFC 8446 §7.1 specifies that application_traffic_secret_0
+     * is derived from the transcript ending at server Finished (not
+     * including client Finished). */
+    u8 app_c_key[16], app_c_iv[12];
+    u8 app_s_key[16], app_s_iv[12];
+    rc = derive_application_keys(app_c_key, app_c_iv,
+                                  app_s_key, app_s_iv,
+                                  handshake_secret, &ts);
+    if (rc) { rc = 4; goto fail_ts; }
+
+    /* Step 11: Receive client Finished (still using handshake traffic keys) */
     rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
     if (rc) { rc = 4; goto fail_ts; }
 
@@ -1723,15 +1737,8 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     free(hs_msg); hs_msg = NULL;
     if (rc) { rc = 4; goto fail_ts; }
 
-    /* Step 11: Derive application traffic keys */
+    /* Step 12: Install application traffic keys for subsequent records. */
     {
-        u8 app_c_key[16], app_c_iv[12];
-        u8 app_s_key[16], app_s_iv[12];
-        rc = derive_application_keys(app_c_key, app_c_iv,
-                                      app_s_key, app_s_iv,
-                                      handshake_secret, &ts);
-        if (rc) { rc = 4; goto fail_ts; }
-
         memcpy(conn->client_write_key, app_c_key, 16);
         memcpy(conn->client_write_iv,  app_c_iv,  12);
         memcpy(conn->server_write_key, app_s_key, 16);

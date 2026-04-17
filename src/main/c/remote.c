@@ -163,6 +163,71 @@ static unsigned long http_post(u8 **resp_body, u64 *resp_body_len,
     return 0;
 }
 
+/* ---- HTTP chunked transfer-encoding dechunker ----
+ * If the body is chunked ("1BC\r\n<data>\r\n...0\r\n\r\n"), dechunks in place.
+ * If not chunked, leaves body untouched. */
+static unsigned long dechunk_if_needed(u8 **body, u64 *body_len) {
+    u8 *src = *body;
+    u64 src_len = *body_len;
+    u64 k, p;
+    int is_chunked = 0;
+    u8 *dechunked;
+    u64 dechunked_len = 0;
+    u64 dechunked_cap;
+
+    /* Detect: starts with hex + CRLF */
+    k = 0;
+    while (k < src_len && ((src[k] >= '0' && src[k] <= '9') ||
+           (src[k] >= 'a' && src[k] <= 'f') ||
+           (src[k] >= 'A' && src[k] <= 'F'))) k++;
+    if (k > 0 && k + 1 < src_len && src[k] == '\r' && src[k + 1] == '\n') {
+        is_chunked = 1;
+    }
+    if (!is_chunked) return 0;
+
+    dechunked_cap = src_len;
+    dechunked = (u8 *)malloc((size_t)dechunked_cap);
+    if (!dechunked) return __LINE__;
+
+    p = 0;
+    while (p < src_len) {
+        u64 chunk_size = 0;
+        while (p < src_len && src[p] != '\r') {
+            u8 c = src[p];
+            chunk_size <<= 4;
+            if (c >= '0' && c <= '9') chunk_size |= c - '0';
+            else if (c >= 'a' && c <= 'f') chunk_size |= 10 + c - 'a';
+            else if (c >= 'A' && c <= 'F') chunk_size |= 10 + c - 'A';
+            else break;
+            p++;
+        }
+        if (p + 1 >= src_len || src[p] != '\r' || src[p + 1] != '\n') break;
+        p += 2;
+
+        if (chunk_size == 0) break;
+        if (p + chunk_size > src_len) break;
+
+        if (dechunked_len + chunk_size > dechunked_cap) {
+            u8 *tmp;
+            dechunked_cap = (dechunked_len + chunk_size) * 2;
+            tmp = (u8 *)realloc(dechunked, (size_t)dechunked_cap);
+            if (!tmp) { free(dechunked); return __LINE__; }
+            dechunked = tmp;
+        }
+
+        memcpy(dechunked + dechunked_len, src + p, (size_t)chunk_size);
+        dechunked_len += chunk_size;
+        p += chunk_size;
+
+        if (p + 1 < src_len && src[p] == '\r' && src[p + 1] == '\n') p += 2;
+    }
+
+    free(src);
+    *body = dechunked;
+    *body_len = dechunked_len;
+    return 0;
+}
+
 /* ---- Smart HTTP protocol ---- */
 
 unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
@@ -191,6 +256,9 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
 
     rc = http_get(&body, &body_len, info_url);
     if (rc) return __LINE__;
+
+    rc = dechunk_if_needed(&body, &body_len);
+    if (rc) { free(body); return __LINE__; }
 
     /* Parse pkt-line response.
      * First line is usually "# service=git-upload-pack\n"
@@ -337,6 +405,66 @@ unsigned long remote_fetch_pack(const char *url,
                    "application/x-git-upload-pack-request");
     buf_destroy(&request);
     if (rc) return __LINE__;
+
+    rc = dechunk_if_needed(&resp_body, &resp_len);
+    if (rc) { free(resp_body); return __LINE__; }
+
+    /* If sideband-64k was negotiated, the pack is wrapped in pkt-lines
+     * where each packet's first byte is a band ID (1=pack data, 2=progress, 3=error).
+     * Extract only band-1 data into a continuous stream. */
+    {
+        u8 *pack_stream = NULL;
+        u64 pack_stream_len = 0;
+        u64 p = 0;
+        int saw_nak = 0;
+
+        pack_stream = (u8 *)malloc((size_t)resp_len);
+        if (!pack_stream) { free(resp_body); return __LINE__; }
+
+        while (p + 4 <= resp_len) {
+            u32 plen = pktline_len(resp_body + p);
+            if (plen == 0) {
+                /* flush packet */
+                p += 4;
+                continue;
+            }
+            if (plen < 4 || p + plen > resp_len) break;
+
+            {
+                const u8 *payload = resp_body + p + 4;
+                u64 payload_len = plen - 4;
+
+                /* NAK line: "NAK\n" (no sideband prefix) */
+                if (!saw_nak && payload_len >= 3 &&
+                    payload[0] == 'N' && payload[1] == 'A' && payload[2] == 'K') {
+                    saw_nak = 1;
+                    p += plen;
+                    continue;
+                }
+
+                if (payload_len >= 1) {
+                    u8 band = payload[0];
+                    if (band == 1) {
+                        /* Pack data */
+                        memcpy(pack_stream + pack_stream_len,
+                               payload + 1, (size_t)(payload_len - 1));
+                        pack_stream_len += payload_len - 1;
+                    }
+                    /* band 2 = progress, band 3 = error — ignore for now */
+                }
+            }
+            p += plen;
+        }
+
+        if (pack_stream_len == 0) {
+            /* No sideband — scan for PACK signature directly */
+            free(pack_stream);
+        } else {
+            free(resp_body);
+            resp_body = pack_stream;
+            resp_len = pack_stream_len;
+        }
+    }
 
     /* Response: skip pkt-line header (NAK etc), find PACK signature */
     {
