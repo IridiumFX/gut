@@ -38,6 +38,7 @@ static void usage(void) {
         "   repack      Pack all loose objects and remove them\n"
         "   listen      Broadcast ref change events via WebSocket\n"
         "   leech       Subscribe to a peer's gut listen events\n"
+        "   send        Send a one-shot text message to a listener\n"
         "   leechers    Query a listener for its connected peers\n"
         "   login       Authenticate with an OIDC issuer (device flow)\n"
         "   add         Add file contents to the index\n"
@@ -434,6 +435,35 @@ static int cmd_listen(int argc, char **argv) {
 
     rc = leech_listen(&repo, port, poll_ms, token);
     return rc ? 1 : 0;
+}
+
+/* ---- gut send ---- */
+/* One-shot: connect, send a message, optionally wait for one reply, close. */
+static int cmd_send(int argc, char **argv) {
+    const char *url = NULL;
+    const char *token = NULL;
+    const char *text = NULL;
+    int wait_reply = 0;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = argv[++i];
+        } else if (strcmp(argv[i], "--reply") == 0) {
+            wait_reply = 1;
+        } else if (!url) {
+            url = argv[i];
+        } else if (!text) {
+            text = argv[i];
+        }
+    }
+
+    if (!url || !text) {
+        fprintf(stderr, "usage: gut send <ws://host:port> <text> [--token <t>] [--reply]\n");
+        return 1;
+    }
+
+    return leech_send_to(url, token, text, (u64)strlen(text), wait_reply) ? 1 : 0;
 }
 
 /* ---- gut leechers ---- */
@@ -3721,6 +3751,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "leech") == 0) {
         return cmd_leech(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "send") == 0) {
+        return cmd_send(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "leechers") == 0) {
         return cmd_leechers(argc - 2, argv + 2);

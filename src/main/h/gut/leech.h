@@ -49,4 +49,17 @@ unsigned long leech_connect(const char *url, const char *token,
  * host: "host:port" (IPv4 literal for now). Prints JSON to stdout. */
 unsigned long leech_list_peers(const char *host);
 
+/* Set a callback invoked when a connected leecher sends a text message
+ * upstream. Must be set before leech_listen() runs. NULL clears (default
+ * behavior just prints to stdout). */
+typedef void (*leech_on_msg_fn)(u64 peer_slot_id, const char *text, u64 len);
+void leech_listen_set_on_message(leech_on_msg_fn fn);
+
+/* Send a one-shot text message to a peer's listen server.
+ * Opens TCP, does WS upgrade, sends a single masked text frame, closes.
+ * url: ws://host:port  token: optional bearer auth.
+ * If wait_reply is non-zero, reads and prints one reply text frame. */
+unsigned long leech_send_to(const char *url, const char *token,
+                            const char *text, u64 len, int wait_reply);
+
 #endif /* GUT_LEECH_H */

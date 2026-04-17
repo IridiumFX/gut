@@ -573,6 +573,18 @@ static peer_slot g_peers[GUT_LEECH_MAX_PEERS];
 static u64 g_next_slot_id = 1;
 static gut_repo *g_listen_repo = NULL; /* repo for serving /pack and other endpoints */
 
+/* Callback set by leech_listen_set_on_message — see leech.h */
+static leech_on_msg_fn g_on_peer_msg = NULL;
+
+void leech_listen_set_on_message(leech_on_msg_fn fn) { g_on_peer_msg = fn; }
+
+/* Default handler — prints inbound messages */
+static void default_inbound_handler(u64 peer_id, const char *text, u64 len) {
+    printf("[from peer #%llu] %.*s\n",
+           (unsigned long long)peer_id, (int)len, text);
+    fflush(stdout);
+}
+
 /* Forward declaration — the discovery command reads these via a helper */
 static u64 peer_count_connected(void) {
     u64 n = 0;
@@ -865,20 +877,54 @@ static int peer_handshake_step(int idx, const char *required_token) {
     return 0;
 }
 
-/* Drain any incoming data from a connected peer (close/ping handling).
- * We ignore application data — clients are receive-only.
+/* Drain any incoming data from a connected peer.
+ * Decodes WS frames as they arrive: text → dispatch to handler,
+ * close → return -1, ping → ignore (TODO: pong).
  * Returns -1 if the peer closed or errored. */
 static int peer_drain_connected(int idx) {
     peer_slot *p = &g_peers[idx];
     u8 chunk[2048];
     u64 nr;
     unsigned long rc;
+    leech_on_msg_fn handler = g_on_peer_msg ? g_on_peer_msg : default_inbound_handler;
 
     rc = tcp_conn_read(&nr, &p->conn, chunk, sizeof(chunk));
     if (rc) return 1; /* non-blocking: no data */
-    if (nr == 0) return -1; /* closed */
+    if (nr == 0) return -1; /* peer closed */
 
-    /* Ignore — we don't parse frames from clients */
+    /* Append to per-peer recv_buf and decode frames */
+    if (buf_append(&p->recv_buf, chunk, nr) != 0) return -1;
+
+    for (;;) {
+        ws_frame frame;
+        u64 consumed = 0;
+        unsigned long drc;
+
+        drc = ws_frame_decode(&frame, &consumed, p->recv_buf.data, p->recv_buf.len);
+        if (drc == 4) break; /* need more data */
+        if (drc) return -1;  /* protocol error */
+
+        if (frame.opcode == WS_OPCODE_TEXT) {
+            handler(p->slot_id, (const char *)frame.payload, frame.payload_len);
+        } else if (frame.opcode == WS_OPCODE_CLOSE) {
+            ws_frame_free(&frame);
+            return -1;
+        } else if (frame.opcode == WS_OPCODE_PING) {
+            /* TODO: send PONG */
+        }
+
+        ws_frame_free(&frame);
+
+        /* Consume from buffer */
+        if (consumed > 0 && consumed <= p->recv_buf.len) {
+            memmove(p->recv_buf.data, p->recv_buf.data + consumed,
+                    (size_t)(p->recv_buf.len - consumed));
+            p->recv_buf.len -= consumed;
+        } else {
+            break;
+        }
+    }
+
     return 0;
 }
 
@@ -1584,6 +1630,163 @@ unsigned long leech_list_peers(const char *host) {
             }
         }
         buf_destroy(&resp);
+    }
+
+    tcp_conn_destroy(&conn);
+    return 0;
+}
+
+/* ====================================================================
+ *  Public: leech_send_to — one-shot client send
+ * ==================================================================== */
+
+unsigned long leech_send_to(const char *url, const char *token,
+                            const char *text, u64 len, int wait_reply) {
+    char host[256];
+    char path[512];
+    u16  port;
+    net_sock_addr addr;
+    tcp_conn conn;
+    u8 ws_key[16];
+    u8 *request = NULL;
+    u64 request_len = 0;
+    u8 *frame = NULL;
+    u64 frame_len = 0;
+    u8 mask_key[4];
+    unsigned long rc;
+    u64 n;
+
+    rc = parse_ws_url(url, host, sizeof(host), &port, path, sizeof(path));
+    if (rc) { fprintf(stderr, "error: bad URL '%s'\n", url); return __LINE__; }
+
+    /* Resolve as IPv4 literal (MVP) */
+    memset(&addr, 0, sizeof(addr));
+    addr.family = 4;
+    addr.port = port;
+    {
+        unsigned a, b, c, d;
+        if (sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
+            a > 255 || b > 255 || c > 255 || d > 255) {
+            fprintf(stderr, "error: send requires IPv4 host literal, got '%s'\n", host);
+            return __LINE__;
+        }
+        addr.addr.v4.octets[0] = (u8)a;
+        addr.addr.v4.octets[1] = (u8)b;
+        addr.addr.v4.octets[2] = (u8)c;
+        addr.addr.v4.octets[3] = (u8)d;
+    }
+
+    rc = tcp_conn_create(&conn, &addr);
+    if (rc) {
+        fprintf(stderr, "error: cannot connect to %s:%u\n", host, (unsigned)port);
+        return __LINE__;
+    }
+
+    /* WS handshake */
+    {
+        int i;
+        u64 seed = (u64)time(NULL) ^ (u64)(uintptr_t)&conn;
+        for (i = 0; i < 16; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            ws_key[i] = (u8)(seed >> 56);
+        }
+    }
+
+    rc = ws_handshake_build_request(&request, &request_len, host, path, ws_key);
+    if (rc) { tcp_conn_destroy(&conn); return __LINE__; }
+
+    /* Inject Authorization */
+    if (token && *token) {
+        buf modified;
+        u8 *end_pos = NULL;
+        u64 i;
+        for (i = 0; i + 3 < request_len; i++) {
+            if (memcmp(request + i, "\r\n\r\n", 4) == 0) {
+                end_pos = request + i + 2; break;
+            }
+        }
+        if (end_pos) {
+            u64 head_len = (u64)(end_pos - request);
+            char auth_line[512];
+            int auth_len = snprintf(auth_line, sizeof(auth_line),
+                                    "Authorization: Bearer %s\r\n", token);
+            buf_create(&modified, request_len + auth_len);
+            buf_append(&modified, request, head_len);
+            buf_append(&modified, (u8 *)auth_line, (u64)auth_len);
+            buf_append(&modified, request + head_len, request_len - head_len);
+            free(request);
+            request = (u8 *)malloc((size_t)modified.len);
+            memcpy(request, modified.data, (size_t)modified.len);
+            request_len = modified.len;
+            buf_destroy(&modified);
+        }
+    }
+
+    rc = tcp_conn_write_all(&n, &conn, request, request_len);
+    free(request);
+    if (rc) { tcp_conn_destroy(&conn); return __LINE__; }
+
+    /* Read upgrade response */
+    {
+        buf resp;
+        int valid = 0;
+        buf_create(&resp, 4096);
+        rc = read_http_request(&resp, &conn);
+        if (rc == 0) {
+            ws_handshake_validate_response(&valid, resp.data, resp.len, ws_key);
+        }
+        buf_destroy(&resp);
+        if (!valid) {
+            fprintf(stderr, "error: server rejected upgrade\n");
+            tcp_conn_destroy(&conn);
+            return __LINE__;
+        }
+    }
+
+    /* Send the text frame, MASKED (RFC 6455: client→server must mask) */
+    {
+        u64 seed = (u64)time(NULL) ^ (u64)(uintptr_t)text;
+        int i;
+        for (i = 0; i < 4; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            mask_key[i] = (u8)(seed >> 56);
+        }
+    }
+    rc = ws_frame_encode(&frame, &frame_len, WS_OPCODE_TEXT,
+                         (const u8 *)text, len, 1, mask_key);
+    if (rc) { tcp_conn_destroy(&conn); return __LINE__; }
+
+    rc = tcp_conn_write_all(&n, &conn, frame, frame_len);
+    free(frame);
+    if (rc) { tcp_conn_destroy(&conn); return __LINE__; }
+
+    /* Optionally read one reply frame */
+    if (wait_reply) {
+        buf accum;
+        buf_create(&accum, 1024);
+        for (;;) {
+            u8 chunk[2048];
+            u64 nr;
+            ws_frame rf;
+            u64 consumed = 0;
+            unsigned long drc;
+
+            if (tcp_conn_read(&nr, &conn, chunk, sizeof(chunk)) != 0) break;
+            if (nr == 0) break;
+            buf_append(&accum, chunk, nr);
+
+            drc = ws_frame_decode(&rf, &consumed, accum.data, accum.len);
+            if (drc == 0) {
+                if (rf.opcode == WS_OPCODE_TEXT) {
+                    fwrite(rf.payload, 1, (size_t)rf.payload_len, stdout);
+                    printf("\n");
+                    fflush(stdout);
+                }
+                ws_frame_free(&rf);
+                break;
+            }
+        }
+        buf_destroy(&accum);
     }
 
     tcp_conn_destroy(&conn);
