@@ -788,19 +788,116 @@ static unsigned long build_finished(u8 *out_msg, u64 *out_msg_len,
     return 0;
 }
 
-/* Receive a handshake message from an encrypted record.
- * The caller frees *out_msg. */
-static unsigned long recv_handshake_encrypted(u8 **out_msg, u64 *out_msg_len,
-                                               tls_conn *conn)
-{
-    u8 inner_type;
-    unsigned long rc = recv_encrypted_record(&inner_type, out_msg, out_msg_len, conn);
+/* ================================================================
+ *  Handshake-message reader with record reassembly
+ *
+ *  RFC 8446 §5.1: a single handshake message MAY span multiple TLS
+ *  records, and a single record MAY carry multiple handshake messages.
+ *  This buffer accumulates decrypted handshake payload across records
+ *  and hands out exactly one complete message per call.
+ * ================================================================ */
+
+typedef struct {
+    u8 *data;
+    u64 len;
+    u64 cap;
+} hs_buf_t;
+
+static unsigned long hs_buf_init(hs_buf_t *b) {
+    b->cap = 16384;
+    b->data = (u8 *)malloc((size_t)b->cap);
+    if (!b->data) { b->cap = 0; return 1; }
+    b->len = 0;
+    return 0;
+}
+
+static void hs_buf_free(hs_buf_t *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static unsigned long hs_buf_grow(hs_buf_t *b, u64 need) {
+    u64 new_cap;
+    u8 *p;
+    if (b->len + need <= b->cap) return 0;
+    new_cap = b->cap == 0 ? 16384 : b->cap * 2;
+    while (new_cap < b->len + need) new_cap *= 2;
+    p = (u8 *)realloc(b->data, (size_t)new_cap);
+    if (!p) return 1;
+    b->data = p;
+    b->cap = new_cap;
+    return 0;
+}
+
+static unsigned long hs_buf_append(hs_buf_t *b, const u8 *data, u64 len) {
+    unsigned long rc = hs_buf_grow(b, len);
     if (rc) return rc;
-    if (inner_type != CT_HANDSHAKE) {
-        free(*out_msg);
-        *out_msg = NULL;
-        return 1;
+    memcpy(b->data + b->len, data, (size_t)len);
+    b->len += len;
+    return 0;
+}
+
+static void hs_buf_consume(hs_buf_t *b, u64 n) {
+    if (n >= b->len) { b->len = 0; return; }
+    memmove(b->data, b->data + n, (size_t)(b->len - n));
+    b->len -= n;
+}
+
+/* Read exactly one complete handshake message, possibly spanning several
+ * records or sharing a record with adjacent messages. Any overrun stays in
+ * hs_buf for the next call. Caller frees *out_msg.
+ *
+ * Error hatches:
+ *   1  underlying record read / decryption failed (bubble-up is preserved)
+ *   2  received non-handshake inner content type in the middle of handshake
+ *   3  hs_buf grow failed
+ *   4  output alloc failed */
+static unsigned long recv_handshake_msg(u8 **out_msg, u64 *out_msg_len,
+                                         tls_conn *conn, hs_buf_t *hs_buf)
+{
+    u32 body_len;
+    u64 total;
+    unsigned long rc;
+
+    *out_msg = NULL;
+    *out_msg_len = 0;
+
+    /* Ensure the 4-byte handshake header is present. */
+    while (hs_buf->len < 4) {
+        u8 inner_type;
+        u8 *rec_data = NULL;
+        u64 rec_len = 0;
+        rc = recv_encrypted_record(&inner_type, &rec_data, &rec_len, conn);
+        if (rc) return 1;
+        if (inner_type != CT_HANDSHAKE) { free(rec_data); return 2; }
+        rc = hs_buf_append(hs_buf, rec_data, rec_len);
+        free(rec_data);
+        if (rc) return 3;
     }
+
+    body_len = get_u24(hs_buf->data + 1);
+    total = 4 + (u64)body_len;
+
+    /* Keep pulling records until the full message is buffered. */
+    while (hs_buf->len < total) {
+        u8 inner_type;
+        u8 *rec_data = NULL;
+        u64 rec_len = 0;
+        rc = recv_encrypted_record(&inner_type, &rec_data, &rec_len, conn);
+        if (rc) return 1;
+        if (inner_type != CT_HANDSHAKE) { free(rec_data); return 2; }
+        rc = hs_buf_append(hs_buf, rec_data, rec_len);
+        free(rec_data);
+        if (rc) return 3;
+    }
+
+    *out_msg = (u8 *)malloc((size_t)total);
+    if (!*out_msg) return 4;
+    memcpy(*out_msg, hs_buf->data, (size_t)total);
+    *out_msg_len = total;
+    hs_buf_consume(hs_buf, total);
     return 0;
 }
 
@@ -1071,13 +1168,13 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     u8 server_finished_key[32], client_finished_key[32];
     u8 *hs_msg = NULL;
     u64 hs_msg_len;
-    u8 inner_type;
     char *alpn_result = NULL;
     u8 *peer_cert = NULL;
     u64 peer_cert_len = 0;
     u8 th[32];
     u8 finished_buf[36];
     u64 finished_len;
+    hs_buf_t hs_buf = { NULL, 0, 0 };
     unsigned long rc;
 
     if (!out) return 1;
@@ -1090,6 +1187,8 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     conn->cfg = cfg;
     conn->is_client = 1;
     conn->version = TLS_VERSION_13;
+
+    if (hs_buf_init(&hs_buf)) { free(conn); return 6; }
 
     /* Step 1: Generate ephemeral X25519 keypair */
     rc = x25519_keygen(&eph);
@@ -1162,7 +1261,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 7: Receive EncryptedExtensions */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_encrypted_extensions(&alpn_result, hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1170,7 +1269,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 8: Receive Certificate */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_certificate(&peer_cert, &peer_cert_len, hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1178,7 +1277,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 9: Receive CertificateVerify */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
     rc = parse_certificate_verify(hs_msg, hs_msg_len);
     transcript_append(&ts, hs_msg, hs_msg_len);
@@ -1186,7 +1285,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 10: Receive Finished */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Verify server Finished */
@@ -1259,6 +1358,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
     memset(server_finished_key, 0, 32);
     memset(client_finished_key, 0, 32);
     transcript_free(&ts);
+    hs_buf_free(&hs_buf);
 
     *out = conn;
     return 0;
@@ -1266,6 +1366,7 @@ unsigned long tls_conn_create_client(tls_conn **out, tcp_conn *tcp,
 fail_ts:
     transcript_free(&ts);
 fail:
+    hs_buf_free(&hs_buf);
     free(conn->alpn_selected);
     free(conn->peer_cert);
     free(conn->read_buf);
@@ -1591,6 +1692,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     u64 finished_len;
     u8 *hs_msg = NULL;
     u64 hs_msg_len;
+    hs_buf_t hs_buf = { NULL, 0, 0 };
     unsigned long rc;
 
     if (!out) return 1;
@@ -1604,6 +1706,8 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     conn->cfg = cfg;
     conn->is_client = 0;
     conn->version = TLS_VERSION_13;
+
+    if (hs_buf_init(&hs_buf)) { free(conn); return 6; }
 
     /* Step 1: Receive ClientHello */
     rc = recv_record(&rec_type, &ch_raw, &ch_raw_len, tcp);
@@ -1727,7 +1831,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     if (rc) { rc = 4; goto fail_ts; }
 
     /* Step 11: Receive client Finished (still using handshake traffic keys) */
-    rc = recv_handshake_encrypted(&hs_msg, &hs_msg_len, conn);
+    rc = recv_handshake_msg(&hs_msg, &hs_msg_len, conn, &hs_buf);
     if (rc) { rc = 4; goto fail_ts; }
 
     rc = transcript_hash(th, &ts);
@@ -1764,6 +1868,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
     memset(server_finished_key, 0, 32);
     memset(client_finished_key, 0, 32);
     transcript_free(&ts);
+    hs_buf_free(&hs_buf);
 
     *out = conn;
     return 0;
@@ -1771,6 +1876,7 @@ unsigned long tls_conn_create_server(tls_conn **out, tcp_conn *tcp,
 fail_ts:
     transcript_free(&ts);
 fail:
+    hs_buf_free(&hs_buf);
     free(alpn_match);
     free(conn->read_buf);
     free(conn);
