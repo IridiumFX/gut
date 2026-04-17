@@ -406,6 +406,8 @@ static int cmd_login(int argc, char **argv) {
 
 /* ---- gut listen ---- */
 
+#define GUT_LISTEN_MAX_OUTBOUND 16
+
 static int cmd_listen(int argc, char **argv) {
     gut_repo repo;
     char cwd[2048];
@@ -413,6 +415,9 @@ static int cmd_listen(int argc, char **argv) {
     u16 port = 7900;
     u64 poll_ms = 1000;
     const char *token = NULL;
+    int auto_fetch_default = 0;
+    leech_outbound outbound[GUT_LISTEN_MAX_OUTBOUND];
+    u64 outbound_count = 0;
     int i;
 
     for (i = 0; i < argc; i++) {
@@ -422,6 +427,23 @@ static int cmd_listen(int argc, char **argv) {
             poll_ms = (u64)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             token = argv[++i];
+        } else if (strcmp(argv[i], "--auto-fetch") == 0) {
+            auto_fetch_default = 1;
+        } else if (strcmp(argv[i], "--leech") == 0 && i + 1 < argc) {
+            if (outbound_count >= GUT_LISTEN_MAX_OUTBOUND) {
+                fprintf(stderr, "error: too many --leech subscriptions\n");
+                return 1;
+            }
+            outbound[outbound_count].url = argv[++i];
+            outbound[outbound_count].token = NULL;
+            outbound[outbound_count].name = NULL;
+            outbound[outbound_count].auto_fetch = auto_fetch_default;
+            outbound_count++;
+        } else if (strcmp(argv[i], "--as") == 0 && i + 1 < argc && outbound_count > 0) {
+            /* Names the most recent --leech */
+            outbound[outbound_count - 1].name = argv[++i];
+        } else if (strcmp(argv[i], "--leech-token") == 0 && i + 1 < argc && outbound_count > 0) {
+            outbound[outbound_count - 1].token = argv[++i];
         }
     }
 
@@ -433,7 +455,7 @@ static int cmd_listen(int argc, char **argv) {
     rc = repo_open(&repo, cwd);
     if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
 
-    rc = leech_listen(&repo, port, poll_ms, token);
+    rc = leech_listen(&repo, port, poll_ms, token, outbound, outbound_count);
     return rc ? 1 : 0;
 }
 

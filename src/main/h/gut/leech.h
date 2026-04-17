@@ -26,14 +26,27 @@
  *   }
  */
 
+/* Outbound leech subscription passed to leech_listen */
+typedef struct {
+    const char *url;        /* ws://host:port */
+    const char *token;      /* NULL for none */
+    const char *name;       /* display name + refs/leech/<name>/... */
+    int         auto_fetch; /* 1 = fetch objects on update events */
+} leech_outbound;
+
 /* Start a listen server on the given port. Polls repo refs every poll_ms
- * milliseconds and broadcasts changes to connected peers.
+ * milliseconds and broadcasts changes to inbound peers. Also maintains
+ * outbound WS connections to other listeners (the "broker" model).
  *
- * token: optional bearer token — if non-NULL, peers must send
- *        "Authorization: Bearer <token>" in their upgrade request.
+ * token:     optional bearer token for inbound auth
+ * outbound:  array of outbound subscriptions (may be NULL if count==0)
+ * outbound_count: number of entries in outbound array
+ *
  * Blocks until the listener is terminated (Ctrl-C). */
 unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
-                           const char *token);
+                           const char *token,
+                           const leech_outbound *outbound,
+                           u64 outbound_count);
 
 /* Connect to a peer's listen server and print incoming events.
  * url: ws://host:port or wss://host:port (wss not implemented in MVP).

@@ -556,17 +556,28 @@ static unsigned long l_walk_commits(l_oid_set *result, gut_odb *odb, gut_oid *st
 
 typedef enum {
     PEER_SLOT_FREE = 0,
-    PEER_HANDSHAKING,      /* accumulating HTTP upgrade request */
-    PEER_CONNECTED,        /* WebSocket ready, broadcasting events */
+    PEER_HANDSHAKING,      /* inbound: accumulating HTTP upgrade request */
+    PEER_CONNECTED,        /* WebSocket ready, bidirectional traffic */
 } peer_state;
 
+typedef enum {
+    PEER_DIR_INBOUND = 0,  /* a leecher connected to us */
+    PEER_DIR_OUTBOUND,     /* we connected to a remote listener (leech mode) */
+} peer_direction;
+
 typedef struct {
-    peer_state state;
-    tcp_conn   conn;
-    buf        recv_buf;   /* accumulated handshake bytes */
-    char       addr_str[48];
-    time_t     connected_at;
-    u64        slot_id;    /* monotonic id for logging */
+    peer_state     state;
+    peer_direction dir;
+    tcp_conn       conn;
+    buf            recv_buf;   /* accumulated handshake bytes / frame data */
+    char           addr_str[48];
+    time_t         connected_at;
+    u64            slot_id;
+    /* For OUTBOUND only: metadata for auto-fetch and reconnect */
+    char           peer_host[64];
+    u16            peer_port;
+    char           peer_name[64];
+    int            auto_fetch;
 } peer_slot;
 
 static peer_slot g_peers[GUT_LEECH_MAX_PEERS];
@@ -609,6 +620,154 @@ static void peer_slot_close(int idx) {
     buf_destroy(&g_peers[idx].recv_buf);
     tcp_conn_destroy(&g_peers[idx].conn);
     memset(&g_peers[idx], 0, sizeof(g_peers[idx]));
+}
+
+/* Forward decl — defined later alongside leech_connect */
+static unsigned long parse_ws_url(const char *url, char *host, size_t host_size,
+                                  u16 *port, char *path, size_t path_size);
+
+/* Forward decl — auto-fetch helper used by outbound leech dispatcher */
+static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name,
+                                           const char *host, u16 port,
+                                           const char *oid_hex,
+                                           const char *ref_name);
+/* Forward decl — JSON string extraction (defined later) */
+static int json_get_str(char *out, size_t out_size, const char *json, const char *key);
+
+static void set_nonblocking(socket_t fd);
+
+/* Connect to a remote listener as an outbound leech. Does TCP+WS handshake
+ * synchronously. On success, allocates a peer slot in PEER_CONNECTED state.
+ * Returns slot index, or -1 on failure. */
+static int start_outbound_leech(const char *url, const char *token,
+                                const char *peer_name, int auto_fetch) {
+    char host[256];
+    char path[512];
+    u16  port;
+    net_sock_addr addr;
+    tcp_conn conn;
+    u8 ws_key[16];
+    u8 *request = NULL;
+    u64 request_len = 0;
+    int slot;
+    unsigned long rc;
+    u64 n;
+
+    rc = parse_ws_url(url, host, sizeof(host), &port, path, sizeof(path));
+    if (rc) {
+        fprintf(stderr, "error: bad leech URL '%s'\n", url);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.family = 4;
+    addr.port = port;
+    {
+        unsigned a, b, c, d;
+        if (sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+            fprintf(stderr, "error: outbound leech requires IPv4 host, got '%s'\n", host);
+            return -1;
+        }
+        addr.addr.v4.octets[0] = (u8)a;
+        addr.addr.v4.octets[1] = (u8)b;
+        addr.addr.v4.octets[2] = (u8)c;
+        addr.addr.v4.octets[3] = (u8)d;
+    }
+
+    rc = tcp_conn_create(&conn, &addr);
+    if (rc) {
+        fprintf(stderr, "error: leech cannot connect to %s:%u\n", host, (unsigned)port);
+        return -1;
+    }
+
+    /* Generate WS key */
+    {
+        int i;
+        u64 seed = (u64)time(NULL) ^ (u64)(uintptr_t)url;
+        for (i = 0; i < 16; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            ws_key[i] = (u8)(seed >> 56);
+        }
+    }
+
+    rc = ws_handshake_build_request(&request, &request_len, host, path, ws_key);
+    if (rc) { tcp_conn_destroy(&conn); return -1; }
+
+    /* Inject token if provided */
+    if (token && *token) {
+        buf mod;
+        u8 *end_pos = NULL;
+        u64 i;
+        for (i = 0; i + 3 < request_len; i++) {
+            if (memcmp(request + i, "\r\n\r\n", 4) == 0) { end_pos = request + i + 2; break; }
+        }
+        if (end_pos) {
+            u64 head_len = (u64)(end_pos - request);
+            char auth_line[512];
+            int auth_len = snprintf(auth_line, sizeof(auth_line),
+                                    "Authorization: Bearer %s\r\n", token);
+            buf_create(&mod, request_len + auth_len);
+            buf_append(&mod, request, head_len);
+            buf_append(&mod, (u8 *)auth_line, (u64)auth_len);
+            buf_append(&mod, request + head_len, request_len - head_len);
+            free(request);
+            request = (u8 *)malloc((size_t)mod.len);
+            memcpy(request, mod.data, (size_t)mod.len);
+            request_len = mod.len;
+            buf_destroy(&mod);
+        }
+    }
+
+    rc = tcp_conn_write_all(&n, &conn, request, request_len);
+    free(request);
+    if (rc) { tcp_conn_destroy(&conn); return -1; }
+
+    /* Read 101 response */
+    {
+        buf resp;
+        int valid = 0;
+        buf_create(&resp, 4096);
+        rc = read_http_request(&resp, &conn);
+        if (rc == 0) {
+            ws_handshake_validate_response(&valid, resp.data, resp.len, ws_key);
+        }
+        buf_destroy(&resp);
+        if (!valid) {
+            fprintf(stderr, "error: leech server rejected upgrade for %s\n", url);
+            tcp_conn_destroy(&conn);
+            return -1;
+        }
+    }
+
+    /* Claim a peer slot */
+    slot = peer_slot_alloc();
+    if (slot < 0) {
+        fprintf(stderr, "error: peer table full, cannot add outbound leech\n");
+        tcp_conn_destroy(&conn);
+        return -1;
+    }
+
+    set_nonblocking(conn.fd);
+    g_peers[slot].state = PEER_CONNECTED;
+    g_peers[slot].dir = PEER_DIR_OUTBOUND;
+    g_peers[slot].conn = conn;
+    buf_create(&g_peers[slot].recv_buf, 4096);
+    g_peers[slot].connected_at = time(NULL);
+    g_peers[slot].slot_id = g_next_slot_id++;
+    snprintf(g_peers[slot].peer_host, sizeof(g_peers[slot].peer_host), "%s", host);
+    g_peers[slot].peer_port = port;
+    snprintf(g_peers[slot].peer_name, sizeof(g_peers[slot].peer_name),
+             "%s", peer_name ? peer_name : "peer");
+    g_peers[slot].auto_fetch = auto_fetch;
+    snprintf(g_peers[slot].addr_str, sizeof(g_peers[slot].addr_str),
+             "%s:%u", host, (unsigned)port);
+
+    printf("leech #%llu connected → %s (as '%s'%s)\n",
+           (unsigned long long)g_peers[slot].slot_id,
+           g_peers[slot].addr_str, g_peers[slot].peer_name,
+           auto_fetch ? ", auto-fetch" : "");
+    fflush(stdout);
+    return slot;
 }
 
 /* Set a socket to non-blocking mode */
@@ -905,7 +1064,36 @@ static int peer_drain_connected(int idx) {
         if (drc) return -1;  /* protocol error */
 
         if (frame.opcode == WS_OPCODE_TEXT) {
-            handler(p->slot_id, (const char *)frame.payload, frame.payload_len);
+            if (p->dir == PEER_DIR_OUTBOUND) {
+                /* This is an event from a peer we're leeching. Print it
+                 * (so the daemon log shows activity) and optionally auto-fetch. */
+                printf("[leech %s] %.*s\n", p->peer_name,
+                       (int)frame.payload_len, (const char *)frame.payload);
+                fflush(stdout);
+
+                if (p->auto_fetch && g_listen_repo) {
+                    char json_copy[2048];
+                    char ev_type[32], ev_oid[GUT_OID_HEX_SIZE + 1], ev_ref[256];
+                    size_t cp = (size_t)frame.payload_len;
+                    if (cp >= sizeof(json_copy)) cp = sizeof(json_copy) - 1;
+                    memcpy(json_copy, frame.payload, cp);
+                    json_copy[cp] = '\0';
+
+                    if (json_get_str(ev_type, sizeof(ev_type), json_copy, "type") &&
+                        json_get_str(ev_oid, sizeof(ev_oid), json_copy, "oid") &&
+                        json_get_str(ev_ref, sizeof(ev_ref), json_copy, "ref")) {
+                        if (strcmp(ev_type, "update") == 0 ||
+                            strcmp(ev_type, "create") == 0) {
+                            leech_fetch_and_store(g_listen_repo, p->peer_name,
+                                                  p->peer_host, p->peer_port,
+                                                  ev_oid, ev_ref);
+                        }
+                    }
+                }
+            } else {
+                /* Inbound peer sent us a message (ask/offer/sos etc.) */
+                handler(p->slot_id, (const char *)frame.payload, frame.payload_len);
+            }
         } else if (frame.opcode == WS_OPCODE_CLOSE) {
             ws_frame_free(&frame);
             return -1;
@@ -942,6 +1130,7 @@ static void broadcast_to_peers(const char *text, u64 len) {
 
     for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
         if (g_peers[i].state != PEER_CONNECTED) continue;
+        if (g_peers[i].dir == PEER_DIR_OUTBOUND) continue; /* don't echo to servers we leech */
         {
             u64 n;
             if (tcp_conn_write_all(&n, &g_peers[i].conn, frame, frame_len) != 0) {
@@ -985,12 +1174,15 @@ static u64 now_ms(void) {
 #endif
 
 unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
-                           const char *token) {
+                           const char *token,
+                           const leech_outbound *outbound,
+                           u64 outbound_count) {
     tcp_listener listener;
     net_sock_addr addr;
     ref_snapshot prev_snap;
     unsigned long rc;
     u64 last_poll;
+    u64 oi;
 
     if (!repo) return __LINE__;
 
@@ -1013,10 +1205,20 @@ unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
         printf("  auth: none (any peer may connect)\n");
     }
     printf("  multi-peer, max %d concurrent\n", GUT_LEECH_MAX_PEERS);
+    if (outbound_count > 0) {
+        printf("  outbound subscriptions: %llu\n", (unsigned long long)outbound_count);
+    }
     fflush(stdout);
 
     memset(g_peers, 0, sizeof(g_peers));
     g_listen_repo = repo;
+
+    /* Initiate outbound connections */
+    for (oi = 0; oi < outbound_count; oi++) {
+        start_outbound_leech(outbound[oi].url, outbound[oi].token,
+                             outbound[oi].name, outbound[oi].auto_fetch);
+    }
+
     snap_init(&prev_snap);
     take_snapshot(&prev_snap, repo);
     last_poll = now_ms();
