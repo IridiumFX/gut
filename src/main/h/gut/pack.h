@@ -4,6 +4,7 @@
 #include "gut/types.h"
 #include "gut/oid.h"
 #include "gut/object.h"
+#include "gut/odb.h"
 #include "apennines/buf.h"
 
 /*
@@ -74,5 +75,26 @@ unsigned long pack_read_object(gut_object *out, gut_pack *pack, u64 offset);
 
 /* Close pack and free resources */
 unsigned long pack_close(gut_pack *pack);
+
+/* ---- Pack writer ---- */
+
+/* Write a packfile (.pack + .idx) containing the given objects.
+ *
+ *   pack_dir:    directory where the pack + idx will be created
+ *                (typically .git/objects/pack)
+ *   odb:         object database to read the objects from
+ *   oids:        array of object OIDs to include
+ *   count:       number of OIDs
+ *   out_hex:     buffer to receive the pack's SHA-1 hex (41 chars incl. NUL).
+ *                The resulting files will be named
+ *                "pack-<out_hex>.pack" and "pack-<out_hex>.idx".
+ *                May be NULL if the caller doesn't need it.
+ *
+ * The objects are written as base objects (no delta compression) with zlib.
+ * Git readers accept this perfectly. */
+unsigned long pack_write(char *out_hex,
+                         const char *pack_dir,
+                         gut_odb *odb,
+                         gut_oid *oids, u64 count);
 
 #endif /* GUT_PACK_H */

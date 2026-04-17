@@ -29,6 +29,7 @@ static void usage(void) {
         "Commands:\n"
         "   init        Create an empty gut repository\n"
         "   clone       Clone a repository via HTTP(S)\n"
+        "   pack-objects Create a pack from OIDs on stdin\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -358,6 +359,77 @@ static int cmd_clone(int argc, char **argv) {
     }
 
     printf("done.\n");
+    return 0;
+}
+
+/* ---- gut pack-objects ---- */
+/* Takes object names on stdin, one per line, creates a pack containing them.
+ * Prints the pack hash. */
+static int cmd_pack_objects(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char pack_dir[2048];
+    char pack_hex[GUT_OID_HEX_SIZE + 1];
+    char line[256];
+    gut_oid *oids = NULL;
+    u64 count = 0;
+    u64 capacity = 64;
+    unsigned long rc;
+
+    (void)argc;
+    (void)argv;
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    oids = (gut_oid *)malloc(capacity * sizeof(gut_oid));
+    if (!oids) return 1;
+
+    /* Read OID hexes from stdin */
+    while (fgets(line, sizeof(line), stdin)) {
+        size_t len = strlen(line);
+        gut_oid oid;
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        /* Accept short SHAs too */
+        if (resolve_object(&oid, &repo, line)) {
+            fprintf(stderr, "error: unknown object '%s'\n", line);
+            free(oids);
+            return 1;
+        }
+
+        if (count >= capacity) {
+            capacity *= 2;
+            oids = (gut_oid *)realloc(oids, capacity * sizeof(gut_oid));
+            if (!oids) return 1;
+        }
+        memcpy(oids[count].bytes, oid.bytes, GUT_OID_RAW_SIZE);
+        count++;
+    }
+
+    if (count == 0) {
+        fprintf(stderr, "error: no objects provided\n");
+        free(oids);
+        return 1;
+    }
+
+    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.git_dir);
+    rc = pack_write(pack_hex, pack_dir, &repo.odb, oids, count);
+    free(oids);
+    if (rc) {
+        fprintf(stderr, "error: pack_write failed (line %lu)\n", rc);
+        return 1;
+    }
+
+    printf("%s\n", pack_hex);
     return 0;
 }
 
@@ -2854,6 +2926,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "clone") == 0) {
         return cmd_clone(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "pack-objects") == 0) {
+        return cmd_pack_objects(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);

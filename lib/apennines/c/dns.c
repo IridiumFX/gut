@@ -10,6 +10,16 @@
     typedef SOCKET dns_sock_t;
     #define DNS_INVALID_SOCKET INVALID_SOCKET
     #define dns_close_socket closesocket
+
+    static int dns_wsa_init(void) {
+        static int done = 0;
+        if (!done) {
+            WSADATA wsa;
+            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
+            done = 1;
+        }
+        return 0;
+    }
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -176,6 +186,10 @@ unsigned long dns_query(dns_response *out, const char *hostname) {
 
     if (!out) return 1;
     if (!hostname) return 2;
+
+#ifdef _WIN32
+    if (dns_wsa_init() != 0) return 3;
+#endif
 
     memset(out, 0, sizeof(dns_response));
     memset(&hints, 0, sizeof(hints));

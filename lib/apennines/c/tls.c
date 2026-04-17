@@ -6,6 +6,7 @@
 #include "apennines/pki.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 /* ================================================================
  *  Internal constants — TLS 1.3 (RFC 8446)
