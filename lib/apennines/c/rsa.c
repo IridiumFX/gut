@@ -1693,10 +1693,134 @@ unsigned long rsa_keypair_destroy(rsa_keypair *kp) {
     rsa_privkey_destroy(&kp->priv);
     return 0;
 }
-unsigned long rsa_destroy(void) { return 0; }
-unsigned long rsa_privkey_export(void) { return 0; }
-unsigned long rsa_privkey_import(void) { return 0; }
-unsigned long rsa_pubkey_export(void) { return 0; }
-unsigned long rsa_pubkey_import(void) { return 0; }
-unsigned long rsa_sign_pkcs1(void) { return 0; }
-unsigned long rsa_verify_pkcs1(void) { return 0; }
+
+/* ================================================================
+ * PKCS#1 v1.5 signing (RFC 8017 §8.2) — SHA-256 only
+ * ================================================================ */
+
+/* ASN.1 DigestInfo prefix for SHA-256.
+ * SEQUENCE { SEQUENCE { OID id-sha256, NULL }, OCTET STRING <32 bytes> } */
+static const u8 PKCS1V15_SHA256_PREFIX[] = {
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20
+};
+#define PKCS1V15_SHA256_PREFIX_LEN 19
+#define PKCS1V15_SHA256_T_LEN      (PKCS1V15_SHA256_PREFIX_LEN + HLEN) /* 51 */
+
+/* Build the EMSA-PKCS1-v1_5 encoded message of length em_len.
+ *   em_len = modulus byte length (k)
+ *   Requires em_len >= t_len + 11 (so PS >= 8 bytes, RFC 8017 §9.2 step 3).
+ *   Fills em[0..em_len-1] with 0x00 0x01 FF.. FF 0x00 T. */
+static unsigned long pkcs1v15_emsa_encode(u8 *em, u64 em_len,
+                                           const u8 *msg, u64 msg_len) {
+    if (em_len < PKCS1V15_SHA256_T_LEN + 11) return 1;
+
+    u8 mhash[HLEN];
+    sha256_hash(mhash, msg, msg_len);
+
+    u64 ps_len = em_len - PKCS1V15_SHA256_T_LEN - 3;
+
+    em[0] = 0x00;
+    em[1] = 0x01;
+    memset(em + 2, 0xFF, (size_t)ps_len);
+    em[2 + ps_len] = 0x00;
+    memcpy(em + 3 + ps_len, PKCS1V15_SHA256_PREFIX,
+           PKCS1V15_SHA256_PREFIX_LEN);
+    memcpy(em + 3 + ps_len + PKCS1V15_SHA256_PREFIX_LEN, mhash, HLEN);
+    return 0;
+}
+
+unsigned long rsa_sign_pkcs1v15(buf *out, rsa_privkey *key,
+                                 const u8 *message, u64 msg_len) {
+    if (!out) return 1;
+    if (!key) return 2;
+    if (msg_len > 0 && !message) return 3;
+
+    u64 n_bits;
+    unsigned long rc = bigint_bitlen(&n_bits, &key->n);
+    if (rc) return 5;
+    u64 k = (n_bits + 7) / 8;
+    if (k < PKCS1V15_SHA256_T_LEN + 11) return 4;
+
+    u8 *em = (u8 *)malloc((size_t)k);
+    if (!em) return 5;
+
+    rc = pkcs1v15_emsa_encode(em, k, message, msg_len);
+    if (rc) { free(em); return 5; }
+
+    bigint m_bi, s_bi;
+    memset(&m_bi, 0, sizeof(bigint));
+    memset(&s_bi, 0, sizeof(bigint));
+
+    rc = bigint_from_bytes(&m_bi, em, k);
+    free(em);
+    if (rc) return 5;
+
+    rc = rsa_dp_crt(&s_bi, &m_bi, key);
+    bigint_destroy(&m_bi);
+    if (rc) { bigint_destroy(&s_bi); return 5; }
+
+    u8 *sig_bytes = (u8 *)malloc((size_t)k);
+    if (!sig_bytes) { bigint_destroy(&s_bi); return 5; }
+    rc = bigint_to_fixed_bytes(sig_bytes, k, &s_bi);
+    bigint_destroy(&s_bi);
+    if (rc) { free(sig_bytes); return 5; }
+
+    rc = buf_create(out, k);
+    if (rc) { free(sig_bytes); return 5; }
+    rc = buf_append(out, sig_bytes, k);
+    free(sig_bytes);
+    if (rc) { buf_destroy(out); return 5; }
+
+    return 0;
+}
+
+unsigned long rsa_verify_pkcs1v15(unsigned long *valid, rsa_pubkey *key,
+                                   const u8 *signature, u64 sig_len,
+                                   const u8 *message, u64 msg_len) {
+    if (!valid) return 1;
+    if (!key) return 2;
+    if (!signature) return 3;
+    if (msg_len > 0 && !message) return 4;
+
+    *valid = 0;
+
+    u64 n_bits;
+    unsigned long rc = bigint_bitlen(&n_bits, &key->n);
+    if (rc) return 5;
+    u64 k = (n_bits + 7) / 8;
+    if (sig_len != k) return 5;
+    if (k < PKCS1V15_SHA256_T_LEN + 11) return 5;
+
+    /* s = OS2IP(signature); must be < n (enforced by modpow) */
+    bigint s_bi, m_bi;
+    memset(&s_bi, 0, sizeof(bigint));
+    memset(&m_bi, 0, sizeof(bigint));
+    rc = bigint_from_bytes(&s_bi, (u8 *)signature, sig_len);
+    if (rc) return 0;
+
+    rc = rsa_ep(&m_bi, &s_bi, key);
+    bigint_destroy(&s_bi);
+    if (rc) { bigint_destroy(&m_bi); return 0; }
+
+    u8 *em = (u8 *)malloc((size_t)k);
+    if (!em) { bigint_destroy(&m_bi); return 0; }
+    rc = bigint_to_fixed_bytes(em, k, &m_bi);
+    bigint_destroy(&m_bi);
+    if (rc) { free(em); return 0; }
+
+    /* Build expected EM and compare in constant time. */
+    u8 *expected = (u8 *)malloc((size_t)k);
+    if (!expected) { free(em); return 0; }
+    rc = pkcs1v15_emsa_encode(expected, k, message, msg_len);
+    if (rc) { free(em); free(expected); return 0; }
+
+    u8 diff = 0;
+    for (u64 i = 0; i < k; i++) diff |= (u8)(em[i] ^ expected[i]);
+    free(em);
+    free(expected);
+
+    *valid = (diff == 0) ? 1 : 0;
+    return 0;
+}

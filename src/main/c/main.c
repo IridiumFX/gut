@@ -7,6 +7,7 @@
 #include "gut/remote.h"
 #include "gut/pack.h"
 #include "gut/leech.h"
+#include "gut/login.h"
 #include <dirent.h>
 #include "apennines/diff.h"
 #include <stdio.h>
@@ -38,6 +39,7 @@ static void usage(void) {
         "   listen      Broadcast ref change events via WebSocket\n"
         "   leech       Subscribe to a peer's gut listen events\n"
         "   leechers    Query a listener for its connected peers\n"
+        "   login       Authenticate with an OIDC issuer (device flow)\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -368,6 +370,37 @@ static int cmd_clone(int argc, char **argv) {
 
     printf("done.\n");
     return 0;
+}
+
+/* ---- gut login ---- */
+
+static int cmd_login(int argc, char **argv) {
+    const char *issuer = NULL;
+    const char *client_id = NULL;
+    const char *scope = "openid email";
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--client-id") == 0 && i + 1 < argc) {
+            client_id = argv[++i];
+        } else if (strcmp(argv[i], "--scope") == 0 && i + 1 < argc) {
+            scope = argv[++i];
+        } else if (argv[i][0] != '-') {
+            issuer = argv[i];
+        }
+    }
+
+    if (!issuer) {
+        fprintf(stderr, "usage: gut login <issuer-url> [--client-id <id>] [--scope <s>]\n");
+        fprintf(stderr, "  e.g.: gut login https://github.com --client-id Iv1.b507a08c87ecfe98\n");
+        return 1;
+    }
+    if (!client_id) {
+        fprintf(stderr, "error: --client-id required (register your app with the IdP)\n");
+        return 1;
+    }
+
+    return login_device_flow(issuer, client_id, scope) ? 1 : 0;
 }
 
 /* ---- gut listen ---- */
@@ -3691,6 +3724,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "leechers") == 0) {
         return cmd_leechers(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "login") == 0) {
+        return cmd_login(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);

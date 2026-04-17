@@ -1,7 +1,6 @@
 #ifndef APENNINES_T2_CRYPTO_RSA_H
 #define APENNINES_T2_CRYPTO_RSA_H
 
-
 #include "apennines/types.h"
 #include "apennines/buf.h"
 #include "apennines/bigint.h"
@@ -70,11 +69,24 @@ unsigned long rsa_pubkey_destroy(rsa_pubkey *key);
 unsigned long rsa_privkey_destroy(rsa_privkey *key);
 unsigned long rsa_keypair_destroy(rsa_keypair *kp);
 
+/* PKCS#1 v1.5 sign (RFC 8017 §8.2, SHA-256).
+   The message is hashed internally with SHA-256, then wrapped in the
+   SHA-256 DigestInfo ASN.1 structure, padded EMSA-PKCS1-v1_5 style, and
+   signed with the RSA private key.
+   Hatches: 1=null out, 2=null key, 3=null msg when msg_len>0,
+            4=modulus too small, 5=sign fail */
+unsigned long rsa_sign_pkcs1v15(buf *out, rsa_privkey *key,
+                                               const u8 *message, u64 msg_len);
+
+/* PKCS#1 v1.5 verify (RFC 8017 §8.2, SHA-256).
+   *valid set to 1 on success, 0 on failure.
+   Hatches: 1=null valid, 2=null key, 3=null sig,
+            4=null msg when msg_len>0, 5=signature length mismatch */
+unsigned long rsa_verify_pkcs1v15(unsigned long *valid,
+                                                 rsa_pubkey *key,
+                                                 const u8 *signature,
+                                                 u64 sig_len,
+                                                 const u8 *message,
+                                                 u64 msg_len);
+
 #endif /* APENNINES_T2_CRYPTO_RSA_H */
-unsigned long rsa_destroy(void);
-unsigned long rsa_privkey_export(void);
-unsigned long rsa_privkey_import(void);
-unsigned long rsa_pubkey_export(void);
-unsigned long rsa_pubkey_import(void);
-unsigned long rsa_sign_pkcs1(void);
-unsigned long rsa_verify_pkcs1(void);
