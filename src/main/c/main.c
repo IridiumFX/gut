@@ -6,6 +6,7 @@
 #include "gut/ignore.h"
 #include "gut/remote.h"
 #include "gut/pack.h"
+#include "gut/leech.h"
 #include <dirent.h>
 #include "apennines/diff.h"
 #include <stdio.h>
@@ -32,6 +33,8 @@ static void usage(void) {
         "   clone       Clone a repository via HTTP(S)\n"
         "   pack-objects Create a pack from OIDs on stdin\n"
         "   repack      Pack all loose objects and remove them\n"
+        "   listen      Broadcast ref change events via WebSocket\n"
+        "   leech       Subscribe to a peer's gut listen events\n"
         "   add         Add file contents to the index\n"
         "   unstage     Remove file from the index (keep working tree)\n"
         "   rm          Remove file from index and working tree\n"
@@ -362,6 +365,64 @@ static int cmd_clone(int argc, char **argv) {
 
     printf("done.\n");
     return 0;
+}
+
+/* ---- gut listen ---- */
+
+static int cmd_listen(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    unsigned long rc;
+    u16 port = 7900;
+    u64 poll_ms = 1000;
+    const char *token = NULL;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = (u16)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--poll") == 0 && i + 1 < argc) {
+            poll_ms = (u64)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = argv[++i];
+        }
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    rc = leech_listen(&repo, port, poll_ms, token);
+    return rc ? 1 : 0;
+}
+
+/* ---- gut leech ---- */
+
+static int cmd_leech(int argc, char **argv) {
+    const char *url = NULL;
+    const char *token = NULL;
+    unsigned long rc;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = argv[++i];
+        } else if (argv[i][0] != '-') {
+            url = argv[i];
+        }
+    }
+
+    if (!url) {
+        fprintf(stderr, "usage: gut leech <ws://host:port> [--token <t>]\n");
+        return 1;
+    }
+
+    rc = leech_connect(url, token);
+    return rc ? 1 : 0;
 }
 
 /* ---- gut repack ---- */
@@ -3065,6 +3126,12 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "repack") == 0) {
         return cmd_repack(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "listen") == 0) {
+        return cmd_listen(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "leech") == 0) {
+        return cmd_leech(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "add") == 0) {
         return cmd_add(argc - 2, argv + 2);
