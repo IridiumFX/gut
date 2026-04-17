@@ -31,6 +31,7 @@ static void usage(void) {
         "Commands:\n"
         "   init        Create an empty gut repository\n"
         "   clone       Clone a repository via HTTP(S)\n"
+        "   fetch       Fetch refs + objects from a remote\n"
         "   pack-objects Create a pack from OIDs on stdin\n"
         "   repack      Pack all loose objects and remove them\n"
         "   listen      Broadcast ref change events via WebSocket\n"
@@ -637,6 +638,184 @@ static int cmd_pack_objects(int argc, char **argv) {
     }
 
     printf("%s\n", pack_hex);
+    return 0;
+}
+
+/* ---- gut fetch ---- */
+/* Usage: gut fetch [<url>]
+ * If no URL given, reads [remote "origin"] url from .git/config. */
+static int cmd_fetch(int argc, char **argv) {
+    gut_repo repo;
+    gut_remote_refs remote_refs;
+    gut_oid *wants = NULL;
+    u64 want_count = 0;
+    gut_oid *haves = NULL;
+    u64 have_count = 0;
+    char cwd[2048];
+    char url_buf[1024];
+    const char *url = NULL;
+    char pack_path[2048];
+    char idx_cmd[4096];
+    unsigned long rc;
+    u64 i, j;
+
+    if (argc > 0) {
+        url = argv[0];
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    /* Read URL from config if not provided */
+    if (!url) {
+        gut_config cfg;
+        char config_path[2048];
+        const char *v;
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        rc = config_read(&cfg, config_path);
+        if (rc) { fprintf(stderr, "error: cannot read config\n"); return 1; }
+        if (config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
+            snprintf(url_buf, sizeof(url_buf), "%s", v);
+            url = url_buf;
+        }
+        config_destroy(&cfg);
+        if (!url) {
+            fprintf(stderr, "error: no remote configured. Usage: gut fetch [<url>]\n");
+            return 1;
+        }
+    }
+
+    printf("Fetching from %s\n", url);
+
+    /* Discover remote refs */
+    rc = remote_discover_refs(&remote_refs, url);
+    if (rc) {
+        fprintf(stderr, "error: cannot discover refs (line %lu)\n", rc);
+        return 1;
+    }
+    if (remote_refs.count == 0) {
+        printf("No refs on remote.\n");
+        return 0;
+    }
+    printf("Discovered %llu remote refs\n", (unsigned long long)remote_refs.count);
+
+    /* Collect haves: our local branch tips that exist in ODB */
+    {
+        char heads_dir[2048];
+        DIR *d;
+        struct dirent *ent;
+        u64 have_cap = 32;
+        snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.git_dir);
+        haves = (gut_oid *)malloc(have_cap * sizeof(gut_oid));
+        if (!haves) return 1;
+
+        d = opendir(heads_dir);
+        if (d) {
+            while ((ent = readdir(d)) != NULL) {
+                char ref_path[2048];
+                char local_ref[256];
+                gut_oid oid;
+                if (ent->d_name[0] == '.') continue;
+                snprintf(local_ref, sizeof(local_ref), "refs/heads/%s", ent->d_name);
+                if (repo_resolve_ref(&oid, &repo, local_ref) != 0) continue;
+                if (have_count >= have_cap) {
+                    have_cap *= 2;
+                    haves = (gut_oid *)realloc(haves, have_cap * sizeof(gut_oid));
+                    if (!haves) { closedir(d); return 1; }
+                }
+                memcpy(haves[have_count].bytes, oid.bytes, GUT_OID_RAW_SIZE);
+                have_count++;
+                (void)ref_path;
+            }
+            closedir(d);
+        }
+    }
+
+    /* Compute wants: any remote ref OID that differs from our local */
+    wants = (gut_oid *)malloc(remote_refs.count * sizeof(gut_oid));
+    if (!wants) { free(haves); return 1; }
+    for (i = 0; i < remote_refs.count; i++) {
+        const char *rname = remote_refs.refs[i].name;
+        gut_oid *rid = &remote_refs.refs[i].oid;
+        long cmp;
+        int already_have = 0;
+
+        if (strcmp(rname, "HEAD") == 0) continue;
+
+        /* Skip if we already have this exact OID as a branch tip */
+        for (j = 0; j < have_count; j++) {
+            oid_compare(&cmp, &haves[j], rid);
+            if (cmp == 0) { already_have = 1; break; }
+        }
+        /* Skip duplicate wants */
+        for (j = 0; j < want_count && !already_have; j++) {
+            oid_compare(&cmp, &wants[j], rid);
+            if (cmp == 0) { already_have = 1; break; }
+        }
+        if (already_have) continue;
+
+        memcpy(wants[want_count].bytes, rid->bytes, GUT_OID_RAW_SIZE);
+        want_count++;
+    }
+
+    if (want_count == 0) {
+        printf("Already up to date.\n");
+        free(wants);
+        free(haves);
+        return 0;
+    }
+
+    printf("Fetching %llu new commits (with %llu haves)...\n",
+           (unsigned long long)want_count, (unsigned long long)have_count);
+
+    snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-fetch.pack", repo.git_dir);
+    rc = remote_fetch_pack(url, wants, want_count, haves, have_count, pack_path);
+    free(wants);
+    free(haves);
+    if (rc) {
+        fprintf(stderr, "error: fetch failed (line %lu)\n", rc);
+        return 1;
+    }
+
+    /* Index the pack */
+    printf("Indexing pack...\n");
+    snprintf(idx_cmd, sizeof(idx_cmd),
+             "git index-pack \"%s/objects/pack/gut-fetch.pack\"", repo.git_dir);
+    if (system(idx_cmd) != 0) {
+        fprintf(stderr, "warning: git index-pack failed\n");
+    }
+
+    /* Update remote tracking refs: refs/remotes/origin/* */
+    {
+        char ref_dir[2048];
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+#ifdef _WIN32
+        _mkdir(ref_dir);
+#else
+        mkdir(ref_dir, 0755);
+#endif
+        for (i = 0; i < remote_refs.count; i++) {
+            const char *rname = remote_refs.refs[i].name;
+            char ref_path[2048];
+            char hex[GUT_OID_HEX_SIZE + 2];
+            FILE *fp;
+            if (strcmp(rname, "HEAD") == 0) continue;
+            if (strncmp(rname, "refs/heads/", 11) != 0) continue;
+            snprintf(ref_path, sizeof(ref_path), "%s/%s", ref_dir, rname + 11);
+            oid_to_hex(hex, &remote_refs.refs[i].oid);
+            hex[GUT_OID_HEX_SIZE] = '\n';
+            hex[GUT_OID_HEX_SIZE + 1] = '\0';
+            fp = fopen(ref_path, "w");
+            if (fp) { fputs(hex, fp); fclose(fp); }
+        }
+    }
+
+    printf("done.\n");
     return 0;
 }
 
@@ -3133,6 +3312,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "clone") == 0) {
         return cmd_clone(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "fetch") == 0) {
+        return cmd_fetch(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "pack-objects") == 0) {
         return cmd_pack_objects(argc - 2, argv + 2);
