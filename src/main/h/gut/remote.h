@@ -49,4 +49,26 @@ unsigned long remote_fetch_pack(const char *url,
                                 gut_oid *have_oids, u64 have_count,
                                 const char *pack_path);
 
+/* Discover refs via git-receive-pack endpoint (used for push). */
+unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *url,
+                                             const char *token);
+
+/* A single ref update command for push */
+typedef struct {
+    gut_oid old_oid;
+    gut_oid new_oid;
+    char    ref_name[256];
+} gut_remote_update;
+
+/* Send a packfile to the remote via git-receive-pack.
+ *   url:      repository URL
+ *   token:    optional bearer/basic auth token (passed as Authorization Basic
+ *             with username "x-oauth-basic")
+ *   updates:  array of (old_oid, new_oid, ref) tuples
+ *   pack_data, pack_len: full packfile bytes (PACK header to trailer SHA-1)
+ *   Sets *server_msg to the server's textual response (caller frees). */
+unsigned long remote_send_pack(char **server_msg, const char *url, const char *token,
+                               gut_remote_update *updates, u64 update_count,
+                               u8 *pack_data, u64 pack_len);
+
 #endif /* GUT_REMOTE_H */

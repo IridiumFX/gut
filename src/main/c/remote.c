@@ -502,3 +502,239 @@ unsigned long remote_fetch_pack(const char *url,
     free(resp_body);
     return 0;
 }
+
+/* ====================================================================
+ *  Push: discover refs + send pack
+ * ==================================================================== */
+
+/* Same as remote_discover_refs, but uses git-receive-pack service.
+ * Optional bearer token via Authorization. */
+unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *url,
+                                             const char *token) {
+    char info_url[2048];
+    u8 *body = NULL;
+    u64 body_len = 0;
+    u64 pos;
+    unsigned long rc;
+
+    if (!out || !url) return __LINE__;
+    out->count = 0;
+    out->capabilities[0] = '\0';
+
+    {
+        char clean_url[2048];
+        size_t ulen = strlen(url);
+        if (ulen >= sizeof(clean_url)) return __LINE__;
+        memcpy(clean_url, url, ulen + 1);
+        while (ulen > 0 && clean_url[ulen - 1] == '/') clean_url[--ulen] = '\0';
+        snprintf(info_url, sizeof(info_url),
+                 "%s/info/refs?service=git-receive-pack", clean_url);
+    }
+
+    /* Use authenticated GET if token provided */
+    if (token && *token && is_https(info_url)) {
+        https_client *c;
+        https_response resp;
+
+        rc = https_client_create(&c);
+        if (rc) return __LINE__;
+
+        /* Treat token as personal access token: HTTP Basic with x-oauth-basic / token */
+        https_client_set_auth_basic(c, "x-oauth-basic", token);
+
+        rc = https_client_get(&resp, c, info_url);
+        if (rc) { https_client_destroy(c); return __LINE__; }
+
+        if (resp.status < 200 || resp.status >= 300) {
+            fprintf(stderr, "error: server returned status %u\n", (unsigned)resp.status);
+            https_response_free(&resp);
+            https_client_destroy(c);
+            return __LINE__;
+        }
+
+        body = (u8 *)malloc((size_t)resp.body_len);
+        if (!body) { https_response_free(&resp); https_client_destroy(c); return __LINE__; }
+        memcpy(body, resp.body, (size_t)resp.body_len);
+        body_len = resp.body_len;
+
+        https_response_free(&resp);
+        https_client_destroy(c);
+    } else {
+        rc = http_get(&body, &body_len, info_url);
+        if (rc) return __LINE__;
+    }
+
+    rc = dechunk_if_needed(&body, &body_len);
+    if (rc) { free(body); return __LINE__; }
+
+    /* Parse pkt-line response (same as discover_refs) */
+    pos = 0;
+    while (pos + 4 <= body_len) {
+        u32 pkt_len = pktline_len(body + pos);
+        if (pkt_len == 0) { pos += 4; continue; }
+        if (pkt_len < 4 || pos + pkt_len > body_len) break;
+
+        {
+            const char *line = (const char *)(body + pos + 4);
+            u64 line_len = pkt_len - 4;
+            while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
+                line_len--;
+            if (line[0] == '#') { pos += pkt_len; continue; }
+
+            if (line_len >= GUT_OID_HEX_SIZE + 1 && out->count < GUT_REMOTE_MAX_REFS) {
+                gut_remote_ref *ref = &out->refs[out->count];
+                if (oid_from_hex(&ref->oid, line) == 0) {
+                    const char *name_start = line + GUT_OID_HEX_SIZE + 1;
+                    const char *name_end = name_start;
+                    const char *caps = NULL;
+                    while (name_end < line + line_len && *name_end != '\0')
+                        name_end++;
+                    if (name_end < line + line_len && *name_end == '\0')
+                        caps = name_end + 1;
+                    {
+                        size_t nlen = (size_t)(name_end - name_start);
+                        if (nlen >= sizeof(ref->name)) nlen = sizeof(ref->name) - 1;
+                        memcpy(ref->name, name_start, nlen);
+                        ref->name[nlen] = '\0';
+                    }
+                    if (caps && out->count == 0) {
+                        size_t clen = (size_t)(line + line_len - caps);
+                        if (clen >= sizeof(out->capabilities)) clen = sizeof(out->capabilities) - 1;
+                        memcpy(out->capabilities, caps, clen);
+                        out->capabilities[clen] = '\0';
+                    }
+                    out->count++;
+                }
+            }
+        }
+        pos += pkt_len;
+    }
+
+    free(body);
+    return 0;
+}
+
+unsigned long remote_send_pack(char **server_msg, const char *url, const char *token,
+                               gut_remote_update *updates, u64 update_count,
+                               u8 *pack_data, u64 pack_len) {
+    char post_url[2048];
+    buf request;
+    u64 i;
+    unsigned long rc;
+
+    if (server_msg) *server_msg = NULL;
+    if (!url || !updates || update_count == 0) return __LINE__;
+
+    {
+        char clean_url[2048];
+        size_t ulen = strlen(url);
+        if (ulen >= sizeof(clean_url)) return __LINE__;
+        memcpy(clean_url, url, ulen + 1);
+        while (ulen > 0 && clean_url[ulen - 1] == '/') clean_url[--ulen] = '\0';
+        snprintf(post_url, sizeof(post_url), "%s/git-receive-pack", clean_url);
+    }
+
+    /* Build request body: pkt-line update commands + flush + pack */
+    rc = buf_create(&request, pack_len + 1024);
+    if (rc) return __LINE__;
+
+    for (i = 0; i < update_count; i++) {
+        char old_hex[GUT_OID_HEX_SIZE + 1];
+        char new_hex[GUT_OID_HEX_SIZE + 1];
+        char line[1024];
+        oid_to_hex(old_hex, &updates[i].old_oid);
+        oid_to_hex(new_hex, &updates[i].new_oid);
+        if (i == 0) {
+            /* First command line includes capabilities */
+            snprintf(line, sizeof(line), "%s %s %s\0report-status",
+                     old_hex, new_hex, updates[i].ref_name);
+            /* Manually compose to embed the NUL byte */
+            {
+                u64 cmd_part_len = strlen(old_hex) + 1 + strlen(new_hex) + 1
+                                   + strlen(updates[i].ref_name);
+                const char *caps = "report-status";
+                u64 caps_len = strlen(caps);
+                u64 total = cmd_part_len + 1 /*NUL*/ + caps_len + 1 /*\n*/;
+                char hdr[5];
+                snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(total + 4));
+                buf_append(&request, (u8 *)hdr, 4);
+                buf_append(&request, (u8 *)old_hex, GUT_OID_HEX_SIZE);
+                buf_append_byte(&request, ' ');
+                buf_append(&request, (u8 *)new_hex, GUT_OID_HEX_SIZE);
+                buf_append_byte(&request, ' ');
+                buf_append(&request, (u8 *)updates[i].ref_name, strlen(updates[i].ref_name));
+                buf_append_byte(&request, '\0');
+                buf_append(&request, (u8 *)caps, caps_len);
+                buf_append_byte(&request, '\n');
+            }
+        } else {
+            snprintf(line, sizeof(line), "%s %s %s\n",
+                     old_hex, new_hex, updates[i].ref_name);
+            {
+                u64 ll = strlen(line);
+                char hdr[5];
+                snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(ll + 4));
+                buf_append(&request, (u8 *)hdr, 4);
+                buf_append(&request, (u8 *)line, ll);
+            }
+        }
+    }
+    pktline_flush(&request);
+
+    /* Append pack bytes */
+    buf_append(&request, pack_data, pack_len);
+
+    /* Send authenticated POST */
+    {
+        u8 *resp_body = NULL;
+        u64 resp_len = 0;
+
+        if (token && *token && is_https(post_url)) {
+            https_client *c;
+            https_response resp;
+
+            rc = https_client_create(&c);
+            if (rc) { buf_destroy(&request); return __LINE__; }
+
+            https_client_set_auth_basic(c, "x-oauth-basic", token);
+
+            rc = https_client_post(&resp, c, post_url, request.data, request.len,
+                                   "application/x-git-receive-pack-request");
+            buf_destroy(&request);
+            if (rc) { https_client_destroy(c); return __LINE__; }
+
+            if (resp.status < 200 || resp.status >= 300) {
+                fprintf(stderr, "error: push returned status %u\n", (unsigned)resp.status);
+                https_response_free(&resp);
+                https_client_destroy(c);
+                return __LINE__;
+            }
+
+            resp_body = (u8 *)malloc((size_t)resp.body_len);
+            if (!resp_body) { https_response_free(&resp); https_client_destroy(c); return __LINE__; }
+            memcpy(resp_body, resp.body, (size_t)resp.body_len);
+            resp_len = resp.body_len;
+            https_response_free(&resp);
+            https_client_destroy(c);
+        } else {
+            rc = http_post(&resp_body, &resp_len, post_url, request.data, request.len,
+                           "application/x-git-receive-pack-request");
+            buf_destroy(&request);
+            if (rc) return __LINE__;
+        }
+
+        rc = dechunk_if_needed(&resp_body, &resp_len);
+        if (rc) { free(resp_body); return __LINE__; }
+
+        if (server_msg) {
+            *server_msg = (char *)malloc((size_t)(resp_len + 1));
+            if (*server_msg) {
+                memcpy(*server_msg, resp_body, (size_t)resp_len);
+                (*server_msg)[resp_len] = '\0';
+            }
+        }
+        free(resp_body);
+    }
+
+    return 0;
+}

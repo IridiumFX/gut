@@ -32,6 +32,7 @@ static void usage(void) {
         "   init        Create an empty gut repository\n"
         "   clone       Clone a repository via HTTP(S)\n"
         "   fetch       Fetch refs + objects from a remote\n"
+        "   push        Push refs + objects to a remote\n"
         "   pack-objects Create a pack from OIDs on stdin\n"
         "   repack      Pack all loose objects and remove them\n"
         "   listen      Broadcast ref change events via WebSocket\n"
@@ -812,6 +813,313 @@ static int cmd_fetch(int argc, char **argv) {
             hex[GUT_OID_HEX_SIZE + 1] = '\0';
             fp = fopen(ref_path, "w");
             if (fp) { fputs(hex, fp); fclose(fp); }
+        }
+    }
+
+    printf("done.\n");
+    return 0;
+}
+
+/* ---- gut push ---- */
+
+/* Object set: dynamic array with linear search dedup. Sufficient for MVP sizes. */
+typedef struct {
+    gut_oid *items;
+    u64 count;
+    u64 capacity;
+} oid_set;
+
+static int oid_set_contains(oid_set *s, gut_oid *oid) {
+    u64 i;
+    for (i = 0; i < s->count; i++) {
+        if (memcmp(s->items[i].bytes, oid->bytes, GUT_OID_RAW_SIZE) == 0) return 1;
+    }
+    return 0;
+}
+
+static unsigned long oid_set_add(oid_set *s, gut_oid *oid) {
+    if (oid_set_contains(s, oid)) return 0;
+    if (s->count >= s->capacity) {
+        u64 new_cap = s->capacity == 0 ? 64 : s->capacity * 2;
+        gut_oid *tmp = (gut_oid *)realloc(s->items, (size_t)(new_cap * sizeof(gut_oid)));
+        if (!tmp) return __LINE__;
+        s->items = tmp;
+        s->capacity = new_cap;
+    }
+    memcpy(s->items[s->count].bytes, oid->bytes, GUT_OID_RAW_SIZE);
+    s->count++;
+    return 0;
+}
+
+/* Walk a tree recursively, adding all referenced object OIDs to `result`. */
+static unsigned long walk_tree_objects(oid_set *result, gut_odb *odb, gut_oid *tree_oid) {
+    gut_object obj;
+    gut_tree tree;
+    u64 i;
+    unsigned long rc;
+
+    if (oid_set_contains(result, tree_oid)) return 0;
+    rc = oid_set_add(result, tree_oid);
+    if (rc) return rc;
+
+    rc = odb_read(&obj, odb, tree_oid);
+    if (rc) return 0; /* skip unreadable */
+    if (obj.type != GUT_OBJ_TREE) { object_destroy(&obj); return 0; }
+
+    rc = tree_parse(&tree, obj.data.data, obj.data.len);
+    object_destroy(&obj);
+    if (rc) return 0;
+
+    for (i = 0; i < tree.count; i++) {
+        if (tree.entries[i].mode == 040000) {
+            walk_tree_objects(result, odb, &tree.entries[i].oid);
+        } else {
+            oid_set_add(result, &tree.entries[i].oid);
+        }
+    }
+
+    tree_destroy(&tree);
+    return 0;
+}
+
+/* Walk commits from `start`, stopping when reaching any OID in `stop_at`.
+ * Adds all reachable commits, trees, and blobs to `result`. */
+static unsigned long walk_commits_for_push(oid_set *result, gut_odb *odb,
+                                           gut_oid *start,
+                                           gut_oid *stop_at, u64 stop_count) {
+    /* Simple BFS using an explicit queue */
+    gut_oid *queue;
+    u64 qcap = 256, qhead = 0, qtail = 0;
+    unsigned long rc;
+    u64 j;
+
+    queue = (gut_oid *)malloc(qcap * sizeof(gut_oid));
+    if (!queue) return __LINE__;
+
+    /* Seed */
+    memcpy(queue[0].bytes, start->bytes, GUT_OID_RAW_SIZE);
+    qtail = 1;
+
+    while (qhead < qtail) {
+        gut_oid current;
+        gut_object obj;
+        gut_commit commit;
+        int is_stop = 0;
+
+        memcpy(current.bytes, queue[qhead++].bytes, GUT_OID_RAW_SIZE);
+
+        for (j = 0; j < stop_count; j++) {
+            if (memcmp(current.bytes, stop_at[j].bytes, GUT_OID_RAW_SIZE) == 0) {
+                is_stop = 1; break;
+            }
+        }
+        if (is_stop) continue;
+
+        if (oid_set_contains(result, &current)) continue;
+        rc = oid_set_add(result, &current);
+        if (rc) { free(queue); return rc; }
+
+        rc = odb_read(&obj, odb, &current);
+        if (rc) continue;
+        if (obj.type != GUT_OBJ_COMMIT) { object_destroy(&obj); continue; }
+
+        rc = commit_parse(&commit, obj.data.data, obj.data.len);
+        object_destroy(&obj);
+        if (rc) continue;
+
+        /* Walk this commit's tree */
+        walk_tree_objects(result, odb, &commit.tree_oid);
+
+        /* Enqueue parents */
+        for (j = 0; j < commit.parent_count; j++) {
+            if (qtail >= qcap) {
+                qcap *= 2;
+                queue = (gut_oid *)realloc(queue, qcap * sizeof(gut_oid));
+                if (!queue) { commit_destroy(&commit); return __LINE__; }
+            }
+            memcpy(queue[qtail++].bytes, commit.parent_oids[j].bytes, GUT_OID_RAW_SIZE);
+        }
+
+        commit_destroy(&commit);
+    }
+
+    free(queue);
+    return 0;
+}
+
+static int cmd_push(int argc, char **argv) {
+    gut_repo repo;
+    gut_remote_refs remote_refs;
+    char cwd[2048];
+    char url_buf[1024];
+    const char *url = NULL;
+    const char *token = NULL;
+    char head_ref[256];
+    char branch_name[128];
+    gut_oid local_oid, remote_oid;
+    int has_remote_oid = 0;
+    unsigned long rc;
+    int i;
+
+    /* Parse args: gut push [<url>] [--token <t>] */
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = argv[++i];
+        } else if (argv[i][0] != '-') {
+            if (!url) url = argv[i];
+        }
+    }
+    if (!token) token = getenv("GUT_TOKEN");
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
+
+    /* Read URL from config if not provided */
+    if (!url) {
+        gut_config cfg;
+        char config_path[2048];
+        const char *v;
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        if (config_read(&cfg, config_path) == 0) {
+            if (config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
+                snprintf(url_buf, sizeof(url_buf), "%s", v);
+                url = url_buf;
+            }
+            config_destroy(&cfg);
+        }
+        if (!url) {
+            fprintf(stderr, "error: no remote configured. Usage: gut push [<url>] [--token <t>]\n");
+            return 1;
+        }
+    }
+
+    /* Resolve current HEAD */
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    if (strncmp(head_ref, "refs/heads/", 11) != 0) {
+        fprintf(stderr, "error: HEAD is not on a branch\n");
+        return 1;
+    }
+    snprintf(branch_name, sizeof(branch_name), "%s", head_ref + 11);
+
+    rc = repo_resolve_ref(&local_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "error: cannot resolve %s\n", head_ref); return 1; }
+
+    printf("Pushing branch '%s' to %s\n", branch_name, url);
+
+    /* Discover remote refs */
+    rc = remote_discover_refs_for_push(&remote_refs, url, token);
+    if (rc) {
+        fprintf(stderr, "error: cannot discover remote refs (line %lu)\n", rc);
+        return 1;
+    }
+
+    /* Find the remote's current OID for our branch */
+    {
+        u64 j;
+        for (j = 0; j < remote_refs.count; j++) {
+            if (strcmp(remote_refs.refs[j].name, head_ref) == 0) {
+                memcpy(remote_oid.bytes, remote_refs.refs[j].oid.bytes, GUT_OID_RAW_SIZE);
+                has_remote_oid = 1;
+                break;
+            }
+        }
+    }
+
+    /* Already up to date? */
+    if (has_remote_oid &&
+        memcmp(local_oid.bytes, remote_oid.bytes, GUT_OID_RAW_SIZE) == 0) {
+        printf("Already up to date.\n");
+        return 0;
+    }
+
+    /* Compute object closure: walk from local_oid, stopping at remote_oid */
+    {
+        oid_set objects;
+        char pack_dir[2048];
+        char pack_hex[GUT_OID_HEX_SIZE + 1];
+        char pack_path[2048];
+        u8 *pack_data = NULL;
+        u64 pack_len = 0;
+        FILE *pf;
+        long fsz;
+        gut_remote_update update;
+        char *server_msg = NULL;
+
+        memset(&objects, 0, sizeof(objects));
+        if (has_remote_oid) {
+            walk_commits_for_push(&objects, &repo.odb, &local_oid, &remote_oid, 1);
+        } else {
+            walk_commits_for_push(&objects, &repo.odb, &local_oid, NULL, 0);
+        }
+
+        if (objects.count == 0) {
+            free(objects.items);
+            fprintf(stderr, "error: no objects to push\n");
+            return 1;
+        }
+
+        printf("Packing %llu objects...\n", (unsigned long long)objects.count);
+
+        /* Write pack to pack dir */
+        snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.git_dir);
+        rc = pack_write(pack_hex, pack_dir, &repo.odb, objects.items, objects.count);
+        free(objects.items);
+        if (rc) { fprintf(stderr, "error: pack_write failed (line %lu)\n", rc); return 1; }
+
+        /* Read the pack back into memory */
+        snprintf(pack_path, sizeof(pack_path), "%s/pack-%s.pack", pack_dir, pack_hex);
+        pf = fopen(pack_path, "rb");
+        if (!pf) { fprintf(stderr, "error: cannot open written pack\n"); return 1; }
+        fseek(pf, 0, SEEK_END);
+        fsz = ftell(pf);
+        fseek(pf, 0, SEEK_SET);
+        pack_data = (u8 *)malloc((size_t)fsz);
+        if (!pack_data) { fclose(pf); return 1; }
+        fread(pack_data, 1, (size_t)fsz, pf);
+        pack_len = (u64)fsz;
+        fclose(pf);
+
+        /* Build update record */
+        if (has_remote_oid) {
+            memcpy(update.old_oid.bytes, remote_oid.bytes, GUT_OID_RAW_SIZE);
+        } else {
+            memset(update.old_oid.bytes, 0, GUT_OID_RAW_SIZE);
+        }
+        memcpy(update.new_oid.bytes, local_oid.bytes, GUT_OID_RAW_SIZE);
+        snprintf(update.ref_name, sizeof(update.ref_name), "%s", head_ref);
+
+        printf("Sending pack (%llu bytes) and update command...\n",
+               (unsigned long long)pack_len);
+
+        rc = remote_send_pack(&server_msg, url, token, &update, 1, pack_data, pack_len);
+        free(pack_data);
+
+        /* Clean up the pack we just wrote — server has it now */
+        remove(pack_path);
+        {
+            char idx_path[2048];
+            snprintf(idx_path, sizeof(idx_path), "%s/pack-%s.idx", pack_dir, pack_hex);
+            remove(idx_path);
+        }
+
+        if (rc) {
+            if (server_msg) {
+                fprintf(stderr, "server response:\n%s\n", server_msg);
+                free(server_msg);
+            }
+            fprintf(stderr, "error: push failed (line %lu)\n", rc);
+            return 1;
+        }
+
+        if (server_msg) {
+            printf("server: %s\n", server_msg);
+            free(server_msg);
         }
     }
 
@@ -3315,6 +3623,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "fetch") == 0) {
         return cmd_fetch(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "push") == 0) {
+        return cmd_push(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "pack-objects") == 0) {
         return cmd_pack_objects(argc - 2, argv + 2);
