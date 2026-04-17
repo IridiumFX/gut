@@ -6,6 +6,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
+/* Atomic-replace rename */
+static int idx_atomic_rename(const char *from, const char *to) {
+#ifdef _WIN32
+    return MoveFileExA(from, to,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(from, to);
+#endif
+}
 
 /* Big-endian read/write helpers */
 static u32 read_u32(const u8 *p) {
@@ -169,7 +192,6 @@ unsigned long index_write(gut_index *idx, const char *path) {
     buf b;
     u8 header[12];
     u8 checksum[GUT_SHA1_DIGEST_SIZE];
-    FILE *fp;
     unsigned long rc;
     u64 i;
 
@@ -234,17 +256,56 @@ unsigned long index_write(gut_index *idx, const char *path) {
     rc = buf_append(&b, checksum, GUT_SHA1_DIGEST_SIZE);
     if (rc) { buf_destroy(&b); return __LINE__; }
 
-    /* Write to file */
-    fp = fopen(path, "wb");
-    if (!fp) { buf_destroy(&b); return __LINE__; }
+    /* Atomic write: go through <path>.lock with O_EXCL, then rename */
+    {
+        char lock_path[2048];
+        int fd;
+        int n = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+        if (n < 0 || (u64)n >= sizeof(lock_path)) { buf_destroy(&b); return __LINE__; }
 
-    if (fwrite(b.data, 1, (size_t)b.len, fp) != (size_t)b.len) {
-        fclose(fp);
-        buf_destroy(&b);
-        return __LINE__;
+#ifdef _WIN32
+        fd = _open(lock_path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                   _S_IREAD | _S_IWRITE);
+#else
+        fd = open(lock_path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0644);
+#endif
+        if (fd < 0) {
+            /* Lock held by another writer — fail rather than race */
+            buf_destroy(&b);
+            return __LINE__;
+        }
+
+        {
+#ifdef _WIN32
+            int w = _write(fd, b.data, (unsigned)b.len);
+#else
+            ssize_t w = write(fd, b.data, (size_t)b.len);
+#endif
+            if (w != (int)b.len) {
+#ifdef _WIN32
+                _close(fd);
+#else
+                close(fd);
+#endif
+                remove(lock_path);
+                buf_destroy(&b);
+                return __LINE__;
+            }
+        }
+
+#ifdef _WIN32
+        _close(fd);
+#else
+        close(fd);
+#endif
+
+        if (idx_atomic_rename(lock_path, path) != 0) {
+            remove(lock_path);
+            buf_destroy(&b);
+            return __LINE__;
+        }
     }
 
-    fclose(fp);
     buf_destroy(&b);
     return 0;
 }

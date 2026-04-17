@@ -6,10 +6,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <process.h>
+#define gut_getpid() _getpid()
 #else
 #include <sys/types.h>
+#include <unistd.h>
+#define gut_getpid() getpid()
 #endif
 
 /* Big-endian readers */
@@ -591,9 +596,16 @@ unsigned long pack_write(char *out_hex,
     }
 #endif
 
-    /* Write to temporary files; we rename after we know the pack SHA-1 */
-    snprintf(tmp_pack_path, sizeof(tmp_pack_path), "%s/pack-tmp.pack", pack_dir);
-    snprintf(tmp_idx_path, sizeof(tmp_idx_path), "%s/pack-tmp.idx", pack_dir);
+    /* Write to temporary files with PID + timestamp to avoid concurrent-writer
+     * collisions; we rename to content-addressed name after we know the SHA-1. */
+    {
+        unsigned long pid = (unsigned long)gut_getpid();
+        unsigned long ts = (unsigned long)time(NULL);
+        snprintf(tmp_pack_path, sizeof(tmp_pack_path),
+                 "%s/pack-tmp-%lu-%lu.pack", pack_dir, pid, ts);
+        snprintf(tmp_idx_path, sizeof(tmp_idx_path),
+                 "%s/pack-tmp-%lu-%lu.idx", pack_dir, pid, ts);
+    }
 
     fp = fopen(tmp_pack_path, "wb");
     if (!fp) return __LINE__;

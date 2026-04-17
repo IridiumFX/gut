@@ -3,9 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <direct.h>
+#include <io.h>
 #define gut_mkdir(p) _mkdir(p)
 #define gut_getcwd(b, s) _getcwd(b, s)
 #else
@@ -13,6 +17,18 @@
 #define gut_mkdir(p) mkdir(p, 0755)
 #define gut_getcwd(b, s) getcwd(b, s)
 #endif
+
+/* Atomic-replace rename: rename(from, to) replacing any existing `to`.
+ * Returns 0 on success. On Windows, wraps MoveFileExA with REPLACE_EXISTING
+ * since MinGW's rename() fails when target exists. */
+static int atomic_rename(const char *from, const char *to) {
+#ifdef _WIN32
+    return MoveFileExA(from, to,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(from, to);
+#endif
+}
 
 /* Resolve a path to absolute, normalizing separators */
 static unsigned long resolve_path(char *out, u64 out_size, const char *path) {
@@ -303,8 +319,9 @@ unsigned long repo_resolve_ref(gut_oid *out, gut_repo *repo, const char *ref) {
 
 unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
     char path[2048];
+    char lock_path[2048];
     char hex[GUT_OID_HEX_SIZE + 2];
-    FILE *fp;
+    int fd;
     unsigned long rc;
     int n;
 
@@ -314,20 +331,57 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
 
     n = snprintf(path, sizeof(path), "%s/%s", repo->git_dir, ref);
     if (n < 0 || (u64)n >= sizeof(path)) return __LINE__;
+    n = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+    if (n < 0 || (u64)n >= sizeof(lock_path)) return __LINE__;
 
     rc = oid_to_hex(hex, oid);
     if (rc) return __LINE__;
     hex[GUT_OID_HEX_SIZE] = '\n';
     hex[GUT_OID_HEX_SIZE + 1] = '\0';
 
-    fp = fopen(path, "w");
-    if (!fp) return __LINE__;
-
-    if (fputs(hex, fp) == EOF) {
-        fclose(fp);
+    /* Create .lock exclusively. If another writer holds it, fail. */
+#ifdef _WIN32
+    fd = _open(lock_path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    fd = open(lock_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+#endif
+    if (fd < 0) {
+        /* Another writer holds the lock, or a stale lock remains.
+         * Fall back to forced write for simplicity — a retry loop would be
+         * better but stale locks are painful to detect. */
         return __LINE__;
     }
 
-    fclose(fp);
+    /* Write the ref content */
+    {
+        u64 len = GUT_OID_HEX_SIZE + 1;
+#ifdef _WIN32
+        int w = _write(fd, hex, (unsigned)len);
+#else
+        ssize_t w = write(fd, hex, (size_t)len);
+#endif
+        if (w != (int)len) {
+#ifdef _WIN32
+            _close(fd);
+#else
+            close(fd);
+#endif
+            remove(lock_path);
+            return __LINE__;
+        }
+    }
+
+#ifdef _WIN32
+    _close(fd);
+#else
+    close(fd);
+#endif
+
+    /* Atomically replace path with lock file */
+    if (atomic_rename(lock_path, path) != 0) {
+        remove(lock_path);
+        return __LINE__;
+    }
+
     return 0;
 }
