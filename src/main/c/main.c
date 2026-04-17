@@ -420,23 +420,42 @@ static int cmd_leechers(int argc, char **argv) {
 static int cmd_leech(int argc, char **argv) {
     const char *url = NULL;
     const char *token = NULL;
+    const char *peer_name = NULL;
+    int auto_fetch = 0;
     unsigned long rc;
     int i;
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             token = argv[++i];
+        } else if (strcmp(argv[i], "--as") == 0 && i + 1 < argc) {
+            peer_name = argv[++i];
+        } else if (strcmp(argv[i], "--auto-fetch") == 0) {
+            auto_fetch = 1;
         } else if (argv[i][0] != '-') {
             url = argv[i];
         }
     }
 
     if (!url) {
-        fprintf(stderr, "usage: gut leech <ws://host:port> [--token <t>]\n");
+        fprintf(stderr, "usage: gut leech <ws://host:port> [--token <t>] [--as <name>] [--auto-fetch]\n");
         return 1;
     }
 
-    rc = leech_connect(url, token);
+    if (auto_fetch) {
+        gut_repo repo;
+        char cwd[2048];
+        if (!peer_name) peer_name = "peer";
+        if (!gut_getcwd(cwd, sizeof(cwd))) {
+            fprintf(stderr, "error: cannot get current directory\n");
+            return 1;
+        }
+        rc = repo_open(&repo, cwd);
+        if (rc) { fprintf(stderr, "error: --auto-fetch requires a gut repository\n"); return 1; }
+        rc = leech_connect(url, token, &repo, peer_name);
+    } else {
+        rc = leech_connect(url, token, NULL, NULL);
+    }
     return rc ? 1 : 0;
 }
 
@@ -1121,6 +1140,37 @@ static int cmd_push(int argc, char **argv) {
             printf("server: %s\n", server_msg);
             free(server_msg);
         }
+    }
+
+    /* Update local remote tracking ref so listeners can broadcast push events */
+    {
+        char ref_path[2048];
+        char ref_dir[2048];
+        char hex[GUT_OID_HEX_SIZE + 2];
+        FILE *fp;
+
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+#ifdef _WIN32
+        {
+            char tmp[2048];
+            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.git_dir);
+            _mkdir(tmp);
+            _mkdir(ref_dir);
+        }
+#else
+        {
+            char tmp[2048];
+            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.git_dir);
+            mkdir(tmp, 0755);
+            mkdir(ref_dir, 0755);
+        }
+#endif
+        snprintf(ref_path, sizeof(ref_path), "%s/%s", ref_dir, branch_name);
+        oid_to_hex(hex, &local_oid);
+        hex[GUT_OID_HEX_SIZE] = '\n';
+        hex[GUT_OID_HEX_SIZE + 1] = '\0';
+        fp = fopen(ref_path, "w");
+        if (fp) { fputs(hex, fp); fclose(fp); }
     }
 
     printf("done.\n");

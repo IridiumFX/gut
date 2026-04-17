@@ -1,6 +1,7 @@
 #include "gut/leech.h"
 #include "gut/object.h"
 #include "gut/odb.h"
+#include "gut/pack.h"
 #include "apennines/tcp.h"
 #include "apennines/ws.h"
 #include "apennines/addr.h"
@@ -86,18 +87,60 @@ static ref_entry *snap_find(ref_snapshot *s, const char *name) {
     return NULL;
 }
 
-/* Walk refs/heads and refs/tags and populate snapshot */
+/* Recursively walk a refs/ subdirectory and add all refs found */
+static void walk_refs_dir(ref_snapshot *out, const char *base_dir, const char *prefix) {
+    DIR *d = opendir(base_dir);
+    struct dirent *ent;
+    struct stat st;
+    if (!d) return;
+    while ((ent = readdir(d)) != NULL) {
+        char full_path[2048];
+        char child_prefix[512];
+
+        if (ent->d_name[0] == '.') continue;
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, ent->d_name);
+        snprintf(child_prefix, sizeof(child_prefix), "%s/%s", prefix, ent->d_name);
+
+        if (stat(full_path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse */
+            walk_refs_dir(out, full_path, child_prefix);
+        } else {
+            FILE *fp;
+            char line[64];
+            gut_oid oid;
+            fp = fopen(full_path, "r");
+            if (!fp) continue;
+            if (!fgets(line, sizeof(line), fp)) { fclose(fp); continue; }
+            fclose(fp);
+            {
+                size_t llen = strlen(line);
+                while (llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r' || line[llen - 1] == ' '))
+                    line[--llen] = '\0';
+            }
+            if (oid_from_hex(&oid, line) == 0) {
+                snap_add(out, child_prefix, &oid);
+            }
+        }
+    }
+    closedir(d);
+}
+
+/* Walk refs/heads, refs/tags, and refs/remotes (where push events appear) */
 static unsigned long take_snapshot(ref_snapshot *out, gut_repo *repo) {
-    char base_dirs[2][512];
-    const char *ref_prefixes[2];
+    char base_dirs[3][512];
+    const char *ref_prefixes[3];
     int i;
 
-    snprintf(base_dirs[0], sizeof(base_dirs[0]), "%s/refs/heads", repo->git_dir);
-    snprintf(base_dirs[1], sizeof(base_dirs[1]), "%s/refs/tags",  repo->git_dir);
+    snprintf(base_dirs[0], sizeof(base_dirs[0]), "%s/refs/heads",   repo->git_dir);
+    snprintf(base_dirs[1], sizeof(base_dirs[1]), "%s/refs/tags",    repo->git_dir);
+    snprintf(base_dirs[2], sizeof(base_dirs[2]), "%s/refs/remotes", repo->git_dir);
     ref_prefixes[0] = "refs/heads";
     ref_prefixes[1] = "refs/tags";
+    ref_prefixes[2] = "refs/remotes";
 
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 3; i++) {
         DIR *d = opendir(base_dirs[i]);
         struct dirent *ent;
         if (!d) continue;
@@ -107,10 +150,17 @@ static unsigned long take_snapshot(ref_snapshot *out, gut_repo *repo) {
             FILE *fp;
             char line[64];
             gut_oid oid;
+            struct stat st;
 
             if (ent->d_name[0] == '.') continue;
             snprintf(full_path, sizeof(full_path), "%s/%s", base_dirs[i], ent->d_name);
             snprintf(ref_name, sizeof(ref_name), "%s/%s", ref_prefixes[i], ent->d_name);
+
+            /* refs/remotes contains per-remote subdirs — recurse into those */
+            if (i == 2 && stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                walk_refs_dir(out, full_path, ref_name);
+                continue;
+            }
 
             fp = fopen(full_path, "r");
             if (!fp) continue;
@@ -406,6 +456,99 @@ static void emit_via_ws(const char *json, u64 len, void *ctx_void) {
  * ==================================================================== */
 
 /* ====================================================================
+ *  Object closure walker (mirror of cmd_push helpers, kept local)
+ * ==================================================================== */
+
+typedef struct {
+    gut_oid *items;
+    u64 count;
+    u64 capacity;
+} l_oid_set;
+
+static int l_oid_set_contains(l_oid_set *s, gut_oid *oid) {
+    u64 i;
+    for (i = 0; i < s->count; i++) {
+        if (memcmp(s->items[i].bytes, oid->bytes, GUT_OID_RAW_SIZE) == 0) return 1;
+    }
+    return 0;
+}
+
+static unsigned long l_oid_set_add(l_oid_set *s, gut_oid *oid) {
+    if (l_oid_set_contains(s, oid)) return 0;
+    if (s->count >= s->capacity) {
+        u64 new_cap = s->capacity == 0 ? 64 : s->capacity * 2;
+        gut_oid *tmp = (gut_oid *)realloc(s->items, (size_t)(new_cap * sizeof(gut_oid)));
+        if (!tmp) return __LINE__;
+        s->items = tmp;
+        s->capacity = new_cap;
+    }
+    memcpy(s->items[s->count].bytes, oid->bytes, GUT_OID_RAW_SIZE);
+    s->count++;
+    return 0;
+}
+
+static void l_walk_tree(l_oid_set *result, gut_odb *odb, gut_oid *tree_oid) {
+    gut_object obj;
+    gut_tree tree;
+    u64 i;
+    if (l_oid_set_contains(result, tree_oid)) return;
+    l_oid_set_add(result, tree_oid);
+    if (odb_read(&obj, odb, tree_oid) != 0) return;
+    if (obj.type != GUT_OBJ_TREE) { object_destroy(&obj); return; }
+    if (tree_parse(&tree, obj.data.data, obj.data.len) != 0) {
+        object_destroy(&obj); return;
+    }
+    object_destroy(&obj);
+    for (i = 0; i < tree.count; i++) {
+        if (tree.entries[i].mode == 040000) {
+            l_walk_tree(result, odb, &tree.entries[i].oid);
+        } else {
+            l_oid_set_add(result, &tree.entries[i].oid);
+        }
+    }
+    tree_destroy(&tree);
+}
+
+static unsigned long l_walk_commits(l_oid_set *result, gut_odb *odb, gut_oid *start) {
+    gut_oid *queue = (gut_oid *)malloc(256 * sizeof(gut_oid));
+    u64 qcap = 256, qhead = 0, qtail = 1;
+    if (!queue) return __LINE__;
+    memcpy(queue[0].bytes, start->bytes, GUT_OID_RAW_SIZE);
+
+    while (qhead < qtail) {
+        gut_oid current;
+        gut_object obj;
+        gut_commit commit;
+        u64 j;
+
+        memcpy(current.bytes, queue[qhead++].bytes, GUT_OID_RAW_SIZE);
+        if (l_oid_set_contains(result, &current)) continue;
+        l_oid_set_add(result, &current);
+
+        if (odb_read(&obj, odb, &current) != 0) continue;
+        if (obj.type != GUT_OBJ_COMMIT) { object_destroy(&obj); continue; }
+        if (commit_parse(&commit, obj.data.data, obj.data.len) != 0) {
+            object_destroy(&obj); continue;
+        }
+        object_destroy(&obj);
+
+        l_walk_tree(result, odb, &commit.tree_oid);
+
+        for (j = 0; j < commit.parent_count; j++) {
+            if (qtail >= qcap) {
+                qcap *= 2;
+                queue = (gut_oid *)realloc(queue, qcap * sizeof(gut_oid));
+                if (!queue) { commit_destroy(&commit); return __LINE__; }
+            }
+            memcpy(queue[qtail++].bytes, commit.parent_oids[j].bytes, GUT_OID_RAW_SIZE);
+        }
+        commit_destroy(&commit);
+    }
+    free(queue);
+    return 0;
+}
+
+/* ====================================================================
  *  Multi-peer state and select-based event loop
  * ==================================================================== */
 
@@ -428,6 +571,7 @@ typedef struct {
 
 static peer_slot g_peers[GUT_LEECH_MAX_PEERS];
 static u64 g_next_slot_id = 1;
+static gut_repo *g_listen_repo = NULL; /* repo for serving /pack and other endpoints */
 
 /* Forward declaration — the discovery command reads these via a helper */
 static u64 peer_count_connected(void) {
@@ -535,6 +679,87 @@ static int peer_handshake_step(int idx, const char *required_token) {
                         space_count++;
                     }
                 }
+            }
+
+            /* /pack?want=<40-hex> — return a pack with closure of this OID */
+            if (path_end > path_start &&
+                path_end - path_start >= 11 &&
+                memcmp(req + path_start, "/pack?want=", 11) == 0 &&
+                path_end - path_start == 11 + GUT_OID_HEX_SIZE) {
+                char hex_oid[GUT_OID_HEX_SIZE + 1];
+                gut_oid want;
+                l_oid_set objects;
+                memcpy(hex_oid, req + path_start + 11, GUT_OID_HEX_SIZE);
+                hex_oid[GUT_OID_HEX_SIZE] = '\0';
+
+                if (oid_from_hex(&want, hex_oid) != 0 || !g_listen_repo) {
+                    const char *resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    u64 n;
+                    tcp_conn_write_all(&n, &p->conn, (const u8 *)resp, strlen(resp));
+                    return -1;
+                }
+
+                memset(&objects, 0, sizeof(objects));
+                l_walk_commits(&objects, &g_listen_repo->odb, &want);
+
+                if (objects.count == 0) {
+                    const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    u64 n;
+                    tcp_conn_write_all(&n, &p->conn, (const u8 *)resp, strlen(resp));
+                    free(objects.items);
+                    return -1;
+                }
+
+                /* Build pack to a temp file, read back, send */
+                {
+                    char pack_dir[2048];
+                    char pack_hex[GUT_OID_HEX_SIZE + 1];
+                    char pack_path[2048];
+                    char idx_path[2048];
+                    FILE *pf;
+                    u8 *pack_data;
+                    long pack_sz;
+                    char header[256];
+                    u64 n;
+
+                    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack",
+                             g_listen_repo->git_dir);
+                    if (pack_write(pack_hex, pack_dir, &g_listen_repo->odb,
+                                   objects.items, objects.count) != 0) {
+                        free(objects.items);
+                        return -1;
+                    }
+                    free(objects.items);
+
+                    snprintf(pack_path, sizeof(pack_path), "%s/pack-%s.pack",
+                             pack_dir, pack_hex);
+                    pf = fopen(pack_path, "rb");
+                    if (!pf) return -1;
+                    fseek(pf, 0, SEEK_END);
+                    pack_sz = ftell(pf);
+                    fseek(pf, 0, SEEK_SET);
+                    pack_data = (u8 *)malloc((size_t)pack_sz);
+                    if (!pack_data) { fclose(pf); return -1; }
+                    fread(pack_data, 1, (size_t)pack_sz, pf);
+                    fclose(pf);
+
+                    snprintf(header, sizeof(header),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/x-git-pack\r\n"
+                        "Content-Length: %lld\r\n"
+                        "Connection: close\r\n\r\n",
+                        (long long)pack_sz);
+                    tcp_conn_write_all(&n, &p->conn, (const u8 *)header, strlen(header));
+                    tcp_conn_write_all(&n, &p->conn, pack_data, (u64)pack_sz);
+                    free(pack_data);
+
+                    /* Clean up the temp pack — remote_pack_serve created it */
+                    remove(pack_path);
+                    snprintf(idx_path, sizeof(idx_path), "%s/pack-%s.idx",
+                             pack_dir, pack_hex);
+                    remove(idx_path);
+                }
+                return -1;
             }
 
             if (path_end > path_start &&
@@ -745,6 +970,7 @@ unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
     fflush(stdout);
 
     memset(g_peers, 0, sizeof(g_peers));
+    g_listen_repo = repo;
     snap_init(&prev_snap);
     take_snapshot(&prev_snap, repo);
     last_poll = now_ms();
@@ -912,7 +1138,165 @@ static unsigned long parse_ws_url(const char *url, char *host, size_t host_size,
     return 0;
 }
 
-unsigned long leech_connect(const char *url, const char *token) {
+/* Helper: extract a JSON string field value into out_buf. Returns 1 if found. */
+static int json_get_str(char *out, size_t out_size, const char *json, const char *key) {
+    char needle[64];
+    const char *p, *vstart, *vend;
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    p = strstr(json, needle);
+    if (!p) return 0;
+    vstart = p + strlen(needle);
+    vend = vstart;
+    while (*vend && *vend != '"') {
+        if (*vend == '\\' && vend[1]) vend += 2;
+        else vend++;
+    }
+    {
+        size_t len = (size_t)(vend - vstart);
+        if (len >= out_size) len = out_size - 1;
+        memcpy(out, vstart, len);
+        out[len] = '\0';
+    }
+    return 1;
+}
+
+/* Download a pack from the peer's /pack?want=<oid> endpoint and write
+ * to the repo's objects/pack dir. Then update refs/leech/<peer>/<branch>
+ * to point to oid. Uses raw TCP HTTP since the connection is plain. */
+static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name,
+                                           const char *host, u16 port,
+                                           const char *oid_hex,
+                                           const char *ref_name) {
+    net_sock_addr addr;
+    tcp_conn conn;
+    char req[512];
+    int req_len;
+    u64 n;
+    buf resp;
+    unsigned long rc;
+
+    /* Resolve host */
+    memset(&addr, 0, sizeof(addr));
+    addr.family = 4;
+    addr.port = port;
+    {
+        unsigned a, b, c, d;
+        if (sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return __LINE__;
+        addr.addr.v4.octets[0] = (u8)a;
+        addr.addr.v4.octets[1] = (u8)b;
+        addr.addr.v4.octets[2] = (u8)c;
+        addr.addr.v4.octets[3] = (u8)d;
+    }
+
+    rc = tcp_conn_create(&conn, &addr);
+    if (rc) return __LINE__;
+
+    req_len = snprintf(req, sizeof(req),
+        "GET /pack?want=%s HTTP/1.1\r\n"
+        "Host: %s:%u\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        oid_hex, host, (unsigned)port);
+    tcp_conn_write_all(&n, &conn, (const u8 *)req, (u64)req_len);
+
+    /* Read full response */
+    buf_create(&resp, 4096);
+    for (;;) {
+        u8 chunk[4096];
+        u64 nr;
+        if (tcp_conn_read(&nr, &conn, chunk, sizeof(chunk)) != 0) break;
+        if (nr == 0) break;
+        buf_append(&resp, chunk, nr);
+    }
+    tcp_conn_destroy(&conn);
+
+    /* Find body start */
+    {
+        u64 i, body_start = 0;
+        for (i = 0; i + 3 < resp.len; i++) {
+            if (resp.data[i] == '\r' && resp.data[i+1] == '\n' &&
+                resp.data[i+2] == '\r' && resp.data[i+3] == '\n') {
+                body_start = i + 4;
+                break;
+            }
+        }
+        if (body_start == 0) { buf_destroy(&resp); return __LINE__; }
+
+        /* Verify it's a PACK */
+        if (resp.len - body_start < 4 ||
+            resp.data[body_start] != 'P' || resp.data[body_start+1] != 'A' ||
+            resp.data[body_start+2] != 'C' || resp.data[body_start+3] != 'K') {
+            buf_destroy(&resp);
+            return __LINE__;
+        }
+
+        /* Write pack file to objects/pack/leech-<peer>-<oid_short>.pack */
+        {
+            char pack_dir[2048];
+            char pack_path[2048];
+            char idx_cmd[4096];
+            FILE *fp;
+
+            snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo->git_dir);
+#ifdef _WIN32
+            _mkdir(pack_dir);
+#else
+            mkdir(pack_dir, 0755);
+#endif
+            snprintf(pack_path, sizeof(pack_path), "%s/leech-%s-%.8s.pack",
+                     pack_dir, peer_name, oid_hex);
+            fp = fopen(pack_path, "wb");
+            if (!fp) { buf_destroy(&resp); return __LINE__; }
+            fwrite(resp.data + body_start, 1, (size_t)(resp.len - body_start), fp);
+            fclose(fp);
+
+            /* Index it (uses git for now until we have our own pack indexer) */
+            snprintf(idx_cmd, sizeof(idx_cmd),
+                     "git index-pack \"%s\"", pack_path);
+            system(idx_cmd);
+        }
+    }
+    buf_destroy(&resp);
+
+    /* Update ref under refs/leech/<peer>/<branch> */
+    {
+        char ref_dir[2048];
+        char ref_path[2048];
+        char tmp[2048];
+        const char *branch = ref_name;
+        char ref_content[GUT_OID_HEX_SIZE + 2];
+        FILE *fp;
+
+        if (strncmp(ref_name, "refs/heads/", 11) == 0) branch = ref_name + 11;
+        else if (strncmp(ref_name, "refs/tags/", 10) == 0) branch = ref_name + 10;
+
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/leech/%s", repo->git_dir, peer_name);
+        /* Recursive mkdir */
+        snprintf(tmp, sizeof(tmp), "%s/refs/leech", repo->git_dir);
+#ifdef _WIN32
+        _mkdir(tmp);
+        _mkdir(ref_dir);
+#else
+        mkdir(tmp, 0755);
+        mkdir(ref_dir, 0755);
+#endif
+
+        snprintf(ref_path, sizeof(ref_path), "%s/%s", ref_dir, branch);
+        snprintf(ref_content, sizeof(ref_content), "%s\n", oid_hex);
+        fp = fopen(ref_path, "w");
+        if (!fp) return __LINE__;
+        fputs(ref_content, fp);
+        fclose(fp);
+
+        printf("  → fetched into refs/leech/%s/%s\n", peer_name, branch);
+        fflush(stdout);
+    }
+
+    return 0;
+}
+
+unsigned long leech_connect(const char *url, const char *token,
+                            gut_repo *repo, const char *peer_name) {
     char host[256];
     char path[512];
     u16  port;
@@ -1073,6 +1457,28 @@ unsigned long leech_connect(const char *url, const char *token) {
                     fwrite(frame.payload, 1, (size_t)frame.payload_len, stdout);
                     printf("\n");
                     fflush(stdout);
+
+                    /* Auto-fetch on update event if repo is provided */
+                    if (repo && peer_name) {
+                        char json_copy[2048];
+                        char ev_type[32], ev_oid[GUT_OID_HEX_SIZE + 1], ev_ref[256];
+                        size_t copy_len = (size_t)frame.payload_len;
+                        if (copy_len >= sizeof(json_copy)) copy_len = sizeof(json_copy) - 1;
+                        memcpy(json_copy, frame.payload, copy_len);
+                        json_copy[copy_len] = '\0';
+
+                        if (json_get_str(ev_type, sizeof(ev_type), json_copy, "type") &&
+                            json_get_str(ev_oid, sizeof(ev_oid), json_copy, "oid") &&
+                            json_get_str(ev_ref, sizeof(ev_ref), json_copy, "ref")) {
+                            if (strcmp(ev_type, "update") == 0 || strcmp(ev_type, "create") == 0) {
+                                if (leech_fetch_and_store(repo, peer_name, host, port,
+                                                          ev_oid, ev_ref) != 0) {
+                                    printf("  → fetch failed for %s\n", ev_ref);
+                                    fflush(stdout);
+                                }
+                            }
+                        }
+                    }
                 } else if (frame.opcode == WS_OPCODE_CLOSE) {
                     ws_frame_free(&frame);
                     goto done;

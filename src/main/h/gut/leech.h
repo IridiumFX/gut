@@ -38,8 +38,12 @@ unsigned long leech_listen(gut_repo *repo, u16 port, u64 poll_ms,
 /* Connect to a peer's listen server and print incoming events.
  * url: ws://host:port or wss://host:port (wss not implemented in MVP).
  * token: optional bearer token.
+ * If repo and peer_name are non-NULL, also auto-fetches the new commits
+ * from the peer's /pack endpoint and stores them under
+ * refs/leech/<peer_name>/<branch>.
  * Blocks until the connection closes. */
-unsigned long leech_connect(const char *url, const char *token);
+unsigned long leech_connect(const char *url, const char *token,
+                            gut_repo *repo, const char *peer_name);
 
 /* Query a peer's listen server for its list of connected leechers.
  * host: "host:port" (IPv4 literal for now). Prints JSON to stdout. */
