@@ -36,7 +36,7 @@ static void usage(void) {
         "   push        Push refs + objects to a remote\n"
         "   pack-objects Create a pack from OIDs on stdin\n"
         "   repack      Pack all loose objects and remove them\n"
-        "   listen      Broadcast ref change events via WebSocket\n"
+        "   listen      Run the gut broker daemon (listen + optional --leech peers)\n"
         "   leech       Subscribe to a peer's gut listen events\n"
         "   send        Send a one-shot text message to a listener\n"
         "   leechers    Query a listener for its connected peers\n"
@@ -408,6 +408,111 @@ static int cmd_login(int argc, char **argv) {
 
 #define GUT_LISTEN_MAX_OUTBOUND 16
 
+/* Daemon helpers: PID file + log file paths live in ~/.gut/ */
+static void listen_pid_path(char *out, size_t out_size, u16 port) {
+    const char *home;
+#ifdef _WIN32
+    home = getenv("USERPROFILE"); if (!home) home = "C:";
+#else
+    home = getenv("HOME"); if (!home) home = "/tmp";
+#endif
+    snprintf(out, out_size, "%s/.gut/listen-%u.pid", home, (unsigned)port);
+}
+
+static void listen_log_path(char *out, size_t out_size, u16 port) {
+    const char *home;
+#ifdef _WIN32
+    home = getenv("USERPROFILE"); if (!home) home = "C:";
+#else
+    home = getenv("HOME"); if (!home) home = "/tmp";
+#endif
+    snprintf(out, out_size, "%s/.gut/listen-%u.log", home, (unsigned)port);
+}
+
+/* Ensure ~/.gut exists */
+static void ensure_gut_home(void) {
+    const char *home;
+    char gut_dir[1024];
+#ifdef _WIN32
+    home = getenv("USERPROFILE"); if (!home) home = "C:";
+    snprintf(gut_dir, sizeof(gut_dir), "%s/.gut", home);
+    _mkdir(gut_dir);
+#else
+    home = getenv("HOME"); if (!home) home = "/tmp";
+    snprintf(gut_dir, sizeof(gut_dir), "%s/.gut", home);
+    mkdir(gut_dir, 0755);
+#endif
+}
+
+/* Check if a PID is still alive */
+static int pid_is_alive(long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return 0;
+    {
+        DWORD code;
+        GetExitCodeProcess(h, &code);
+        CloseHandle(h);
+        return code == STILL_ACTIVE;
+    }
+#else
+    return (kill((pid_t)pid, 0) == 0);
+#endif
+}
+
+static long read_pid_file(u16 port) {
+    char path[1024];
+    FILE *fp;
+    long pid = 0;
+    listen_pid_path(path, sizeof(path), port);
+    fp = fopen(path, "r");
+    if (!fp) return 0;
+    fscanf(fp, "%ld", &pid);
+    fclose(fp);
+    return pid;
+}
+
+static int cmd_listen_status(u16 port) {
+    long pid = read_pid_file(port);
+    if (pid == 0) {
+        printf("gut listen on port %u: not running\n", (unsigned)port);
+        return 1;
+    }
+    if (pid_is_alive(pid)) {
+        char log_path[1024];
+        listen_log_path(log_path, sizeof(log_path), port);
+        printf("gut listen on port %u: running (pid %ld)\n  log: %s\n",
+               (unsigned)port, pid, log_path);
+        return 0;
+    }
+    printf("gut listen on port %u: stale PID %ld (process not alive)\n",
+           (unsigned)port, pid);
+    return 1;
+}
+
+static int cmd_listen_stop(u16 port) {
+    long pid = read_pid_file(port);
+    char pid_path[1024];
+    if (pid == 0) {
+        fprintf(stderr, "no gut listen recorded on port %u\n", (unsigned)port);
+        return 1;
+    }
+    if (!pid_is_alive(pid)) {
+        fprintf(stderr, "process %ld no longer running\n", pid);
+    } else {
+#ifdef _WIN32
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
+        if (h) { TerminateProcess(h, 0); CloseHandle(h); }
+#else
+        kill((pid_t)pid, SIGTERM);
+#endif
+        printf("stopped gut listen on port %u (pid %ld)\n", (unsigned)port, pid);
+    }
+    listen_pid_path(pid_path, sizeof(pid_path), port);
+    remove(pid_path);
+    return 0;
+}
+
 static int cmd_listen(int argc, char **argv) {
     gut_repo repo;
     char cwd[2048];
@@ -416,6 +521,9 @@ static int cmd_listen(int argc, char **argv) {
     u64 poll_ms = 1000;
     const char *token = NULL;
     int auto_fetch_default = 0;
+    int background = 0;
+    int want_status = 0;
+    int want_stop = 0;
     leech_outbound outbound[GUT_LISTEN_MAX_OUTBOUND];
     u64 outbound_count = 0;
     int i;
@@ -429,6 +537,12 @@ static int cmd_listen(int argc, char **argv) {
             token = argv[++i];
         } else if (strcmp(argv[i], "--auto-fetch") == 0) {
             auto_fetch_default = 1;
+        } else if (strcmp(argv[i], "--background") == 0) {
+            background = 1;
+        } else if (strcmp(argv[i], "--status") == 0) {
+            want_status = 1;
+        } else if (strcmp(argv[i], "--stop") == 0) {
+            want_stop = 1;
         } else if (strcmp(argv[i], "--leech") == 0 && i + 1 < argc) {
             if (outbound_count >= GUT_LISTEN_MAX_OUTBOUND) {
                 fprintf(stderr, "error: too many --leech subscriptions\n");
@@ -440,12 +554,14 @@ static int cmd_listen(int argc, char **argv) {
             outbound[outbound_count].auto_fetch = auto_fetch_default;
             outbound_count++;
         } else if (strcmp(argv[i], "--as") == 0 && i + 1 < argc && outbound_count > 0) {
-            /* Names the most recent --leech */
             outbound[outbound_count - 1].name = argv[++i];
         } else if (strcmp(argv[i], "--leech-token") == 0 && i + 1 < argc && outbound_count > 0) {
             outbound[outbound_count - 1].token = argv[++i];
         }
     }
+
+    if (want_status) return cmd_listen_status(port);
+    if (want_stop)   return cmd_listen_stop(port);
 
     if (!gut_getcwd(cwd, sizeof(cwd))) {
         fprintf(stderr, "error: cannot get current directory\n");
@@ -455,7 +571,134 @@ static int cmd_listen(int argc, char **argv) {
     rc = repo_open(&repo, cwd);
     if (rc) { fprintf(stderr, "error: not a gut repository\n"); return 1; }
 
+    ensure_gut_home();
+
+    /* Check if a previous instance is still alive. Skip when we're a
+     * re-spawned child (parent sets GUT_DAEMON_CHILD env var). */
+    if (!getenv("GUT_DAEMON_CHILD")) {
+        long existing = read_pid_file(port);
+        if (existing != 0 && pid_is_alive(existing)) {
+            fprintf(stderr, "error: gut listen already running on port %u (pid %ld)\n",
+                    (unsigned)port, existing);
+            return 1;
+        }
+    }
+
+    if (background) {
+        char pid_path[1024];
+        char log_path[1024];
+        listen_pid_path(pid_path, sizeof(pid_path), port);
+        listen_log_path(log_path, sizeof(log_path), port);
+
+#ifdef _WIN32
+        /* Windows: spawn a detached child that runs gut listen without --background */
+        {
+            char cmdline[4096];
+            STARTUPINFOA si;
+            PROCESS_INFORMATION pi;
+            HANDLE log_fh;
+            SECURITY_ATTRIBUTES sa;
+            char self_path[1024];
+            int n;
+
+            GetModuleFileNameA(NULL, self_path, sizeof(self_path));
+
+            /* Build command-line, stripping --background from argv */
+            n = snprintf(cmdline, sizeof(cmdline), "\"%s\" listen", self_path);
+            for (i = 0; i < argc; i++) {
+                if (strcmp(argv[i], "--background") == 0) continue;
+                n += snprintf(cmdline + n, sizeof(cmdline) - n, " \"%s\"", argv[i]);
+            }
+
+            memset(&sa, 0, sizeof(sa));
+            sa.nLength = sizeof(sa);
+            sa.bInheritHandle = TRUE;
+            log_fh = CreateFileA(log_path, GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (log_fh == INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "error: cannot open log file %s\n", log_path);
+                return 1;
+            }
+
+            memset(&si, 0, sizeof(si));
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            si.hStdOutput = log_fh;
+            si.hStdError = log_fh;
+
+            /* Child inherits env — mark it as a daemon child so it skips the
+             * "already running" check when it starts up. */
+            _putenv("GUT_DAEMON_CHILD=1");
+
+            if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                                CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+                                NULL, cwd, &si, &pi)) {
+                fprintf(stderr, "error: CreateProcess failed (%lu)\n", GetLastError());
+                CloseHandle(log_fh);
+                _putenv("GUT_DAEMON_CHILD=");
+                return 1;
+            }
+            _putenv("GUT_DAEMON_CHILD=");
+            CloseHandle(log_fh);
+
+            {
+                FILE *pf = fopen(pid_path, "w");
+                if (pf) { fprintf(pf, "%lu\n", (unsigned long)pi.dwProcessId); fclose(pf); }
+            }
+            printf("gut listen started in background (pid %lu)\n  log: %s\n",
+                   (unsigned long)pi.dwProcessId, log_path);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return 0;
+        }
+#else
+        /* POSIX: double-fork */
+        {
+            pid_t pid = fork();
+            if (pid < 0) return 1;
+            if (pid > 0) {
+                /* Parent writes PID file and exits */
+                FILE *pf = fopen(pid_path, "w");
+                if (pf) { fprintf(pf, "%d\n", (int)pid); fclose(pf); }
+                printf("gut listen started in background (pid %d)\n  log: %s\n",
+                       (int)pid, log_path);
+                return 0;
+            }
+            /* Child: detach from terminal, redirect I/O */
+            setsid();
+            {
+                int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+            }
+        }
+#endif
+    } else {
+        /* Foreground: write our own PID for tooling */
+        char pid_path[1024];
+        FILE *pf;
+        listen_pid_path(pid_path, sizeof(pid_path), port);
+        pf = fopen(pid_path, "w");
+        if (pf) {
+#ifdef _WIN32
+            fprintf(pf, "%lu\n", (unsigned long)GetCurrentProcessId());
+#else
+            fprintf(pf, "%d\n", (int)getpid());
+#endif
+            fclose(pf);
+        }
+    }
+
     rc = leech_listen(&repo, port, poll_ms, token, outbound, outbound_count);
+
+    /* Remove PID file on clean exit */
+    {
+        char pid_path[1024];
+        listen_pid_path(pid_path, sizeof(pid_path), port);
+        remove(pid_path);
+    }
+
     return rc ? 1 : 0;
 }
 
