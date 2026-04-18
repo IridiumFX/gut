@@ -53,10 +53,10 @@
 
 ### Commands (30+)
 init, add, unstage, rm, branch, branches, tag, tags, checkout, merge,
-diff, commit, log, status, last, amend, undo, restore, reset,
-hash-object, cat-file, clone, fetch, push, login, listen, leech, send,
-leechers, ask, offer, offers, sos, feeling, repack, pack-objects,
-index-pack
+cherry-pick, diff, commit, log, reflog, status, last, amend, undo,
+restore, reset, hash-object, cat-file, clone, fetch, push, login,
+listen, leech, send, leechers, ask, offer, offers, sos, feeling,
+repack, pack-objects, index-pack
 
 ## In Progress
 
@@ -86,15 +86,32 @@ not just a command glued on top of existing primitives.
       `--continue`/`--abort`. Non-interactive `gut rebase <upstream>`
       (just replay) is a useful intermediate milestone.
 
-- [ ] **Cherry-pick** — `gut cherry-pick <commit>`. Replay one
-      commit's diff onto HEAD. Reuses three-way-merge for conflict
-      handling (we already have diff3). Small module.
+- [x] **Cherry-pick** — `gut cherry-pick <commit>` replays one
+      commit's diff (commit − parent(commit)) onto HEAD via the
+      existing three-way merge engine (base = parent(pick), ours =
+      HEAD, theirs = pick). Conflict path mirrors `gut merge`: diff3
+      markers written into the file, index staged, exit 1. Clean
+      application writes a single-parent commit that preserves the
+      pick's author, uses the current user as committer, and appends
+      a `(cherry picked from commit <full-sha>)` trailer. **Verified
+      interop**: `git cat-file -p HEAD` after `gut cherry-pick` shows
+      the git-standard trailer; `git log` walks the history
+      identically. Already-applied picks are detected (HEAD tree ==
+      pick tree) and short-circuit with `Already applied`.
+      Root-commit picks are deferred (rare; needs null-tree base).
 
-- [ ] **Reflog** — `gut reflog` + implicit `.git/logs/HEAD` +
-      `.git/logs/refs/heads/<name>` append on every ref update. Most
-      invasive in `repo_update_ref` (needs old→new→timestamp→reason
-      line format). Once the log file is written, `gut reflog` is
-      just a file reader.
+- [x] **Reflog** — `gut reflog [<ref>] [-n <n>]` + implicit
+      `.git/logs/HEAD` + `.git/logs/refs/heads/<name>` append on
+      every `repo_update_ref` call. Line format matches git exactly
+      (`<old> <new> <name> <email> <ts> <tz>\t<reason>\n`). Every
+      caller of `repo_update_ref` (commit, amend, squash, stash,
+      undo, reset, merge ff, merge commit, receive-pack) now passes
+      a reason string; `cmd_checkout` additionally records
+      `checkout: moving from X to Y` via the new `repo_reflog_head`
+      helper. **Verified**: `git reflog` reads gut-written logs
+      bit-identically. `HEAD@{N}` indexing works; `-n` caps output.
+      Not yet wired: expiration / `reflog expire`, `HEAD@{<time>}`
+      syntax, detached-HEAD ref-update reflog.
 
 - [ ] **Worktree add** — `gut worktree add <path> <branch>`. Parent
       repo keeps the `.git/` dir; new worktrees at arbitrary paths
@@ -117,6 +134,149 @@ not just a command glued on top of existing primitives.
       with the system keychain helpers (`manager-core` on Windows,
       `osxkeychain` on Mac, `libsecret` on Linux) so users who already
       have git-credentials cached don't re-authenticate.
+
+## Tier 5: Drop-copy audit channel
+
+A compliance-grade **non-destructive mirror**: every push (or a
+subset, per-remote) is also delivered to a dedicated drop-copy
+channel that retains history *even when upstream rewrites or deletes
+it*. Distinct from a regular leeching/mirror client — a mirror
+follows state; a drop-copy retains *superseded* state forever. Dual-
+channel (client + server both report) closes the tampering hole
+where a client strips the drop-copy remote before pushing.
+
+### Architecture
+
+- [ ] **`gut remote add --drop-copy <name> <url>`** — client-side
+      tee. Every `gut push origin` also sends the same pack + ref
+      updates to the drop-copy remote with a generated `push_id`
+      (UUID) for channel correlation.
+- [ ] **`gut server --drop-copy <url>`** — origin-side forwarding.
+      On successful receive-pack, origin forwards the exact pack +
+      ref updates to the drop-copy with the client's `push_id` (from
+      the `X-Gut-Push-Id` header). This is the second channel — if a
+      client strips the client-side tee, drop-copy still receives
+      the server-side copy and flags the mismatch.
+- [ ] **`gut server --drop-copy-mode`** — receive-only server mode.
+      Accepts everything (no fast-forward checks, no auth-gated
+      rejection), fires `post-receive` hooks, disables repack's
+      prune path, and is where the non-destructive-archive logic
+      lives.
+- [ ] **`gut server --require-drop-copy`** — synchronous gate.
+      Origin checks `GET <drop-copy>/health` before accepting a
+      push; if drop-copy is unhealthy or any recent push is still
+      awaiting dual-channel reconciliation, origin returns 503 with
+      `Retry-After`.
+- [ ] **`post-receive` hook** wired into `srv_receive_pack` (we
+      currently have pre-/post-commit and pre-push, but not
+      post-receive). Runs after all ref updates are applied; stdin
+      carries the `<old> <new> <ref>` triplets.
+
+### Non-destructive archive (the load-bearing differentiator)
+
+- [ ] **Is-ancestor check** on every incoming ref update.
+      Fast-forward (`old ∈ ancestors(new)`) = no archive needed; the
+      old commits live on in new's ancestry.
+- [ ] **Rewrite detection + archive ref**. Any non-FF update (force-
+      push, reset + push, rebase + push) triggers an archive write
+      *before* the ref is overwritten:
+        `refs/dropcopy/archive/<ref>/<iso-ts>-<short-old-oid>`
+      The archive ref keeps the would-be-orphaned commits reachable
+      → safe from any future gc.
+- [ ] **Ref deletions** get both an archive ref (holding the old
+      tip's history) and a tombstone:
+        `refs/dropcopy/tombstones/<ref>/<iso-ts>`
+      Tombstones make deletions first-class in the audit browse UI.
+- [ ] **Archive refs are immutable.** Once written, never pruned,
+      never rewritten. Retention defaults to forever — compliance
+      can demand 20+ years and the price of keeping everything is
+      paid down by the cold-storage tier below, not by pruning.
+
+### Event stream (per-file deltas)
+
+- [ ] JSON-lines event format over HTTP, one event per file change
+      per ref update:
+      ```
+      {"ts":"...","channel":"client|server","push_id":"<uuid>",
+       "origin":"<url>","ref":"refs/heads/main",
+       "old_ref_oid":"<hex>","new_ref_oid":"<hex>","commit":"<hex>",
+       "path":"src/foo.c","change":"added|modified|deleted",
+       "old_blob":"<hex>","new_blob":"<hex>","mode":"100644"}
+      ```
+      Plus a `push_complete` aggregate `{push_id, ref, n_commits,
+      n_files, pack_sha256}` so drop-copy can match the two channels
+      on content, not just ID.
+- [ ] **`history_rewrite` event** emitted whenever an archive
+      ref is written — enumerates the `orphaned_oids` (commits in
+      `ancestors(old) ∖ ancestors(new)`) so downstream audit sees
+      exactly what would have been lost.
+- [ ] **Async by default, synchronous via `--require-drop-copy`.**
+      Push latency dominates developer experience; async delivery
+      is right for honest-auditor scenarios. Sync gating exists for
+      adversarial-enforcement scenarios where drop-copy must see
+      every byte before origin commits.
+
+### Cold storage tier
+
+As archive refs accumulate forever, loose objects and hot packs
+bloat. Cold-packing consolidates older objects into time-bucket
+packs without touching the archive refs themselves — the ref→OID
+mapping stays stable; only storage tier shifts.
+
+- [ ] **`gut cold-pack --older-than <dur>`** (default 1y).
+      Scans `refs/dropcopy/archive/**`, consolidates every object
+      reachable from archive refs older than threshold (minus those
+      also reachable from hot refs) into a single pack per time
+      bucket (e.g. `cold-2024Q1.pack`/`cold-2024Q1.idx`). Strong
+      compression (zlib level 9 today; zstd/xz later if we vendor
+      them — read latency at this tier is irrelevant).
+- [ ] **`gut cold-pack --list`** — inventory of which OIDs live in
+      which cold bucket.
+- [ ] **Idempotent** — re-runs skip objects already in a cold pack.
+- [ ] **Archive refs are untouched by cold-pack.** `gut show
+      refs/dropcopy/archive/refs/heads/main/2024-...` still works
+      regardless of which pack the objects live in.
+
+### Glacier tier (tamper-evident external storage)
+
+Very old cold packs can be pushed to external storage (S3, Glacier,
+tape) to release local disk while keeping the idx on disk for fast
+offline lookup.
+
+- [ ] **`gut cold-pack --glacier <location>`** — moves `.pack` files
+      to external storage, leaves behind a `.pack.stub` carrying the
+      SHA-256 of the moved pack so a swapped/altered copy is
+      detected on return:
+      ```
+      version:     1
+      kind:        pack-stub
+      original:    cold-2010Q1.pack
+      pack-sha256: 7a8b3c2f...64 hex
+      pack-size:   4823947234
+      moved-at:    2026-04-18T20:30:00Z
+      location:    s3://audit-glacier/gut-repo-42/cold-2010Q1.pack
+      ```
+      **`.idx` stays local** — it's tiny (a few MB per multi-GB
+      pack) and is what answers "is OID X in this pack" offline.
+      Only fetching actual object bytes requires a thaw.
+- [ ] **`gut cold-pack --thaw <pack-name>`** — downloads from the
+      stub's `location`, SHA-256-verifies against the stub,
+      atomically replaces the stub with the real pack. Any hash
+      mismatch → reject, emit a `glacier_tamper_detected` event to
+      the audit stream.
+- [ ] **`gut cold-pack --verify`** — rehashes all non-stubbed cold
+      packs against their recorded hashes; tampering in place
+      (while a pack is hot) also shows up.
+- [ ] **`pack_open` stub awareness** — when a pack read hits a
+      `.pack.stub`, refuse and return `NEED_GLACIER_FETCH(location,
+      expected_sha256)` so the caller can surface a clear thaw
+      instruction rather than a mysterious I/O error.
+
+### Glacier v2 (future, not MVP)
+
+- [ ] **Ed25519-signed stubs** so the stub itself can't be swapped.
+      Apennines already has the Ed25519 primitives (000106 crypto
+      tier); incremental add when an auditor needs it.
 
 ## Planned
 

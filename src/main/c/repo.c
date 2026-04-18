@@ -1,11 +1,13 @@
 #include "gut/repo.h"
 #include "gut/config.h"
+#include "gut/oid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 /* If `candidate` is a regular file in gitfile format ("gitdir: <path>\n"),
  * read it and write the resolved absolute git dir into `out`. If it's a
@@ -416,7 +418,188 @@ unsigned long repo_resolve_ref(gut_oid *out, gut_repo *repo, const char *ref) {
     return oid_from_hex_n(out, line, hex_len);
 }
 
-unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
+/* Resolve the committer identity for reflog entries.
+ *
+ * Priority: GUT_COMMITTER_NAME/EMAIL env > GUT_AUTHOR_NAME/EMAIL env >
+ * GIT_COMMITTER_NAME/EMAIL env > GIT_AUTHOR_NAME/EMAIL env >
+ * [user] name/email in .git/config > ("Unknown", "unknown@example.com").
+ *
+ * Caller-provided buffers are always filled (never left uninitialized),
+ * so callers can format the reflog line unconditionally.
+ *
+ * Note: this duplicates the identity resolution that cmd_commit does
+ * inline. When cmd_commit is refactored, both should share this helper. */
+static void resolve_identity(char *name, u64 name_sz,
+                             char *email, u64 email_sz,
+                             gut_repo *repo) {
+    const char *n = NULL;
+    const char *e = NULL;
+    gut_config cfg;
+    int have_cfg = 0;
+    char config_path[2048];
+
+    n = getenv("GUT_COMMITTER_NAME");
+    if (!n) n = getenv("GUT_AUTHOR_NAME");
+    if (!n) n = getenv("GIT_COMMITTER_NAME");
+    if (!n) n = getenv("GIT_AUTHOR_NAME");
+
+    e = getenv("GUT_COMMITTER_EMAIL");
+    if (!e) e = getenv("GUT_AUTHOR_EMAIL");
+    if (!e) e = getenv("GIT_COMMITTER_EMAIL");
+    if (!e) e = getenv("GIT_AUTHOR_EMAIL");
+
+    if (!n || !e) {
+        snprintf(config_path, sizeof(config_path), "%s/config", repo->git_dir);
+        if (config_read(&cfg, config_path) == 0) {
+            have_cfg = 1;
+            if (!n) {
+                const char *v;
+                if (config_get(&v, &cfg, "user", "name") == 0) n = v;
+            }
+            if (!e) {
+                const char *v;
+                if (config_get(&v, &cfg, "user", "email") == 0) e = v;
+            }
+        }
+    }
+
+    if (!n) n = "Unknown";
+    if (!e) e = "unknown@example.com";
+
+    snprintf(name, (size_t)name_sz, "%s", n);
+    snprintf(email, (size_t)email_sz, "%s", e);
+
+    if (have_cfg) config_destroy(&cfg);
+}
+
+/* Format "<unix_ts> <tz_offset>" matching git's reflog/commit timestamp
+ * convention. Example: "1713517200 +0100". */
+static void format_reflog_time(char *out, u64 out_sz) {
+    time_t now = time(NULL);
+    long tz_offset_min = 0;
+#ifdef _WIN32
+    TIME_ZONE_INFORMATION tzi;
+    if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID) {
+        tz_offset_min = -(long)tzi.Bias;
+    }
+#else
+    struct tm *lt = localtime(&now);
+    if (lt) tz_offset_min = lt->tm_gmtoff / 60;
+#endif
+    snprintf(out, (size_t)out_sz, "%lld %+03ld%02ld",
+             (long long)now, tz_offset_min / 60, labs(tz_offset_min) % 60);
+}
+
+/* Append a reflog line to .git/logs/<ref>. Creates parent directories
+ * as needed. Returns 0 on success; non-zero line number on failure.
+ *
+ * Git's reflog line format:
+ *   <old-hex> SP <new-hex> SP <name> SP "<" email ">" SP
+ *   <unix-ts> SP <tz-offset> TAB <reason> LF
+ *
+ * Both old-hex and new-hex are written at the repo's hash width. If
+ * the ref didn't exist before (initial commit, new branch), old-hex is
+ * all zeros of that width. */
+static unsigned long reflog_append_one(gut_repo *repo, const char *ref_path_rel,
+                                       const gut_oid *old_oid,
+                                       const gut_oid *new_oid,
+                                       const char *name, const char *email,
+                                       const char *time_str,
+                                       const char *reason) {
+    char log_path[2048];
+    char parent_dir[2048];
+    char line[1024];
+    char old_hex[GUT_OID_MAX_HEX_SIZE + 1];
+    char new_hex[GUT_OID_MAX_HEX_SIZE + 1];
+    unsigned hex_len;
+    unsigned long rc;
+    FILE *fp;
+    int n;
+    int line_len;
+
+    n = snprintf(log_path, sizeof(log_path), "%s/logs/%s",
+                 repo->git_dir, ref_path_rel);
+    if (n < 0 || (u64)n >= sizeof(log_path)) return __LINE__;
+
+    /* Ensure parent directory exists (e.g. logs/refs/heads/). */
+    {
+        u64 L = strlen(log_path);
+        u64 plen;
+        const char *slash = strrchr(log_path, '/');
+        if (!slash) return __LINE__;
+        plen = (u64)(slash - log_path);
+        if (plen >= sizeof(parent_dir)) return __LINE__;
+        memcpy(parent_dir, log_path, plen);
+        parent_dir[plen] = '\0';
+        (void)L;
+    }
+    rc = mkdirs(parent_dir);
+    if (rc) return __LINE__;
+
+    hex_len = gut_oid_hex_size(repo->hash_algo);
+
+    /* oid_to_hex_n takes a non-const pointer; cast away since it only
+     * reads the bytes. */
+    rc = oid_to_hex_n(old_hex, (gut_oid *)old_oid, hex_len);
+    if (rc) return __LINE__;
+    old_hex[hex_len] = '\0';
+    rc = oid_to_hex_n(new_hex, (gut_oid *)new_oid, hex_len);
+    if (rc) return __LINE__;
+    new_hex[hex_len] = '\0';
+
+    /* Sanitize reason: strip embedded LFs so a single log line always
+     * ends exactly at our own LF. Git does the same — a stray newline
+     * in a commit message would otherwise split one entry into two. */
+    {
+        char safe_reason[512];
+        u64 i, j = 0;
+        u64 rlen = strlen(reason);
+        if (rlen >= sizeof(safe_reason)) rlen = sizeof(safe_reason) - 1;
+        for (i = 0; i < rlen; i++) {
+            char c = reason[i];
+            if (c == '\n' || c == '\r') c = ' ';
+            safe_reason[j++] = c;
+        }
+        safe_reason[j] = '\0';
+
+        line_len = snprintf(line, sizeof(line),
+                            "%s %s %s <%s> %s\t%s\n",
+                            old_hex, new_hex, name, email,
+                            time_str, safe_reason);
+    }
+    if (line_len < 0 || (u64)line_len >= sizeof(line)) return __LINE__;
+
+    fp = fopen(log_path, "ab");
+    if (!fp) return __LINE__;
+    if (fwrite(line, 1, (size_t)line_len, fp) != (size_t)line_len) {
+        fclose(fp);
+        return __LINE__;
+    }
+    fclose(fp);
+    return 0;
+}
+
+unsigned long repo_reflog_head(gut_repo *repo,
+                               const gut_oid *old_oid,
+                               const gut_oid *new_oid,
+                               const char *reason) {
+    char rname[256];
+    char remail[256];
+    char rtime[64];
+
+    if (!repo) return __LINE__;
+    if (!old_oid) return __LINE__;
+    if (!new_oid) return __LINE__;
+    if (!reason) return __LINE__;
+
+    resolve_identity(rname, sizeof(rname), remail, sizeof(remail), repo);
+    format_reflog_time(rtime, sizeof(rtime));
+    return reflog_append_one(repo, "HEAD", old_oid, new_oid,
+                             rname, remail, rtime, reason);
+}
+
+unsigned long repo_update_ref(gut_repo *repo, const char *ref,
+                              gut_oid *oid, const char *reason) {
     char path[2048];
     char lock_path[2048];
     char hex[GUT_OID_MAX_HEX_SIZE + 2];
@@ -424,10 +607,21 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
     unsigned long rc;
     int n;
     unsigned hex_len;
+    gut_oid old_oid;
+    int have_old = 0;
 
     if (!repo) return __LINE__;
     if (!ref) return __LINE__;
     if (!oid) return __LINE__;
+
+    /* Snapshot the old value before we overwrite it (for the reflog).
+     * Missing ref → all-zero hex, matching git's "ref didn't exist yet"
+     * convention for initial commits and new branches. */
+    memset(&old_oid, 0, sizeof(old_oid));
+    if (reason) {
+        if (repo_resolve_ref(&old_oid, repo, ref) == 0) have_old = 1;
+        (void)have_old;
+    }
 
     n = snprintf(path, sizeof(path), "%s/%s", repo->git_dir, ref);
     if (n < 0 || (u64)n >= sizeof(path)) return __LINE__;
@@ -482,6 +676,35 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
     if (atomic_rename(lock_path, path) != 0) {
         remove(lock_path);
         return __LINE__;
+    }
+
+    /* Reflog entry (best-effort — a failure here does not undo the ref
+     * write, since the ref mutation has already succeeded and reverting
+     * it would create its own divergence. We log and continue.) */
+    if (reason) {
+        char rname[256];
+        char remail[256];
+        char rtime[64];
+        int is_branch = (strncmp(ref, "refs/heads/", 11) == 0);
+
+        resolve_identity(rname, sizeof(rname),
+                         remail, sizeof(remail), repo);
+        format_reflog_time(rtime, sizeof(rtime));
+
+        (void)reflog_append_one(repo, ref, &old_oid, oid,
+                                rname, remail, rtime, reason);
+
+        /* If updating a branch that HEAD currently points to, also
+         * record against HEAD itself so `gut reflog` (which defaults
+         * to HEAD) sees the movement. */
+        if (is_branch) {
+            char head_ref[256];
+            if (repo_head_ref(head_ref, sizeof(head_ref), repo) == 0 &&
+                strcmp(head_ref, ref) == 0) {
+                (void)reflog_append_one(repo, "HEAD", &old_oid, oid,
+                                        rname, remail, rtime, reason);
+            }
+        }
     }
 
     return 0;

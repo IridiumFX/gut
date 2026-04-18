@@ -56,6 +56,7 @@ static void usage(void) {
         "\n"
         "History & inspection\n"
         "  log             Show commit history  (--oneline, --graph, -n)\n"
+        "  reflog [<ref>]  Show local ref movements (HEAD default, -n to cap)\n"
         "  show [<commit>] Pretty-print a commit + its diff from parent\n"
         "  diff            Show changes  (--staged, --stat)\n"
         "  blame <path>    Per-line commit attribution\n"
@@ -69,6 +70,7 @@ static void usage(void) {
         "  tag / tags      Create / list tags\n"
         "  checkout        Switch branches\n"
         "  merge           Merge a branch into HEAD\n"
+        "  cherry-pick <c> Apply one commit's diff onto HEAD\n"
         "  reset           Move HEAD (--soft or --hard)\n"
         "  stash           Snapshot working tree, reset to HEAD\n"
         "                    subcommands: pop, list\n"
@@ -117,8 +119,8 @@ static void suggest_command(const char *typo) {
         "ask", "offer", "offers", "sos", "feeling", "login",
         "add", "unstage", "rm", "mv", "ls-files", "config",
         "branch", "branches", "tag", "tags",
-        "checkout", "merge", "diff", "commit", "wip", "squash",
-        "log", "show", "status", "last", "amend", "undo", "restore",
+        "checkout", "merge", "cherry-pick", "diff", "commit", "wip", "squash",
+        "log", "reflog", "show", "status", "last", "amend", "undo", "restore",
         "reset", "stash", "blame", "bisect", "revert-file",
         "hash-object", "cat-file", "server", "help", NULL
     };
@@ -1608,7 +1610,7 @@ static int srv_handle_receive_pack(srv_io *io, gut_repo *repo,
                 snprintf(u->reason, sizeof(u->reason), "delete failed");
             }
         } else {
-            if (repo_update_ref(repo, u->name, &u->new_oid) == 0) {
+            if (repo_update_ref(repo, u->name, &u->new_oid, "push") == 0) {
                 u->ok = 1;
             } else {
                 u->ok = 0;
@@ -5529,6 +5531,11 @@ static int cmd_checkout(int argc, char **argv) {
     char head_content[256];
     unsigned long rc;
     struct stat st;
+    /* Pre-checkout HEAD snapshot — used to record the transition in
+     * .git/logs/HEAD after the switch succeeds. */
+    char old_head_ref[256] = "";
+    gut_oid old_head_oid;
+    int have_old_head = 0;
 
     if (argc < 1) {
         fprintf(stderr, "usage: gut checkout <branch>\n");
@@ -5544,6 +5551,14 @@ static int cmd_checkout(int argc, char **argv) {
     if (rc) {
         fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n");
         return 1;
+    }
+
+    /* Snapshot HEAD's current branch + OID so we can record the checkout
+     * transition in .git/logs/HEAD once the switch is complete. */
+    memset(&old_head_oid, 0, sizeof(old_head_oid));
+    if (repo_head_ref(old_head_ref, sizeof(old_head_ref), &repo) == 0 &&
+        repo_resolve_ref(&old_head_oid, &repo, old_head_ref) == 0) {
+        have_old_head = 1;
     }
 
     /* Verify target branch exists */
@@ -5631,6 +5646,17 @@ static int cmd_checkout(int argc, char **argv) {
         }
         fputs(head_content, fp);
         fclose(fp);
+    }
+
+    /* Record the transition in .git/logs/HEAD. Best-effort: reflog
+     * failure doesn't roll back the checkout itself. */
+    if (have_old_head) {
+        char reason[256];
+        const char *from_name = old_head_ref;
+        if (strncmp(from_name, "refs/heads/", 11) == 0) from_name += 11;
+        snprintf(reason, sizeof(reason),
+                 "checkout: moving from %s to %s", from_name, argv[0]);
+        (void)repo_reflog_head(&repo, &old_head_oid, &target_oid, reason);
     }
 
     printf("Switched to branch '%s'\n", argv[0]);
@@ -6500,7 +6526,13 @@ static int cmd_commit(int argc, char **argv) {
     }
 
     /* Update ref */
-    rc = repo_update_ref(&repo, head_ref, &commit_oid);
+    {
+        char reflog_reason[512];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 has_parent ? "commit: %s" : "commit (initial): %s",
+                 message);
+        rc = repo_update_ref(&repo, head_ref, &commit_oid, reflog_reason);
+    }
     if (rc) {
         fprintf(stderr, "error: cannot update ref (line %lu)\n", rc);
         return 1;
@@ -6794,6 +6826,145 @@ static void diff_stat_print(const stat_row *rows, int n_rows) {
                total_ins, total_ins == 1 ? "" : "s",
                total_del, total_del == 1 ? "" : "s");
     }
+}
+
+/* ---- gut reflog ---- */
+
+/* Read `.git/logs/<ref>` and print one line per entry in reverse order
+ * (newest first), indexed as <ref>@{0}, <ref>@{1}, ....
+ *
+ * Each stored line is:
+ *   <old-hex> SP <new-hex> SP <name> SP "<" email ">" SP
+ *   <unix-ts> SP <tz-offset> TAB <reason> LF
+ *
+ * We print the git-style compact form:
+ *   <short-new> <ref>@{N}: <reason>
+ *
+ * For each line except the very first (which records creation), the
+ * "new" hex is what HEAD/ref pointed at after that update — which is
+ * the useful OID to dereference if the user wants to undo.
+ *
+ * With -n <count> we cap output; with no args the ref defaults to HEAD. */
+static int cmd_reflog(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char log_path[2048];
+    const char *ref = "HEAD";
+    int max_count = -1;
+    int ai;
+    unsigned long rc;
+    FILE *fp;
+    long fsize;
+    char *buf_all = NULL;
+    size_t n_read;
+    long *line_starts = NULL;
+    int n_lines = 0;
+    int cap = 0;
+    long i_scan;
+    int i_emit;
+    int shown = 0;
+    unsigned hex_len;
+
+    for (ai = 0; ai < argc; ai++) {
+        if (strcmp(argv[ai], "-n") == 0 && ai + 1 < argc) {
+            max_count = atoi(argv[++ai]);
+        } else if (argv[ai][0] != '-') {
+            ref = argv[ai];
+        }
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n");
+        return 1;
+    }
+
+    hex_len = gut_oid_hex_size(repo.hash_algo);
+
+    snprintf(log_path, sizeof(log_path), "%s/logs/%s", repo.git_dir, ref);
+
+    fp = fopen(log_path, "rb");
+    if (!fp) {
+        /* No reflog yet — not an error, just empty. Match git's behavior
+         * when the log file simply hasn't been created. */
+        return 0;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 1; }
+    fsize = ftell(fp);
+    if (fsize < 0) { fclose(fp); return 1; }
+    if (fsize == 0) { fclose(fp); return 0; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return 1; }
+
+    buf_all = (char *)malloc((size_t)fsize);
+    if (!buf_all) { fclose(fp); return 1; }
+    n_read = fread(buf_all, 1, (size_t)fsize, fp);
+    fclose(fp);
+    if (n_read != (size_t)fsize) { free(buf_all); return 1; }
+
+    /* Index start of each line (byte after previous '\n', or 0 for the
+     * first). We'll walk the list in reverse to emit newest-first. */
+    for (i_scan = 0; i_scan < fsize; ) {
+        long start = i_scan;
+        while (i_scan < fsize && buf_all[i_scan] != '\n') i_scan++;
+        if (i_scan < fsize) i_scan++;   /* past the LF */
+        if (n_lines == cap) {
+            int new_cap = cap ? cap * 2 : 64;
+            long *grown = (long *)realloc(line_starts,
+                                          (size_t)new_cap * sizeof(long));
+            if (!grown) { free(buf_all); free(line_starts); return 1; }
+            line_starts = grown;
+            cap = new_cap;
+        }
+        line_starts[n_lines++] = start;
+    }
+
+    /* Emit newest-first as <short-new> <ref>@{N}: <reason>. */
+    for (i_emit = n_lines - 1; i_emit >= 0; i_emit--) {
+        long start = line_starts[i_emit];
+        long end = (i_emit + 1 < n_lines) ? line_starts[i_emit + 1] : fsize;
+        long lineno_from_newest = (n_lines - 1) - i_emit;
+        const char *line = buf_all + start;
+        long llen = end - start;
+        const char *p;
+        const char *tab;
+        const char *new_hex;
+        const char *reason;
+        long reason_len;
+
+        /* Trim trailing LF/CR. */
+        while (llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r'))
+            llen--;
+        if (llen <= (long)(hex_len * 2 + 2)) continue;   /* malformed */
+
+        /* Positions: old-hex starts at 0, new-hex at hex_len + 1.
+         * Reason follows a TAB; everything up to the TAB is the prefix. */
+        new_hex = line + hex_len + 1;
+
+        tab = NULL;
+        for (p = line; p < line + llen; p++) {
+            if (*p == '\t') { tab = p; break; }
+        }
+        if (!tab) continue;
+        reason = tab + 1;
+        reason_len = (line + llen) - reason;
+
+        printf("%.7s %s@{%ld}: %.*s\n",
+               new_hex, ref, lineno_from_newest,
+               (int)reason_len, reason);
+
+        shown++;
+        if (max_count > 0 && shown >= max_count) break;
+    }
+
+    free(line_starts);
+    free(buf_all);
+    return 0;
 }
 
 static int cmd_diff(int argc, char **argv) {
@@ -7330,7 +7501,12 @@ static int cmd_amend(int argc, char **argv) {
     commit_destroy(&old_commit);
     if (rc) { fprintf(stderr, "error: cannot write commit\n"); return 1; }
 
-    rc = repo_update_ref(&repo, head_ref, &new_commit_oid);
+    {
+        char reflog_reason[512];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "commit (amend): %s", message);
+        rc = repo_update_ref(&repo, head_ref, &new_commit_oid, reflog_reason);
+    }
     if (rc) { fprintf(stderr, "error: cannot update ref\n"); return 1; }
 
     oid_to_hex(hex, &new_commit_oid);
@@ -7506,8 +7682,13 @@ static int cmd_squash(int argc, char **argv) {
     commit_destroy(&head_commit);
     if (rc) { fprintf(stderr, "error: cannot write commit\n"); return 1; }
 
-    if (repo_update_ref(&repo, head_ref, &new_commit_oid) != 0) {
-        fprintf(stderr, "error: cannot update ref\n"); return 1;
+    {
+        char reflog_reason[128];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "squash: %d commits", n);
+        if (repo_update_ref(&repo, head_ref, &new_commit_oid, reflog_reason) != 0) {
+            fprintf(stderr, "error: cannot update ref\n"); return 1;
+        }
     }
 
     oid_to_hex(hex, &new_commit_oid);
@@ -8386,7 +8567,7 @@ static int stash_save(gut_repo *repo) {
 #endif
     snprintf(stash_ref_path, sizeof(stash_ref_path),
              "refs/stashes/%ld", (long)now);
-    if (repo_update_ref(repo, stash_ref_path, &commit_oid) != 0) {
+    if (repo_update_ref(repo, stash_ref_path, &commit_oid, "stash: snapshot") != 0) {
         index_destroy(&idx);
         fprintf(stderr, "error: cannot write stash ref\n"); return 1;
     }
@@ -8606,7 +8787,8 @@ static int cmd_undo(int argc, char **argv) {
     }
 
     /* Move HEAD to parent */
-    rc = repo_update_ref(&repo, head_ref, &commit.parent_oids[0]);
+    rc = repo_update_ref(&repo, head_ref, &commit.parent_oids[0],
+                         "undo: moving to HEAD^");
     oid_to_hex(hex, &commit.parent_oids[0]);
     commit_destroy(&commit);
 
@@ -8922,7 +9104,12 @@ static int cmd_reset(int argc, char **argv) {
         rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
         if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
 
-        rc = repo_update_ref(&repo, head_ref, &target_oid);
+        {
+            char reflog_reason[256];
+            snprintf(reflog_reason, sizeof(reflog_reason),
+                     "reset: moving to %s", rev_spec);
+            rc = repo_update_ref(&repo, head_ref, &target_oid, reflog_reason);
+        }
         if (rc) { fprintf(stderr, "error: cannot update ref\n"); return 1; }
 
         if (hard) {
@@ -9136,7 +9323,12 @@ static int cmd_merge(int argc, char **argv) {
         index_write(&new_idx, index_path);
         index_destroy(&new_idx);
 
-        repo_update_ref(&repo, head_ref, &their_oid);
+        {
+            char reflog_reason[256];
+            snprintf(reflog_reason, sizeof(reflog_reason),
+                     "merge %s: Fast-forward", branch_name);
+            repo_update_ref(&repo, head_ref, &their_oid, reflog_reason);
+        }
 
         oid_to_hex(hex, &their_oid);
         printf("Fast-forward to %.*s\n", 7, hex);
@@ -9418,10 +9610,483 @@ static int cmd_merge(int argc, char **argv) {
             buf_destroy(&commit_buf);
         }
 
-        repo_update_ref(&repo, head_ref, &merge_commit_oid);
+        {
+            char reflog_reason[256];
+            snprintf(reflog_reason, sizeof(reflog_reason),
+                     "merge %s", branch_name);
+            repo_update_ref(&repo, head_ref, &merge_commit_oid, reflog_reason);
+        }
 
         oid_to_hex(hex, &merge_commit_oid);
         printf("Merge made by the 'recursive' strategy.\n");
+    }
+
+    return 0;
+}
+
+/* ---- gut cherry-pick ---- */
+
+/* Extract the first line of `message` into `subject` (bounded). Used to
+ * build a one-line reflog reason and a short status print. */
+static void commit_subject(char *subject, u64 subject_sz, const char *message) {
+    u64 i = 0;
+    if (!message) { subject[0] = '\0'; return; }
+    while (message[i] && message[i] != '\n' && i + 1 < subject_sz) {
+        subject[i] = message[i];
+        i++;
+    }
+    subject[i] = '\0';
+}
+
+/* Apply the diff introduced by `pick` (pick - parent(pick)) onto HEAD,
+ * then record a new commit with pick's message + author + a
+ * "(cherry picked from commit <oid>)" trailer. HEAD becomes the only
+ * parent of the new commit.
+ *
+ * Conflict handling mirrors cmd_merge: on content conflict we write the
+ * diff3 markers into the blob, stage the file anyway, and refuse to
+ * commit — letting the user resolve, re-add, and `gut commit` manually. */
+static int cmd_cherry_pick(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid our_oid, their_oid, base_oid;
+    char cwd[2048];
+    char head_ref[256];
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+    unsigned long rc;
+    const char *rev_spec;
+    unsigned hex_len;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut cherry-pick <commit>\n");
+        return 1;
+    }
+    rev_spec = argv[0];
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n");
+        return 1;
+    }
+
+    hex_len = gut_oid_hex_size(repo.hash_algo);
+
+    /* Resolve HEAD */
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    rc = repo_resolve_ref(&our_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: HEAD is unborn — run 'gut commit' first\n"); return 1; }
+
+    /* Resolve the commit to pick (short SHA, full SHA, ref name) */
+    if (resolve_object(&their_oid, &repo, rev_spec)) {
+        fprintf(stderr, "fatal: invalid revision '%s'\n", rev_spec);
+        return 1;
+    }
+
+    /* Load pick and its first parent (= base for the 3-way merge) */
+    {
+        gut_object their_obj;
+        gut_commit their_commit;
+        gut_oid their_tree;
+        char *pick_author = NULL;
+        char *pick_message = NULL;
+        u64 pick_author_len = 0;
+        u64 pick_message_len = 0;
+
+        rc = odb_read(&their_obj, &repo.odb, &their_oid);
+        if (rc) { fprintf(stderr, "error: cannot read commit %s\n", rev_spec); return 1; }
+        rc = commit_parse(&their_commit, their_obj.data.data, their_obj.data.len);
+        object_destroy(&their_obj);
+        if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+
+        if (their_commit.parent_count == 0) {
+            /* Root-commit cherry-picks are rare and require a null-tree
+             * diff base. MVP defers them until a user actually asks. */
+            commit_destroy(&their_commit);
+            fprintf(stderr, "error: cherry-picking a root commit is not supported yet\n");
+            return 1;
+        }
+
+        memcpy(their_tree.bytes, their_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        memcpy(base_oid.bytes,
+               their_commit.parent_oids[0].bytes, GUT_OID_MAX_RAW_SIZE);
+
+        /* Snapshot author line and full message so we can build the new
+         * commit after tearing down the parsed `their_commit`. */
+        if (their_commit.author) {
+            pick_author_len = strlen(their_commit.author);
+            pick_author = (char *)malloc(pick_author_len + 1);
+            if (!pick_author) { commit_destroy(&their_commit); return 1; }
+            memcpy(pick_author, their_commit.author, pick_author_len + 1);
+        }
+        if (their_commit.message) {
+            pick_message_len = strlen(their_commit.message);
+            pick_message = (char *)malloc(pick_message_len + 1);
+            if (!pick_message) {
+                free(pick_author);
+                commit_destroy(&their_commit);
+                return 1;
+            }
+            memcpy(pick_message, their_commit.message, pick_message_len + 1);
+        }
+
+        commit_destroy(&their_commit);
+
+        /* Already-applied check: if HEAD's tree and pick's tree are
+         * identical, this is a no-op. Don't bother with the merge. */
+        {
+            gut_object our_obj;
+            gut_commit our_commit;
+            long c;
+            if (odb_read(&our_obj, &repo.odb, &our_oid) == 0 &&
+                commit_parse(&our_commit, our_obj.data.data, our_obj.data.len) == 0) {
+                oid_compare(&c, &our_commit.tree_oid, &their_tree);
+                commit_destroy(&our_commit);
+                object_destroy(&our_obj);
+                if (c == 0) {
+                    free(pick_author); free(pick_message);
+                    printf("Already applied: %s\n", rev_spec);
+                    return 0;
+                }
+            } else {
+                object_destroy(&our_obj);
+            }
+        }
+
+        /* Three-way merge: base = parent(pick), ours = HEAD, theirs = pick. */
+        {
+            gut_object our_commit_obj, base_commit_obj;
+            gut_commit our_commit, base_commit;
+            gut_oid our_tree, base_tree;
+            gut_index base_idx, our_idx, their_idx, merged_idx;
+            char index_path[2048];
+            char obj_dir[2048];
+            gut_oid merge_tree_oid, new_commit_oid;
+            int has_conflicts = 0;
+            u64 i;
+
+            if (odb_read(&our_commit_obj, &repo.odb, &our_oid) ||
+                commit_parse(&our_commit,
+                             our_commit_obj.data.data,
+                             our_commit_obj.data.len)) {
+                free(pick_author); free(pick_message);
+                fprintf(stderr, "error: cannot read HEAD commit\n");
+                return 1;
+            }
+            memcpy(our_tree.bytes, our_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+            commit_destroy(&our_commit);
+            object_destroy(&our_commit_obj);
+
+            if (odb_read(&base_commit_obj, &repo.odb, &base_oid) ||
+                commit_parse(&base_commit,
+                             base_commit_obj.data.data,
+                             base_commit_obj.data.len)) {
+                free(pick_author); free(pick_message);
+                fprintf(stderr, "error: cannot read parent of pick\n");
+                return 1;
+            }
+            memcpy(base_tree.bytes, base_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+            commit_destroy(&base_commit);
+            object_destroy(&base_commit_obj);
+
+            index_read_tree(&base_idx, &repo.odb, &base_tree);
+            index_read_tree(&our_idx, &repo.odb, &our_tree);
+            index_read_tree(&their_idx, &repo.odb, &their_tree);
+            index_init(&merged_idx);
+
+            /* Same three-way merge loop as cmd_merge. */
+            for (i = 0; i < our_idx.count; i++) {
+                const char *path = our_idx.entries[i].path;
+                u64 base_pos, their_pos;
+                int in_base, in_theirs;
+                gut_oid *our_blob = &our_idx.entries[i].oid;
+
+                index_find(&base_pos, &base_idx, path);
+                in_base = (base_pos < base_idx.count &&
+                           strcmp(base_idx.entries[base_pos].path, path) == 0);
+                index_find(&their_pos, &their_idx, path);
+                in_theirs = (their_pos < their_idx.count &&
+                             strcmp(their_idx.entries[their_pos].path, path) == 0);
+
+                if (!in_theirs) {
+                    if (in_base) {
+                        long c;
+                        oid_compare(&c, our_blob, &base_idx.entries[base_pos].oid);
+                        if (c == 0) continue;   /* pick deleted a file we didn't touch */
+                        fprintf(stderr, "CONFLICT (modify/delete): %s\n", path);
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                    } else {
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                    }
+                    continue;
+                }
+
+                {
+                    gut_oid *their_blob = &their_idx.entries[their_pos].oid;
+                    long c_ours_theirs, c_ours_base;
+
+                    oid_compare(&c_ours_theirs, our_blob, their_blob);
+                    if (c_ours_theirs == 0) {
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+
+                    if (!in_base) {
+                        fprintf(stderr, "CONFLICT (add/add): %s\n", path);
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+
+                    oid_compare(&c_ours_base, our_blob, &base_idx.entries[base_pos].oid);
+                    if (c_ours_base == 0) {
+                        index_add(&merged_idx, path, their_blob,
+                                  their_idx.entries[their_pos].mode, 0, 0);
+                        continue;
+                    }
+
+                    {
+                        long c_theirs_base;
+                        oid_compare(&c_theirs_base, their_blob,
+                                    &base_idx.entries[base_pos].oid);
+                        if (c_theirs_base == 0) {
+                            index_add(&merged_idx, path, our_blob,
+                                      our_idx.entries[i].mode, 0, 0);
+                            continue;
+                        }
+                    }
+
+                    {
+                        gut_object b_obj, o_obj, t_obj;
+                        diff_merge_result mr;
+
+                        if (odb_read(&b_obj, &repo.odb,
+                                     &base_idx.entries[base_pos].oid) ||
+                            odb_read(&o_obj, &repo.odb, our_blob) ||
+                            odb_read(&t_obj, &repo.odb, their_blob)) {
+                            fprintf(stderr, "error: cannot read blobs for %s\n", path);
+                            has_conflicts = 1;
+                            index_add(&merged_idx, path, our_blob,
+                                      our_idx.entries[i].mode, 0, 0);
+                            continue;
+                        }
+
+                        rc = diff_three_way(&mr,
+                            (const char *)b_obj.data.data, b_obj.data.len,
+                            (const char *)o_obj.data.data, o_obj.data.len,
+                            (const char *)t_obj.data.data, t_obj.data.len,
+                            "HEAD", "cherry-pick",
+                            DIFF_MERGE_STYLE_STANDARD);
+
+                        object_destroy(&b_obj);
+                        object_destroy(&o_obj);
+                        object_destroy(&t_obj);
+
+                        if (rc) {
+                            fprintf(stderr, "error: merge failed for %s\n", path);
+                            has_conflicts = 1;
+                            index_add(&merged_idx, path, our_blob,
+                                      our_idx.entries[i].mode, 0, 0);
+                        } else {
+                            gut_oid merged_blob;
+                            odb_write(&merged_blob, &repo.odb, GUT_OBJ_BLOB,
+                                      (u8 *)mr.data, mr.len);
+                            index_add(&merged_idx, path, &merged_blob,
+                                      our_idx.entries[i].mode, 0, 0);
+                            if (mr.has_conflicts) {
+                                fprintf(stderr,
+                                        "CONFLICT (content): merge conflict in %s\n",
+                                        path);
+                                has_conflicts = 1;
+                            }
+                            diff_merge_destroy(&mr);
+                        }
+                    }
+                }
+            }
+
+            /* Files new in the pick (added by pick, absent from HEAD). */
+            for (i = 0; i < their_idx.count; i++) {
+                const char *path = their_idx.entries[i].path;
+                u64 our_pos;
+                index_find(&our_pos, &our_idx, path);
+                if (our_pos < our_idx.count &&
+                    strcmp(our_idx.entries[our_pos].path, path) == 0)
+                    continue;
+                index_add(&merged_idx, path, &their_idx.entries[i].oid,
+                          their_idx.entries[i].mode, 0, 0);
+            }
+
+            index_destroy(&base_idx);
+            index_destroy(&our_idx);
+            index_destroy(&their_idx);
+
+            snprintf(index_path, sizeof(index_path), "%s/index", repo.git_dir);
+            {
+                gut_index old_idx;
+                index_read(&old_idx, index_path);
+                workdir_remove_stale(&repo, &old_idx, &merged_idx);
+                index_destroy(&old_idx);
+            }
+            workdir_write_from_index(&repo, &merged_idx);
+
+            if (has_conflicts) {
+                index_write(&merged_idx, index_path);
+                index_destroy(&merged_idx);
+                free(pick_author); free(pick_message);
+                fprintf(stderr,
+                        "error: could not apply %s cleanly; resolve conflicts and "
+                        "commit.\n", rev_spec);
+                return 1;
+            }
+
+            snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+            index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
+            index_write(&merged_idx, index_path);
+            index_destroy(&merged_idx);
+
+            /* Build the new commit: single parent (HEAD), preserved author
+             * (as a full "Name <email> ts tz" line from the picked commit),
+             * current-user committer, message + trailer. */
+            {
+                buf commit_buf;
+                const char *committer_name = NULL;
+                const char *committer_email = NULL;
+                char timestamp[128];
+                time_t now = time(NULL);
+                char committer_name_buf[256];
+                char committer_email_buf[256];
+                gut_config cfg;
+                int have_cfg = 0;
+                char pick_oid_hex[GUT_OID_MAX_HEX_SIZE + 1];
+                char subject[256];
+
+                committer_name = getenv("GUT_COMMITTER_NAME");
+                if (!committer_name) committer_name = getenv("GUT_AUTHOR_NAME");
+                if (!committer_name) committer_name = getenv("GIT_COMMITTER_NAME");
+                if (!committer_name) committer_name = getenv("GIT_AUTHOR_NAME");
+                committer_email = getenv("GUT_COMMITTER_EMAIL");
+                if (!committer_email) committer_email = getenv("GUT_AUTHOR_EMAIL");
+                if (!committer_email) committer_email = getenv("GIT_COMMITTER_EMAIL");
+                if (!committer_email) committer_email = getenv("GIT_AUTHOR_EMAIL");
+                if (!committer_name || !committer_email) {
+                    char config_path[2048];
+                    snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+                    if (config_read(&cfg, config_path) == 0) {
+                        const char *v;
+                        have_cfg = 1;
+                        if (!committer_name && config_get(&v, &cfg, "user", "name") == 0)
+                            committer_name = v;
+                        if (!committer_email && config_get(&v, &cfg, "user", "email") == 0)
+                            committer_email = v;
+                    }
+                }
+                if (!committer_name) committer_name = "Unknown";
+                if (!committer_email) committer_email = "unknown@example.com";
+                snprintf(committer_name_buf, sizeof(committer_name_buf),
+                         "%s", committer_name);
+                snprintf(committer_email_buf, sizeof(committer_email_buf),
+                         "%s", committer_email);
+                if (have_cfg) config_destroy(&cfg);
+
+                {
+                    long tz_offset = 0;
+#ifdef _WIN32
+                    TIME_ZONE_INFORMATION tzi;
+                    if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID)
+                        tz_offset = -(long)tzi.Bias;
+#else
+                    struct tm *lt = localtime(&now);
+                    if (lt) tz_offset = lt->tm_gmtoff / 60;
+#endif
+                    snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
+                             (long long)now, tz_offset / 60, labs(tz_offset) % 60);
+                }
+
+                buf_create(&commit_buf, 512);
+
+                oid_to_hex_n(hex, &merge_tree_oid, hex_len);
+                buf_append(&commit_buf, (u8 *)"tree ", 5);
+                buf_append(&commit_buf, (u8 *)hex, hex_len);
+                buf_append_byte(&commit_buf, '\n');
+
+                oid_to_hex_n(hex, &our_oid, hex_len);
+                buf_append(&commit_buf, (u8 *)"parent ", 7);
+                buf_append(&commit_buf, (u8 *)hex, hex_len);
+                buf_append_byte(&commit_buf, '\n');
+
+                /* Preserve the pick's author line verbatim. Fallback to the
+                 * current committer if the original was missing. */
+                if (pick_author) {
+                    buf_append(&commit_buf, (u8 *)"author ", 7);
+                    buf_append(&commit_buf, (u8 *)pick_author, pick_author_len);
+                    buf_append_byte(&commit_buf, '\n');
+                } else {
+                    char line[512];
+                    int n = snprintf(line, sizeof(line), "author %s <%s> %s\n",
+                                     committer_name_buf, committer_email_buf,
+                                     timestamp);
+                    buf_append(&commit_buf, (u8 *)line, (u64)n);
+                }
+                {
+                    char line[512];
+                    int n = snprintf(line, sizeof(line), "committer %s <%s> %s\n",
+                                     committer_name_buf, committer_email_buf,
+                                     timestamp);
+                    buf_append(&commit_buf, (u8 *)line, (u64)n);
+                }
+
+                buf_append_byte(&commit_buf, '\n');
+
+                if (pick_message) {
+                    buf_append(&commit_buf, (u8 *)pick_message, pick_message_len);
+                    /* Ensure a separating blank line before the trailer. */
+                    if (pick_message_len == 0 ||
+                        pick_message[pick_message_len - 1] != '\n')
+                        buf_append_byte(&commit_buf, '\n');
+                    buf_append_byte(&commit_buf, '\n');
+                }
+
+                oid_to_hex_n(pick_oid_hex, &their_oid, hex_len);
+                pick_oid_hex[hex_len] = '\0';
+                {
+                    char trailer[128];
+                    int n = snprintf(trailer, sizeof(trailer),
+                                     "(cherry picked from commit %s)\n",
+                                     pick_oid_hex);
+                    buf_append(&commit_buf, (u8 *)trailer, (u64)n);
+                }
+
+                odb_write(&new_commit_oid, &repo.odb, GUT_OBJ_COMMIT,
+                          commit_buf.data, commit_buf.len);
+                buf_destroy(&commit_buf);
+
+                commit_subject(subject, sizeof(subject), pick_message);
+                {
+                    char reflog_reason[512];
+                    snprintf(reflog_reason, sizeof(reflog_reason),
+                             "cherry-pick: %s", subject);
+                    repo_update_ref(&repo, head_ref, &new_commit_oid,
+                                    reflog_reason);
+                }
+
+                oid_to_hex_n(hex, &new_commit_oid, hex_len);
+                hex[hex_len] = '\0';
+                printf("[cherry-pick %.*s] %s\n", 7, hex, subject);
+            }
+
+            free(pick_author);
+            free(pick_message);
+        }
     }
 
     return 0;
@@ -9536,6 +10201,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "merge") == 0) {
         return cmd_merge(argc - 2, argv + 2);
     }
+    if (strcmp(argv[1], "cherry-pick") == 0) {
+        return cmd_cherry_pick(argc - 2, argv + 2);
+    }
     if (strcmp(argv[1], "diff") == 0) {
         return cmd_diff(argc - 2, argv + 2);
     }
@@ -9565,6 +10233,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "log") == 0) {
         return cmd_log(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "reflog") == 0) {
+        return cmd_reflog(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "status") == 0) {
         return cmd_status(argc - 2, argv + 2);
