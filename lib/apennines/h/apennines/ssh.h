@@ -1,0 +1,66 @@
+#ifndef APENNINES_T3_SSH_H
+#define APENNINES_T3_SSH_H
+
+#include "apennines/types.h"
+
+/* ================================================================
+ *  SSH Transport — RFC 4253/4252 connection, auth, channels
+ * ================================================================ */
+
+typedef struct ssh_conn    ssh_conn;
+typedef struct ssh_channel ssh_channel;
+
+/* ---- Connection ---- */
+
+/* ssh_conn_create — create SSH connection (TCP + key exchange).
+ *   out:   receives connection handle
+ *   host:  server hostname
+ *   port:  server port (usually 22)
+ *
+ * Hatches: 1=null out, 2=null host, 3=tcp connect failed,
+ *          4=version exchange failed, 5=key exchange failed,
+ *          6=alloc failure */
+unsigned long ssh_conn_create(ssh_conn **out,
+                                             const char *host, u16 port);
+
+/* ssh_conn_auth_password — authenticate with password.
+ * Hatches: 1=null conn, 2=null username, 3=null password,
+ *          4=auth rejected, 5=protocol error */
+unsigned long ssh_conn_auth_password(ssh_conn *conn,
+                                                    const char *username,
+                                                    const char *password);
+
+/* ssh_conn_auth_pubkey — authenticate with public key.
+ * Hatches: 1=null conn, 2=null username, 3=null privkey,
+ *          4=auth rejected, 5=sign failure, 6=protocol error */
+unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
+                                                  const char *username,
+                                                  const u8 *privkey, u64 privkey_len);
+
+/* ssh_conn_open_channel — open a session channel.
+ * Hatches: 1=null out, 2=null conn, 3=channel open rejected,
+ *          4=alloc failure */
+unsigned long ssh_conn_open_channel(ssh_channel **out,
+                                                   ssh_conn *conn);
+
+unsigned long ssh_conn_destroy(ssh_conn *conn);
+
+/* ---- Channel ---- */
+
+unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,
+                                              u8 *buf, u64 len);
+unsigned long ssh_channel_write(u64 *bytes_written, ssh_channel *ch,
+                                               const u8 *data, u64 len);
+
+/* ssh_channel_exec — run a remote command on the open session channel.
+ * After success, channel_read returns the command's stdout, and
+ * channel_write feeds its stdin. This is the mechanism used by git-over-ssh
+ * to invoke `git-upload-pack` / `git-receive-pack` on the remote.
+ *
+ * Hatches: 1=null ch, 2=null command, 3=channel already closed,
+ *          4=protocol/transport error, 5=server rejected exec */
+unsigned long ssh_channel_exec(ssh_channel *ch, const char *command);
+
+unsigned long ssh_channel_close(ssh_channel *ch);
+
+#endif /* APENNINES_T3_SSH_H */
