@@ -41,6 +41,7 @@
       "lib/apennines/c/ssh.c",
       "lib/apennines/c/tcp.c",
       "lib/apennines/c/tls.c",
+      "lib/apennines/c/uds.c",
       "lib/apennines/c/ws.c",
       "lib/apennines/c/x509.c",
       "lib/apennines/c/zlib_wrap.c"

@@ -37,6 +37,24 @@ unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
                                                   const char *username,
                                                   const u8 *privkey, u64 privkey_len);
 
+/* ssh_conn_auth_agent — authenticate via the running ssh-agent.
+ *
+ * Connects to the agent at $SSH_AUTH_SOCK (preferred, works on both
+ * POSIX and Windows if exposed as AF_UNIX) or falls back to the
+ * Windows named pipe \\.\pipe\openssh-ssh-agent. Picks the first
+ * ed25519 identity the agent advertises and delegates session-ID
+ * signing to the agent — the client never sees the private key.
+ *
+ * This is the practical auth path for end-users whose id_ed25519 is
+ * passphrase-encrypted (OpenSSH default) — the agent holds the
+ * decrypted key for the session.
+ *
+ * Hatches: 1=null conn, 2=null username, 3=no agent reachable,
+ *          4=no matching (ed25519) key in agent, 5=agent sign failed,
+ *          6=server rejected userauth / protocol error */
+unsigned long ssh_conn_auth_agent(ssh_conn *conn,
+                                                 const char *username);
+
 /* ssh_conn_open_channel — open a session channel.
  * Hatches: 1=null out, 2=null conn, 3=channel open rejected,
  *          4=alloc failure */

@@ -466,15 +466,28 @@ static unsigned long drain_channel(u8 **out, u64 *out_len, ssh_channel *ch) {
 static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                                    const ssh_url_parts *u, const char *cmd) {
     u8 seed[32];
+    int have_seed = 0;
+    int have_explicit_key = (getenv("GUT_SSH_PRIVKEY_HEX") ||
+                             getenv("GUT_SSH_PRIVKEY_FILE"));
+    int force_agent = (getenv("GUT_SSH_USE_AGENT") != NULL);
+    int verbose = getenv("GUT_SSH_DEBUG") != NULL;
     ssh_conn *c = NULL;
     ssh_channel *ch = NULL;
     unsigned long rc;
 
-    if (load_ed25519_seed(seed)) {
-        fprintf(stderr,
-                "error: no ed25519 key for SSH — set GUT_SSH_PRIVKEY_HEX, "
-                "GUT_SSH_PRIVKEY_FILE, or place one at ~/.ssh/id_ed25519\n");
-        return __LINE__;
+    /* Key-file path is opt-in for testing: only try to load a seed
+     * from disk if the caller explicitly pointed us at one. Otherwise
+     * go straight to ssh-agent, which is the production path for
+     * encrypted keys (OpenSSH's default). */
+    if (have_explicit_key && !force_agent) {
+        if (load_ed25519_seed(seed) == 0) have_seed = 1;
+        else {
+            fprintf(stderr,
+                    "error: GUT_SSH_PRIVKEY_* set but the key could not be "
+                    "loaded (encrypted keys require ssh-agent — unset the "
+                    "env var and run `ssh-add` first)\n");
+            return __LINE__;
+        }
     }
 
     /* apennines' ssh_conn_create -> addr_sockaddr_create only accepts
@@ -507,11 +520,30 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
             return __LINE__;
         }
     }
-    rc = ssh_conn_auth_pubkey(c, u->user, seed, 32);
+    if (have_seed) {
+        if (verbose) fprintf(stderr, "[ssh] auth: pubkey (env-provided seed)\n");
+        rc = ssh_conn_auth_pubkey(c, u->user, seed, 32);
+    } else {
+        if (verbose) fprintf(stderr, "[ssh] auth: ssh-agent\n");
+        rc = ssh_conn_auth_agent(c, u->user);
+    }
     if (rc) {
-        fprintf(stderr, "error: ssh pubkey auth rejected (line %lu) — "
-                "user=%s host=%s (is the key registered with the remote?)\n",
-                rc, u->user, u->host);
+        if (have_seed) {
+            fprintf(stderr, "error: ssh pubkey auth rejected (line %lu) — "
+                    "user=%s host=%s (is the key registered with the remote?)\n",
+                    rc, u->user, u->host);
+        } else {
+            const char *hint =
+                (rc == 3) ? "no ssh-agent reachable — is it running? "
+                            "(check SSH_AUTH_SOCK or the Windows named pipe)"
+              : (rc == 4) ? "no ed25519 key loaded in agent — run `ssh-add ~/.ssh/id_ed25519`"
+              : (rc == 5) ? "ssh-agent sign request failed"
+              : (rc == 6) ? "remote rejected the userauth request "
+                            "(is the pubkey registered with the remote?)"
+                          : "(unknown)";
+            fprintf(stderr, "error: ssh-agent auth failed (line %lu) — %s\n",
+                    rc, hint);
+        }
         ssh_conn_destroy(c);
         return __LINE__;
     }

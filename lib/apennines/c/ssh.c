@@ -1,11 +1,18 @@
 #include "apennines/ssh.h"
 #include "apennines/tcp.h"
+#include "apennines/uds.h"
 #include "apennines/addr.h"
 #include "apennines/hash.h"
 #include "apennines/ec.h"
 #include "apennines/cipher.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 /* ================================================================
  *  SSH Transport — RFC 4253/4252 client implementation
@@ -721,6 +728,330 @@ unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
     memset(sig, 0, ED25519_SIG_LEN);
 
     return 6;
+}
+
+/* ================================================================
+ *  ssh-agent client (RFC-draft-miller-ssh-agent / OpenSSH PROTOCOL.agent)
+ *
+ *  Needed because real-world users keep their `~/.ssh/id_ed25519`
+ *  passphrase-encrypted (aes256-ctr + bcrypt-pbkdf). We can't
+ *  practically decrypt it without implementing OpenSSH's KDF; the
+ *  canonical solution is to delegate signing to the running ssh-agent,
+ *  which holds the decrypted key in memory for the session. Gut's
+ *  `git clone git@github.com:...` flow requires this.
+ *
+ *  Transport endpoint:
+ *    POSIX:   Unix domain socket at $SSH_AUTH_SOCK
+ *    Windows: named pipe \\.\pipe\openssh-ssh-agent
+ *
+ *  Wire format: u32 big-endian length prefix + body.
+ *  Messages used here:
+ *    SSH_AGENTC_REQUEST_IDENTITIES  (11)  — list keys
+ *    SSH_AGENT_IDENTITIES_ANSWER    (12)  — reply: u32 nkeys + per key
+ *                                           (string pubkey_blob, string comment)
+ *    SSH_AGENTC_SIGN_REQUEST        (13)  — ask agent to sign
+ *                                           (string pubkey_blob, string data, u32 flags)
+ *    SSH_AGENT_SIGN_RESPONSE        (14)  — reply: string sig_blob
+ *    SSH_AGENT_FAILURE              (5)
+ * ================================================================ */
+
+#define SSH_AGENTC_REQUEST_IDENTITIES  11
+#define SSH_AGENT_IDENTITIES_ANSWER    12
+#define SSH_AGENTC_SIGN_REQUEST        13
+#define SSH_AGENT_SIGN_RESPONSE        14
+#define SSH_AGENT_FAILURE               5
+
+typedef struct {
+#ifdef _WIN32
+    HANDLE   pipe;
+    int      is_pipe;   /* 1 on Windows when using named pipe */
+    uds_conn uds;       /* fallback on Windows 10+ if SSH_AUTH_SOCK is set */
+#else
+    uds_conn uds;
+#endif
+    int      opened;
+} ssh_agent_conn;
+
+static unsigned long agent_open(ssh_agent_conn *a) {
+    const char *sock;
+
+    memset(a, 0, sizeof(*a));
+
+    /* Prefer SSH_AUTH_SOCK if the env var is set (works on both POSIX
+     * and Windows 10+ when the agent is exposed via AF_UNIX). */
+    sock = getenv("SSH_AUTH_SOCK");
+    if (sock && *sock) {
+        if (uds_conn_create(&a->uds, sock) == 0) {
+            a->opened = 1;
+            return 0;
+        }
+        /* fall through to named-pipe on Windows */
+    }
+
+#ifdef _WIN32
+    /* Windows: OpenSSH-for-Windows exposes the agent at
+     * \\.\pipe\openssh-ssh-agent. CreateFileA + ReadFile/WriteFile
+     * treat it as a message-mode pipe. */
+    {
+        HANDLE h = CreateFileA(
+            "\\\\.\\pipe\\openssh-ssh-agent",
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            a->pipe    = h;
+            a->is_pipe = 1;
+            a->opened  = 1;
+            return 0;
+        }
+    }
+#endif
+
+    return 1;
+}
+
+static unsigned long agent_write_all(ssh_agent_conn *a, const u8 *buf, u64 len) {
+#ifdef _WIN32
+    if (a->is_pipe) {
+        u64 total = 0;
+        while (total < len) {
+            DWORD written = 0;
+            DWORD chunk = (DWORD)(len - total > 0x40000000u ? 0x40000000u : len - total);
+            if (!WriteFile(a->pipe, buf + total, chunk, &written, NULL)) return 1;
+            if (written == 0) return 1;
+            total += written;
+        }
+        return 0;
+    }
+#endif
+    {
+        u64 written = 0;
+        return uds_conn_write_all(&written, &a->uds, buf, len);
+    }
+}
+
+static unsigned long agent_read_exact(ssh_agent_conn *a, u8 *buf, u64 len) {
+    u64 total = 0;
+    while (total < len) {
+#ifdef _WIN32
+        if (a->is_pipe) {
+            DWORD got = 0;
+            DWORD chunk = (DWORD)(len - total > 0x40000000u ? 0x40000000u : len - total);
+            if (!ReadFile(a->pipe, buf + total, chunk, &got, NULL)) return 1;
+            if (got == 0) return 1;
+            total += got;
+            continue;
+        }
+#endif
+        {
+            u64 got = 0;
+            if (uds_conn_read(&got, &a->uds, buf + total, len - total) != 0) return 1;
+            if (got == 0) return 1;
+            total += got;
+        }
+    }
+    return 0;
+}
+
+static void agent_close(ssh_agent_conn *a) {
+    if (!a->opened) return;
+#ifdef _WIN32
+    if (a->is_pipe) {
+        if (a->pipe != INVALID_HANDLE_VALUE) CloseHandle(a->pipe);
+        a->pipe = INVALID_HANDLE_VALUE;
+        a->is_pipe = 0;
+        a->opened = 0;
+        return;
+    }
+#endif
+    uds_conn_destroy(&a->uds);
+    a->opened = 0;
+}
+
+/* Send one agent request: u32 length + u8 type + body. */
+static unsigned long agent_send(ssh_agent_conn *a, u8 type,
+                                const u8 *body, u64 body_len) {
+    u8 hdr[5];
+    u32 total_len = (u32)(1 + body_len);
+    put_u32(hdr, total_len);
+    hdr[4] = type;
+    if (agent_write_all(a, hdr, 5) != 0) return 1;
+    if (body_len > 0) {
+        if (agent_write_all(a, body, body_len) != 0) return 1;
+    }
+    return 0;
+}
+
+/* Read one agent reply. Caller supplies a buffer; on success *out_len
+ * is the reply body length (excluding the length prefix, excluding the
+ * leading type byte — out[0] is the type byte, out[1..*out_len] is the
+ * body proper). Returns 0 on success. */
+static unsigned long agent_recv(ssh_agent_conn *a, u8 *out, u64 cap, u64 *out_len) {
+    u8 lenbuf[4];
+    u32 mlen;
+
+    if (agent_read_exact(a, lenbuf, 4) != 0) return 1;
+    mlen = get_u32(lenbuf);
+    if (mlen == 0 || mlen > cap) return 2;
+    if (agent_read_exact(a, out, mlen) != 0) return 1;
+    *out_len = mlen;
+    return 0;
+}
+
+/* Pick the first ed25519 identity from an IDENTITIES_ANSWER reply.
+ * On success, *pub_out receives a pointer into `reply` to the 32-byte
+ * public key, and the full pubkey_blob (for the SIGN_REQUEST) is copied
+ * into blob_out/blob_out_len. Returns 0 on success, non-zero if no
+ * ed25519 key is present. */
+static unsigned long agent_pick_ed25519(const u8 *reply, u64 reply_len,
+                                         u8 *blob_out, u64 blob_cap,
+                                         u64 *blob_out_len,
+                                         const u8 **pub_out) {
+    pkt_reader pr;
+    u8         msg_type;
+    u32        nkeys, i;
+
+    pr_init(&pr, reply, reply_len);
+    if (pr_u8(&pr, &msg_type) != 0)      return 1;
+    if (msg_type != SSH_AGENT_IDENTITIES_ANSWER) return 1;
+    if (pr_u32(&pr, &nkeys) != 0)        return 1;
+
+    for (i = 0; i < nkeys; i++) {
+        const u8 *blob, *comment;
+        u64       blob_len, comment_len;
+        pkt_reader inner;
+        const u8 *keytype, *pub;
+        u64       keytype_len, pub_len;
+
+        if (pr_string(&pr, &blob, &blob_len) != 0)      return 1;
+        if (pr_string(&pr, &comment, &comment_len) != 0) return 1;
+        (void)comment;
+
+        /* Parse the pubkey blob: string(keytype) + string(pubkey_data) */
+        pr_init(&inner, blob, blob_len);
+        if (pr_string(&inner, &keytype, &keytype_len) != 0) continue;
+        if (pr_string(&inner, &pub,     &pub_len)     != 0) continue;
+
+        if (keytype_len == 11 && memcmp(keytype, "ssh-ed25519", 11) == 0
+            && pub_len == 32) {
+            if (blob_len > blob_cap) return 2;
+            memcpy(blob_out, blob, blob_len);
+            *blob_out_len = blob_len;
+            *pub_out = blob + 4 + 11 + 4;  /* skip keytype string + len-prefix of pubkey */
+            (void)pub;  /* alternatively *pub_out = pub; but `pub` refs inner reader */
+            *pub_out = pub;
+            return 0;
+        }
+    }
+    return 3;
+}
+
+unsigned long ssh_conn_auth_agent(ssh_conn *conn,
+                                                 const char *username) {
+    ssh_agent_conn agent;
+    u8  reply[4096];
+    u64 reply_len;
+    u8  pubkey_blob[512];
+    u64 pubkey_blob_len;
+    const u8 *pub_raw = NULL;
+    u8  sig_data[SSH_MAX_PACKET];
+    pkt_buf  sdb;
+    u8  sign_req[1024];
+    pkt_buf  srb;
+    u8  sign_reply[1024];
+    u64 sign_reply_len;
+    pkt_reader pr;
+    u8  sr_type;
+    const u8 *sig_blob;
+    u64 sig_blob_len;
+    u8  payload[SSH_MAX_PACKET];
+    u64 payload_len;
+    pkt_buf  pb;
+    unsigned long rc;
+
+    if (!conn)     return 1;
+    if (!username) return 2;
+
+    if (agent_open(&agent) != 0) return 3;
+
+    /* 1. Request identities. Body is empty. */
+    if (agent_send(&agent, SSH_AGENTC_REQUEST_IDENTITIES, NULL, 0) != 0) {
+        agent_close(&agent); return 3;
+    }
+
+    if (agent_recv(&agent, reply, sizeof(reply), &reply_len) != 0) {
+        agent_close(&agent); return 3;
+    }
+
+    if (agent_pick_ed25519(reply, reply_len,
+                            pubkey_blob, sizeof(pubkey_blob),
+                            &pubkey_blob_len, &pub_raw) != 0) {
+        agent_close(&agent); return 4;
+    }
+
+    /* 2. Build the userauth data-to-sign blob, identical to the shape
+     *    ssh_conn_auth_pubkey constructs. Agent signs this blob. */
+    pb_init(&sdb, sig_data, sizeof(sig_data));
+    pb_string(&sdb, conn->session_id, conn->session_id_len);
+    pb_u8(&sdb, SSH_MSG_USERAUTH_REQUEST);
+    pb_cstring(&sdb, username);
+    pb_cstring(&sdb, "ssh-connection");
+    pb_cstring(&sdb, "publickey");
+    pb_bool(&sdb, 1);  /* TRUE: real auth, not just probe */
+    pb_cstring(&sdb, "ssh-ed25519");
+    pb_string(&sdb, pubkey_blob, pubkey_blob_len);
+
+    /* 3. Ask the agent to sign. SIGN_REQUEST body:
+     *      string pubkey_blob, string data, u32 flags */
+    pb_init(&srb, sign_req, sizeof(sign_req));
+    pb_string(&srb, pubkey_blob, pubkey_blob_len);
+    pb_string(&srb, sdb.buf, sdb.len);
+    pb_u32(&srb, 0);   /* flags=0 — no SHA-2 preference for ed25519 */
+
+    if (agent_send(&agent, SSH_AGENTC_SIGN_REQUEST, srb.buf, srb.len) != 0) {
+        agent_close(&agent); return 5;
+    }
+
+    if (agent_recv(&agent, sign_reply, sizeof(sign_reply), &sign_reply_len) != 0) {
+        agent_close(&agent); return 5;
+    }
+    agent_close(&agent);
+
+    pr_init(&pr, sign_reply, sign_reply_len);
+    if (pr_u8(&pr, &sr_type) != 0)             return 5;
+    if (sr_type == SSH_AGENT_FAILURE)          return 5;
+    if (sr_type != SSH_AGENT_SIGN_RESPONSE)    return 5;
+    if (pr_string(&pr, &sig_blob, &sig_blob_len) != 0) return 5;
+
+    /* 4. Assemble the userauth request packet with the agent's signature.
+     *    Server accepts this exactly like any other ssh-ed25519 sig. */
+    pb_init(&pb, payload, sizeof(payload));
+    pb_u8(&pb, SSH_MSG_USERAUTH_REQUEST);
+    pb_cstring(&pb, username);
+    pb_cstring(&pb, "ssh-connection");
+    pb_cstring(&pb, "publickey");
+    pb_bool(&pb, 1);
+    pb_cstring(&pb, "ssh-ed25519");
+    pb_string(&pb, pubkey_blob, pubkey_blob_len);
+    pb_string(&pb, sig_blob, sig_blob_len);
+
+    if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 6;
+
+    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 6;
+    if (payload_len < 1) return 6;
+
+    if (payload[0] == SSH_MSG_USERAUTH_SUCCESS) { rc = 0; }
+    else if (payload[0] == SSH_MSG_USERAUTH_FAILURE) { rc = 6; }
+    else { rc = 6; }
+
+    /* pub_raw is only used to suppress an unused-variable warning in
+     * case future callers want the raw pubkey bytes. */
+    (void)pub_raw;
+
+    return rc;
 }
 
 /* ================================================================
