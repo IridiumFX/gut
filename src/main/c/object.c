@@ -1,5 +1,6 @@
 #include "gut/object.h"
 #include "gut/odb.h"
+#include "apennines/hash.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -110,6 +111,9 @@ unsigned long obj_hash(gut_oid *out, gut_obj_type type, u8 *data, u64 len) {
     rc = obj_serialize(&serialized, type, data, len);
     if (rc) { buf_destroy(&serialized); return __LINE__; }
 
+    /* Zero the tail (bytes 20..31) so a SHA-1 OID in a wide buffer
+     * compares cleanly via memcmp. */
+    memset(out->bytes, 0, sizeof(out->bytes));
     rc = oid_hash(out, serialized.data, serialized.len);
     buf_destroy(&serialized);
     if (rc) return __LINE__;
@@ -117,8 +121,38 @@ unsigned long obj_hash(gut_oid *out, gut_obj_type type, u8 *data, u64 len) {
     return 0;
 }
 
-unsigned long tree_parse(gut_tree *out, u8 *data, u64 len) {
+unsigned long obj_hash_sha256(gut_oid *out, gut_obj_type type,
+                              u8 *data, u64 len) {
+    buf serialized;
+    unsigned long rc;
+
+    if (!out) return __LINE__;
+
+    rc = buf_create(&serialized, len + 64);
+    if (rc) return __LINE__;
+
+    rc = obj_serialize(&serialized, type, data, len);
+    if (rc) { buf_destroy(&serialized); return __LINE__; }
+
+    memset(out->bytes, 0, sizeof(out->bytes));
+    rc = sha256_digest(out->bytes, serialized.data, serialized.len);
+    buf_destroy(&serialized);
+    if (rc) return __LINE__;
+
+    return 0;
+}
+
+unsigned long obj_hash_algo(gut_oid *out, gut_hash_algo algo,
+                            gut_obj_type type, u8 *data, u64 len) {
+    return (algo == GUT_HASH_SHA256)
+        ? obj_hash_sha256(out, type, data, len)
+        : obj_hash(out, type, data, len);
+}
+
+unsigned long tree_parse_algo(gut_tree *out, u8 *data, u64 len,
+                              gut_hash_algo algo) {
     u64 pos;
+    unsigned oid_raw = gut_oid_raw_size(algo);
 
     if (!out) return __LINE__;
     if (len > 0 && !data) return __LINE__;
@@ -153,15 +187,16 @@ unsigned long tree_parse(gut_tree *out, u8 *data, u64 len) {
         }
         if (name_end >= len) return __LINE__;
 
-        /* Need 20 bytes of OID after the NUL */
-        if (name_end + 1 + GUT_OID_RAW_SIZE > len) return __LINE__;
+        /* Need oid_raw bytes of OID after the NUL */
+        if (name_end + 1 + oid_raw > len) return __LINE__;
 
         entry.mode = mode;
         entry.name = (char *)malloc(name_end - name_start + 1);
         if (!entry.name) return __LINE__;
         memcpy(entry.name, data + name_start, name_end - name_start);
         entry.name[name_end - name_start] = '\0';
-        memcpy(entry.oid.bytes, data + name_end + 1, GUT_OID_RAW_SIZE);
+        memset(entry.oid.bytes, 0, sizeof(entry.oid.bytes));
+        memcpy(entry.oid.bytes, data + name_end + 1, oid_raw);
 
         /* Grow entries array if needed */
         if (out->count >= out->capacity) {
@@ -177,10 +212,14 @@ unsigned long tree_parse(gut_tree *out, u8 *data, u64 len) {
         }
 
         out->entries[out->count++] = entry;
-        pos = name_end + 1 + GUT_OID_RAW_SIZE;
+        pos = name_end + 1 + oid_raw;
     }
 
     return 0;
+}
+
+unsigned long tree_parse(gut_tree *out, u8 *data, u64 len) {
+    return tree_parse_algo(out, data, len, GUT_HASH_SHA1);
 }
 
 unsigned long tree_destroy(gut_tree *tree) {
@@ -279,10 +318,26 @@ static char *dup_range(u8 *data, u64 start, u64 end) {
     return s;
 }
 
+/* Count hex chars starting at p, stop at newline/non-hex. 40 or 64 means
+ * we're looking at a SHA-1 or SHA-256 OID; anything else is malformed. */
+static unsigned detect_hex_len(const u8 *p, u64 max) {
+    unsigned n = 0;
+    while (n < max) {
+        char c = (char)p[n];
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F')) {
+            n++;
+        } else break;
+    }
+    return n;
+}
+
 unsigned long commit_parse(gut_commit *out, u8 *data, u64 len) {
     u64 pos;
     u64 line_end;
     u64 parent_cap;
+    unsigned hex_len;
 
     if (!out) return __LINE__;
     if (!data) return __LINE__;
@@ -294,19 +349,23 @@ unsigned long commit_parse(gut_commit *out, u8 *data, u64 len) {
     /* Parse "tree <hex>\n" */
     if (pos + 5 > len || memcmp(data + pos, "tree ", 5) != 0) return __LINE__;
     pos += 5;
-    if (pos + GUT_OID_HEX_SIZE > len) return __LINE__;
+    hex_len = detect_hex_len(data + pos, len - pos);
+    if (hex_len != 40 && hex_len != 64) return __LINE__;
     {
-        unsigned long rc = oid_from_hex(&out->tree_oid, (const char *)(data + pos));
+        unsigned long rc = oid_from_hex_n(&out->tree_oid,
+                                          (const char *)(data + pos), hex_len);
         if (rc) return __LINE__;
     }
-    pos += GUT_OID_HEX_SIZE;
+    pos += hex_len;
     if (pos >= len || data[pos] != '\n') return __LINE__;
     pos++;
 
     /* Parse zero or more "parent <hex>\n" */
     while (pos + 7 <= len && memcmp(data + pos, "parent ", 7) == 0) {
+        unsigned p_hex_len;
         pos += 7;
-        if (pos + GUT_OID_HEX_SIZE > len) return __LINE__;
+        p_hex_len = detect_hex_len(data + pos, len - pos);
+        if (p_hex_len != 40 && p_hex_len != 64) return __LINE__;
 
         if (out->parent_count >= parent_cap) {
             u64 new_cap = parent_cap == 0 ? 2 : parent_cap * 2;
@@ -318,12 +377,12 @@ unsigned long commit_parse(gut_commit *out, u8 *data, u64 len) {
         }
 
         {
-            unsigned long rc = oid_from_hex(&out->parent_oids[out->parent_count],
-                                            (const char *)(data + pos));
+            unsigned long rc = oid_from_hex_n(&out->parent_oids[out->parent_count],
+                                              (const char *)(data + pos), p_hex_len);
             if (rc) return __LINE__;
         }
         out->parent_count++;
-        pos += GUT_OID_HEX_SIZE;
+        pos += p_hex_len;
         if (pos >= len || data[pos] != '\n') return __LINE__;
         pos++;
     }
@@ -381,7 +440,7 @@ unsigned long tree_lookup_path(gut_oid *out, gut_odb *odb,
     if (rc) return __LINE__;
     if (obj.type != GUT_OBJ_TREE) { object_destroy(&obj); return __LINE__; }
 
-    rc = tree_parse(&tree, obj.data.data, obj.data.len);
+    rc = tree_parse_algo(&tree, obj.data.data, obj.data.len, odb->hash_algo);
     object_destroy(&obj);
     if (rc) return __LINE__;
 

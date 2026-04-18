@@ -860,7 +860,14 @@ unsigned long http_response_parse(http_response *out, const u8 *data, u64 len) {
                 declared = declared * 10 + (u64)(*cp - '0');
                 ++cp;
             }
-            if (declared < body_len) body_len = declared;
+            /* If we haven't received the declared body yet, the caller
+             * hasn't seen the full response — signal incomplete so the
+             * read loop keeps going. Otherwise clamp to declared length. */
+            if (declared > body_len) {
+                http_response_destroy(out);
+                return 6;
+            }
+            body_len = declared;
         }
     }
 

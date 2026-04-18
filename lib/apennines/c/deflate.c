@@ -872,7 +872,8 @@ static unsigned long deflate_decode_fixed_symbol(bit_reader *br, u32 *sym) {
     return 1; /* invalid code */
 }
 
-unsigned long deflate_decompress(buf *out, u8 *data, u64 len) {
+static unsigned long deflate_decompress_impl(buf *out, u8 *data, u64 len,
+                                             u64 *consumed_out) {
     bit_reader br;
     u32 bfinal;
     unsigned long rc;
@@ -880,7 +881,10 @@ unsigned long deflate_decompress(buf *out, u8 *data, u64 len) {
     if (!out) return 1;
     if (len > 0 && !data) return 2;
 
-    if (len == 0) return 0;
+    if (len == 0) {
+        if (consumed_out) *consumed_out = 0;
+        return 0;
+    }
 
     br_init(&br, data, len);
 
@@ -1278,5 +1282,20 @@ unsigned long deflate_decompress(buf *out, u8 *data, u64 len) {
         }
     } while (!bfinal);
 
+    if (consumed_out) {
+        /* br.pos points to the next unread byte. Any bits already in
+         * br.bits belong to the current byte and do NOT advance pos.
+         * So br.pos itself is the count of fully-consumed input bytes. */
+        *consumed_out = br.pos;
+    }
     return 0;
+}
+
+unsigned long deflate_decompress(buf *out, u8 *data, u64 len) {
+    return deflate_decompress_impl(out, data, len, NULL);
+}
+
+unsigned long deflate_decompress_consumed(buf *out, u8 *data, u64 len,
+                                          u64 *consumed) {
+    return deflate_decompress_impl(out, data, len, consumed);
 }

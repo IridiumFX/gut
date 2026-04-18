@@ -1157,6 +1157,37 @@ static void emit_broadcast(const char *json, u64 len, void *ctx) {
     broadcast_to_peers(json, len);
 }
 
+/* Send a text frame to a specific inbound peer, by slot id. */
+unsigned long leech_listen_reply(u64 peer_slot_id, const char *text, u64 len) {
+    int i;
+    u8 *frame = NULL;
+    u64 frame_len = 0;
+    u8 no_mask[4] = {0};
+    unsigned long rc;
+
+    for (i = 0; i < GUT_LEECH_MAX_PEERS; i++) {
+        if (g_peers[i].state != PEER_CONNECTED) continue;
+        if (g_peers[i].dir != PEER_DIR_INBOUND) continue;
+        if (g_peers[i].slot_id != peer_slot_id) continue;
+
+        if (ws_frame_encode(&frame, &frame_len, WS_OPCODE_TEXT,
+                            (const u8 *)text, len, 0, no_mask) != 0) {
+            return __LINE__;
+        }
+        {
+            u64 n;
+            rc = tcp_conn_write_all(&n, &g_peers[i].conn, frame, frame_len);
+        }
+        free(frame);
+        if (rc) {
+            peer_slot_close(i);
+            return __LINE__;
+        }
+        return 0;
+    }
+    return __LINE__; /* peer not found / not connected */
+}
+
 /* Current time in milliseconds (monotonic-ish) */
 static u64 now_ms(void) {
 #ifdef _WIN32
@@ -1347,6 +1378,12 @@ static unsigned long parse_ws_url(const char *url, char *host, size_t host_size,
     } else if (strncmp(url, "wss://", 6) == 0) {
         p = url + 6;
         is_wss = 1;
+    } else if (strncmp(url, "http://", 7) == 0) {
+        /* Allow plain-HTTP URLs for endpoints like /pack that don't need WS */
+        p = url + 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        p = url + 8;
+        is_wss = 1;
     } else {
         return __LINE__;
     }
@@ -1482,7 +1519,6 @@ static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name
         {
             char pack_dir[2048];
             char pack_path[2048];
-            char idx_cmd[4096];
             FILE *fp;
 
             snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo->git_dir);
@@ -1498,10 +1534,10 @@ static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name
             fwrite(resp.data + body_start, 1, (size_t)(resp.len - body_start), fp);
             fclose(fp);
 
-            /* Index it (uses git for now until we have our own pack indexer) */
-            snprintf(idx_cmd, sizeof(idx_cmd),
-                     "git index-pack \"%s\"", pack_path);
-            system(idx_cmd);
+            if (pack_index_create(pack_path, NULL) != 0) {
+                buf_destroy(&resp);
+                return __LINE__;
+            }
         }
     }
     buf_destroy(&resp);
@@ -1843,7 +1879,8 @@ unsigned long leech_list_peers(const char *host) {
  * ==================================================================== */
 
 unsigned long leech_send_to(const char *url, const char *token,
-                            const char *text, u64 len, int wait_reply) {
+                            const char *text, u64 len,
+                            char **reply_out, u64 *reply_len_out) {
     char host[256];
     char path[512];
     u16  port;
@@ -1963,8 +2000,10 @@ unsigned long leech_send_to(const char *url, const char *token,
     if (rc) { tcp_conn_destroy(&conn); return __LINE__; }
 
     /* Optionally read one reply frame */
-    if (wait_reply) {
+    if (reply_out) {
         buf accum;
+        *reply_out = NULL;
+        if (reply_len_out) *reply_len_out = 0;
         buf_create(&accum, 1024);
         for (;;) {
             u8 chunk[2048];
@@ -1980,9 +2019,12 @@ unsigned long leech_send_to(const char *url, const char *token,
             drc = ws_frame_decode(&rf, &consumed, accum.data, accum.len);
             if (drc == 0) {
                 if (rf.opcode == WS_OPCODE_TEXT) {
-                    fwrite(rf.payload, 1, (size_t)rf.payload_len, stdout);
-                    printf("\n");
-                    fflush(stdout);
+                    *reply_out = (char *)malloc((size_t)rf.payload_len + 1);
+                    if (*reply_out) {
+                        memcpy(*reply_out, rf.payload, (size_t)rf.payload_len);
+                        (*reply_out)[rf.payload_len] = '\0';
+                        if (reply_len_out) *reply_len_out = rf.payload_len;
+                    }
                 }
                 ws_frame_free(&rf);
                 break;
@@ -1993,4 +2035,18 @@ unsigned long leech_send_to(const char *url, const char *token,
 
     tcp_conn_destroy(&conn);
     return 0;
+}
+
+/* Public wrapper: parse URL, call leech_fetch_and_store. */
+unsigned long leech_fetch(gut_repo *repo, const char *url,
+                          const char *peer_name, const char *oid_hex,
+                          const char *ref_name) {
+    char host[256];
+    char path[512];
+    u16  port;
+    unsigned long rc;
+
+    rc = parse_ws_url(url, host, sizeof(host), &port, path, sizeof(path));
+    if (rc) return __LINE__;
+    return leech_fetch_and_store(repo, peer_name, host, port, oid_hex, ref_name);
 }

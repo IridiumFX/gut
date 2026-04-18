@@ -38,6 +38,7 @@ typedef struct {
     gut_index_entry *entries;
     u64              count;
     u64              capacity;
+    gut_hash_algo    hash_algo;  /* defaults to SHA-1; set from repo for SHA-256 */
 } gut_index;
 
 /* Initialize an empty index */

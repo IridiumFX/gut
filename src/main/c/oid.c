@@ -35,6 +35,34 @@ unsigned long oid_from_hex(gut_oid *out, const char *hex) {
     return 0;
 }
 
+/* Width-aware variants for SHA-256 callers. n = hex chars (40 or 64). */
+unsigned long oid_to_hex_n(char *out, gut_oid *oid, unsigned n) {
+    unsigned i;
+    if (!out || !oid) return __LINE__;
+    if (n != 40 && n != 64) return __LINE__;
+    for (i = 0; i < n / 2; i++) {
+        out[i * 2]     = hex_chars[(oid->bytes[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex_chars[oid->bytes[i] & 0x0F];
+    }
+    out[n] = '\0';
+    return 0;
+}
+
+unsigned long oid_from_hex_n(gut_oid *out, const char *hex, unsigned n) {
+    unsigned i;
+    if (!out || !hex) return __LINE__;
+    if (n != 40 && n != 64) return __LINE__;
+    /* Zero the tail so a SHA-1 OID read via this variant stays comparable. */
+    memset(out->bytes, 0, sizeof(out->bytes));
+    for (i = 0; i < n / 2; i++) {
+        int hi = hex_val(hex[i * 2]);
+        int lo = hex_val(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return __LINE__;
+        out->bytes[i] = (u8)((hi << 4) | lo);
+    }
+    return 0;
+}
+
 unsigned long oid_compare(long *result, gut_oid *a, gut_oid *b) {
     if (!result) return __LINE__;
     if (!a) return __LINE__;

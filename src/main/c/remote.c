@@ -242,6 +242,7 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
 
     out->count = 0;
     out->capabilities[0] = '\0';
+    out->hash_algo = GUT_HASH_SHA1;
 
     /* Strip trailing slash and .git if present */
     {
@@ -263,7 +264,9 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
     /* Parse pkt-line response.
      * First line is usually "# service=git-upload-pack\n"
      * Then a flush packet "0000"
-     * Then ref lines: "<oid> <refname>\n" or "<oid> <refname>\0<capabilities>\n" */
+     * Then ref lines: "<oid> <refname>\n" or "<oid> <refname>\0<capabilities>\n"
+     * OID width is 40 (SHA-1) or 64 (SHA-256) — detected from the position of
+     * the first space (or object-format= capability). */
     pos = 0;
 
     while (pos + 4 <= body_len) {
@@ -280,6 +283,8 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
         {
             const char *line = (const char *)(body + pos + 4);
             u64 line_len = pkt_len - 4;
+            unsigned hex_len;
+            u64 sp;
 
             /* Strip trailing newline */
             while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
@@ -291,15 +296,23 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
                 continue;
             }
 
-            /* Parse: <40-hex-oid> <refname>[\0<capabilities>] */
-            if (line_len >= GUT_OID_HEX_SIZE + 1 && out->count < GUT_REMOTE_MAX_REFS) {
+            /* Detect OID width from first space position (40 or 64). */
+            sp = 0;
+            while (sp < line_len && line[sp] != ' ') sp++;
+            if (sp != 40 && sp != 64) { pos += pkt_len; continue; }
+            hex_len = (unsigned)sp;
+            if (out->count == 0) {
+                out->hash_algo = (hex_len == 64) ? GUT_HASH_SHA256 : GUT_HASH_SHA1;
+            }
+
+            if (line_len >= hex_len + 1 && out->count < GUT_REMOTE_MAX_REFS) {
                 gut_remote_ref *ref = &out->refs[out->count];
                 unsigned long parse_rc;
 
-                parse_rc = oid_from_hex(&ref->oid, line);
+                parse_rc = oid_from_hex_n(&ref->oid, line, hex_len);
                 if (parse_rc == 0) {
                     /* Find ref name (starts after space) */
-                    const char *name_start = line + GUT_OID_HEX_SIZE + 1;
+                    const char *name_start = line + hex_len + 1;
                     const char *name_end = name_start;
                     const char *caps = NULL;
 
@@ -324,6 +337,10 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
                         if (clen >= sizeof(out->capabilities)) clen = sizeof(out->capabilities) - 1;
                         memcpy(out->capabilities, caps, clen);
                         out->capabilities[clen] = '\0';
+                        /* Cross-check object-format capability */
+                        if (strstr(out->capabilities, "object-format=sha256")) {
+                            out->hash_algo = GUT_HASH_SHA256;
+                        }
                     }
 
                     out->count++;
@@ -338,10 +355,14 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
     return 0;
 }
 
-unsigned long remote_fetch_pack(const char *url,
-                                gut_oid *want_oids, u64 want_count,
-                                gut_oid *have_oids, u64 have_count,
-                                const char *pack_path) {
+unsigned long remote_fetch_pack_algo(const char *url,
+                                     gut_oid *want_oids, u64 want_count,
+                                     gut_oid *have_oids, u64 have_count,
+                                     const char *pack_path,
+                                     int depth,
+                                     gut_oid **shallow_out,
+                                     u64     *shallow_count_out,
+                                     gut_hash_algo algo) {
     char post_url[2048];
     buf request;
     u8 *resp_body = NULL;
@@ -349,6 +370,12 @@ unsigned long remote_fetch_pack(const char *url,
     unsigned long rc;
     u64 i;
     FILE *fp;
+    gut_oid *shallows = NULL;
+    u64 n_shallows = 0;
+    unsigned hex_len = gut_oid_hex_size(algo);
+
+    if (shallow_out) *shallow_out = NULL;
+    if (shallow_count_out) *shallow_count_out = 0;
 
     if (!url || !want_oids || want_count == 0 || !pack_path) return __LINE__;
 
@@ -368,16 +395,29 @@ unsigned long remote_fetch_pack(const char *url,
 
     /* want lines */
     for (i = 0; i < want_count; i++) {
-        char line[128];
-        char hex[GUT_OID_HEX_SIZE + 1];
-        oid_to_hex(hex, &want_oids[i]);
+        char line[256];
+        char hex[GUT_OID_MAX_HEX_SIZE + 1];
+        oid_to_hex_n(hex, &want_oids[i], hex_len);
         if (i == 0) {
-            /* First want includes capabilities */
+            /* First want includes capabilities. Advertise `shallow` so the
+             * server knows we can handle shallow/unshallow lines (it will
+             * ignore `deepen` if we don't advertise it). */
+            const char *fmt_cap = (algo == GUT_HASH_SHA256)
+                ? " object-format=sha256" : "";
             snprintf(line, sizeof(line),
-                     "want %s multi_ack_detailed side-band-64k ofs-delta", hex);
+                     "want %s multi_ack_detailed side-band-64k ofs-delta shallow%s",
+                     hex, fmt_cap);
         } else {
             snprintf(line, sizeof(line), "want %s", hex);
         }
+        rc = pktline_write(&request, line);
+        if (rc) { buf_destroy(&request); return __LINE__; }
+    }
+
+    /* deepen line — must come after wants, before the wants-flush */
+    if (depth > 0) {
+        char line[32];
+        snprintf(line, sizeof(line), "deepen %d", depth);
         rc = pktline_write(&request, line);
         if (rc) { buf_destroy(&request); return __LINE__; }
     }
@@ -387,9 +427,9 @@ unsigned long remote_fetch_pack(const char *url,
 
     /* have lines (for fetch, not clone) */
     for (i = 0; i < have_count; i++) {
-        char line[128];
-        char hex[GUT_OID_HEX_SIZE + 1];
-        oid_to_hex(hex, &have_oids[i]);
+        char line[160];
+        char hex[GUT_OID_MAX_HEX_SIZE + 1];
+        oid_to_hex_n(hex, &have_oids[i], hex_len);
         snprintf(line, sizeof(line), "have %s", hex);
         rc = pktline_write(&request, line);
         if (rc) { buf_destroy(&request); return __LINE__; }
@@ -433,6 +473,25 @@ unsigned long remote_fetch_pack(const char *url,
             {
                 const u8 *payload = resp_body + p + 4;
                 u64 payload_len = plen - 4;
+
+                /* `shallow <oid>` line — appears before NAK, no sideband byte */
+                if (!saw_nak && payload_len >= 8 + (u64)hex_len &&
+                    memcmp(payload, "shallow ", 8) == 0) {
+                    gut_oid s_oid;
+                    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+                    memcpy(hex, payload + 8, hex_len);
+                    hex[hex_len] = 0;
+                    if (oid_from_hex_n(&s_oid, hex, hex_len) == 0) {
+                        gut_oid *tmp = (gut_oid *)realloc(
+                            shallows, (n_shallows + 1) * sizeof(gut_oid));
+                        if (tmp) {
+                            shallows = tmp;
+                            shallows[n_shallows++] = s_oid;
+                        }
+                    }
+                    p += plen;
+                    continue;
+                }
 
                 /* NAK line: "NAK\n" (no sideband prefix) */
                 if (!saw_nak && payload_len >= 3 &&
@@ -487,20 +546,42 @@ unsigned long remote_fetch_pack(const char *url,
                 pack_start = 0;
             } else {
                 free(resp_body);
+                free(shallows);
                 return __LINE__; /* no pack found */
             }
         }
 
         /* Write pack to file */
         fp = fopen(pack_path, "wb");
-        if (!fp) { free(resp_body); return __LINE__; }
+        if (!fp) { free(resp_body); free(shallows); return __LINE__; }
 
         fwrite(resp_body + pack_start, 1, (size_t)(resp_len - pack_start), fp);
         fclose(fp);
     }
 
     free(resp_body);
+
+    if (shallow_out && n_shallows > 0) {
+        *shallow_out = shallows;
+        if (shallow_count_out) *shallow_count_out = n_shallows;
+    } else {
+        free(shallows);
+    }
     return 0;
+}
+
+unsigned long remote_fetch_pack(const char *url,
+                                gut_oid *want_oids, u64 want_count,
+                                gut_oid *have_oids, u64 have_count,
+                                const char *pack_path,
+                                int depth,
+                                gut_oid **shallow_out,
+                                u64     *shallow_count_out) {
+    return remote_fetch_pack_algo(url, want_oids, want_count,
+                                   have_oids, have_count,
+                                   pack_path, depth,
+                                   shallow_out, shallow_count_out,
+                                   GUT_HASH_SHA1);
 }
 
 /* ====================================================================
@@ -520,6 +601,7 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
     if (!out || !url) return __LINE__;
     out->count = 0;
     out->capabilities[0] = '\0';
+    out->hash_algo = GUT_HASH_SHA1;
 
     {
         char clean_url[2048];
@@ -567,7 +649,8 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
     rc = dechunk_if_needed(&body, &body_len);
     if (rc) { free(body); return __LINE__; }
 
-    /* Parse pkt-line response (same as discover_refs) */
+    /* Parse pkt-line response (same as discover_refs). Width of OID is
+     * detected from the first space in the first ref line. */
     pos = 0;
     while (pos + 4 <= body_len) {
         u32 pkt_len = pktline_len(body + pos);
@@ -577,14 +660,25 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
         {
             const char *line = (const char *)(body + pos + 4);
             u64 line_len = pkt_len - 4;
+            unsigned hex_len;
+            u64 sp;
+
             while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
                 line_len--;
             if (line[0] == '#') { pos += pkt_len; continue; }
 
-            if (line_len >= GUT_OID_HEX_SIZE + 1 && out->count < GUT_REMOTE_MAX_REFS) {
+            sp = 0;
+            while (sp < line_len && line[sp] != ' ') sp++;
+            if (sp != 40 && sp != 64) { pos += pkt_len; continue; }
+            hex_len = (unsigned)sp;
+            if (out->count == 0) {
+                out->hash_algo = (hex_len == 64) ? GUT_HASH_SHA256 : GUT_HASH_SHA1;
+            }
+
+            if (line_len >= hex_len + 1 && out->count < GUT_REMOTE_MAX_REFS) {
                 gut_remote_ref *ref = &out->refs[out->count];
-                if (oid_from_hex(&ref->oid, line) == 0) {
-                    const char *name_start = line + GUT_OID_HEX_SIZE + 1;
+                if (oid_from_hex_n(&ref->oid, line, hex_len) == 0) {
+                    const char *name_start = line + hex_len + 1;
                     const char *name_end = name_start;
                     const char *caps = NULL;
                     while (name_end < line + line_len && *name_end != '\0')
@@ -602,6 +696,9 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
                         if (clen >= sizeof(out->capabilities)) clen = sizeof(out->capabilities) - 1;
                         memcpy(out->capabilities, caps, clen);
                         out->capabilities[clen] = '\0';
+                        if (strstr(out->capabilities, "object-format=sha256")) {
+                            out->hash_algo = GUT_HASH_SHA256;
+                        }
                     }
                     out->count++;
                 }
@@ -614,13 +711,16 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
     return 0;
 }
 
-unsigned long remote_send_pack(char **server_msg, const char *url, const char *token,
-                               gut_remote_update *updates, u64 update_count,
-                               u8 *pack_data, u64 pack_len) {
+unsigned long remote_send_pack_algo(char **server_msg, const char *url,
+                                    const char *token,
+                                    gut_remote_update *updates, u64 update_count,
+                                    u8 *pack_data, u64 pack_len,
+                                    gut_hash_algo algo) {
     char post_url[2048];
     buf request;
     u64 i;
     unsigned long rc;
+    unsigned hex_len = gut_oid_hex_size(algo);
 
     if (server_msg) *server_msg = NULL;
     if (!url || !updates || update_count == 0) return __LINE__;
@@ -639,44 +739,44 @@ unsigned long remote_send_pack(char **server_msg, const char *url, const char *t
     if (rc) return __LINE__;
 
     for (i = 0; i < update_count; i++) {
-        char old_hex[GUT_OID_HEX_SIZE + 1];
-        char new_hex[GUT_OID_HEX_SIZE + 1];
-        char line[1024];
-        oid_to_hex(old_hex, &updates[i].old_oid);
-        oid_to_hex(new_hex, &updates[i].new_oid);
+        char old_hex[GUT_OID_MAX_HEX_SIZE + 1];
+        char new_hex[GUT_OID_MAX_HEX_SIZE + 1];
+        oid_to_hex_n(old_hex, &updates[i].old_oid, hex_len);
+        oid_to_hex_n(new_hex, &updates[i].new_oid, hex_len);
         if (i == 0) {
-            /* First command line includes capabilities */
-            snprintf(line, sizeof(line), "%s %s %s\0report-status",
-                     old_hex, new_hex, updates[i].ref_name);
-            /* Manually compose to embed the NUL byte */
-            {
-                u64 cmd_part_len = strlen(old_hex) + 1 + strlen(new_hex) + 1
-                                   + strlen(updates[i].ref_name);
-                const char *caps = "report-status";
-                u64 caps_len = strlen(caps);
-                u64 total = cmd_part_len + 1 /*NUL*/ + caps_len + 1 /*\n*/;
-                char hdr[5];
-                snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(total + 4));
-                buf_append(&request, (u8 *)hdr, 4);
-                buf_append(&request, (u8 *)old_hex, GUT_OID_HEX_SIZE);
-                buf_append_byte(&request, ' ');
-                buf_append(&request, (u8 *)new_hex, GUT_OID_HEX_SIZE);
-                buf_append_byte(&request, ' ');
-                buf_append(&request, (u8 *)updates[i].ref_name, strlen(updates[i].ref_name));
-                buf_append_byte(&request, '\0');
-                buf_append(&request, (u8 *)caps, caps_len);
-                buf_append_byte(&request, '\n');
-            }
+            /* First command line includes capabilities (with object-format
+             * when non-default). Manually compose to embed the NUL byte. */
+            char caps[128];
+            u64 cmd_part_len = (u64)hex_len + 1 + (u64)hex_len + 1
+                               + strlen(updates[i].ref_name);
+            u64 caps_len;
+            u64 total;
+            char hdr[5];
+            snprintf(caps, sizeof(caps),
+                     (algo == GUT_HASH_SHA256)
+                         ? "report-status object-format=sha256"
+                         : "report-status");
+            caps_len = strlen(caps);
+            total = cmd_part_len + 1 /*NUL*/ + caps_len + 1 /*\n*/;
+            snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(total + 4));
+            buf_append(&request, (u8 *)hdr, 4);
+            buf_append(&request, (u8 *)old_hex, hex_len);
+            buf_append_byte(&request, ' ');
+            buf_append(&request, (u8 *)new_hex, hex_len);
+            buf_append_byte(&request, ' ');
+            buf_append(&request, (u8 *)updates[i].ref_name, strlen(updates[i].ref_name));
+            buf_append_byte(&request, '\0');
+            buf_append(&request, (u8 *)caps, caps_len);
+            buf_append_byte(&request, '\n');
         } else {
-            snprintf(line, sizeof(line), "%s %s %s\n",
-                     old_hex, new_hex, updates[i].ref_name);
-            {
-                u64 ll = strlen(line);
-                char hdr[5];
-                snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(ll + 4));
-                buf_append(&request, (u8 *)hdr, 4);
-                buf_append(&request, (u8 *)line, ll);
-            }
+            char line[1024];
+            int ll;
+            char hdr[5];
+            ll = snprintf(line, sizeof(line), "%s %s %s\n",
+                          old_hex, new_hex, updates[i].ref_name);
+            snprintf(hdr, sizeof(hdr), "%04x", (unsigned)(ll + 4));
+            buf_append(&request, (u8 *)hdr, 4);
+            buf_append(&request, (u8 *)line, (u64)ll);
         }
     }
     pktline_flush(&request);
@@ -737,4 +837,13 @@ unsigned long remote_send_pack(char **server_msg, const char *url, const char *t
     }
 
     return 0;
+}
+
+unsigned long remote_send_pack(char **server_msg, const char *url, const char *token,
+                               gut_remote_update *updates, u64 update_count,
+                               u8 *pack_data, u64 pack_len) {
+    return remote_send_pack_algo(server_msg, url, token,
+                                 updates, update_count,
+                                 pack_data, pack_len,
+                                 GUT_HASH_SHA1);
 }

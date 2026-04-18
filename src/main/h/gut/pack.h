@@ -48,9 +48,10 @@ typedef struct {
     u32  object_count;  /* total objects in pack */
     /* Pointers into data for each section */
     u32 *fanout;        /* 256 entries */
-    u8  *oids;          /* object_count x 20 bytes, sorted */
+    u8  *oids;          /* object_count x (20 or 32) bytes, sorted */
     u8  *offsets;       /* object_count x 4 bytes */
     u8  *offsets64;     /* large offsets (may be NULL) */
+    gut_hash_algo hash_algo; /* SHA-1 default; set by opener */
 } gut_pack_idx;
 
 /* Loaded pack file handle */
@@ -60,10 +61,14 @@ typedef struct {
     u64   data_len;
     u32   object_count;
     gut_pack_idx idx;
+    gut_hash_algo hash_algo; /* mirrors idx.hash_algo */
 } gut_pack;
 
-/* Open a pack + its index from the .pack path */
+/* Open a pack + its index from the .pack path. Reader uses SHA-1 unless
+ * `algo` says otherwise. */
 unsigned long pack_open(gut_pack *out, const char *pack_path);
+unsigned long pack_open_algo(gut_pack *out, const char *pack_path,
+                             gut_hash_algo algo);
 
 /* Look up an OID in the pack index. Returns offset into pack, or sets *found=0. */
 unsigned long pack_idx_lookup(u64 *offset, unsigned long *found,
@@ -96,5 +101,35 @@ unsigned long pack_write(char *out_hex,
                          const char *pack_dir,
                          gut_odb *odb,
                          gut_oid *oids, u64 count);
+
+/* Same as pack_write, but accepts an optional parallel `paths` array
+ * (one entry per OID, NULL entries allowed). When `paths` is non-NULL,
+ * the pre-sort uses (type asc, basename asc, size desc) instead of just
+ * (type asc, size desc) — versions of the same file cluster, so the
+ * sliding delta window sees the best candidate as a base. Produces
+ * smaller packs on repos with many commits touching the same files. */
+unsigned long pack_write_hinted(char *out_hex,
+                                const char *pack_dir,
+                                gut_odb *odb,
+                                gut_oid *oids,
+                                const char **paths,
+                                u64 count);
+
+/* Index an existing .pack file — writes the sibling .idx v2 file.
+ * Used after receiving a pack over the network (clone/fetch/ask) so
+ * pack_open can later read it.
+ *
+ * Walks the pack, reconstructs each object (resolving OFS_DELTA and
+ * REF_DELTA chains), computes its OID, and writes a sorted .idx with
+ * fan-out, OID table, CRC32 table, and offset table. Supports pack sizes
+ * up to 2 GiB (no large-offset table written).
+ *
+ * If pack_sha1_hex_out is non-NULL, it receives the pack's 40-char SHA-1
+ * trailer in hex (41 bytes incl. NUL). */
+unsigned long pack_index_create(const char *pack_path,
+                                char *pack_sha1_hex_out);
+unsigned long pack_index_create_algo(const char *pack_path,
+                                     char *pack_sha1_hex_out,
+                                     gut_hash_algo algo);
 
 #endif /* GUT_PACK_H */

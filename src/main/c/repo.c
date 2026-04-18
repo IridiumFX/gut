@@ -1,10 +1,101 @@
 #include "gut/repo.h"
+#include "gut/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+
+/* If `candidate` is a regular file in gitfile format ("gitdir: <path>\n"),
+ * read it and write the resolved absolute git dir into `out`. If it's a
+ * directory, copy it into `out` as-is. Returns 0 on success.
+ *
+ * Gitfile paths are relative to the file's parent directory — git stores
+ * them as relative paths like "../.git/modules/<name>" so repo trees can
+ * be moved around safely. */
+static unsigned long resolve_git_dir(char *out, u64 out_size,
+                                     const char *candidate) {
+    struct stat st;
+    FILE *fp;
+    char line[2048];
+    const char *target;
+    u64 target_len;
+
+    if (stat(candidate, &st) != 0) return __LINE__;
+
+    /* Directory: use candidate as-is. */
+    if (st.st_mode & S_IFDIR) {
+        u64 clen = strlen(candidate);
+        if (clen >= out_size) return __LINE__;
+        memcpy(out, candidate, clen + 1);
+        return 0;
+    }
+
+    /* Regular file: expect "gitdir: <path>\n". */
+    fp = fopen(candidate, "r");
+    if (!fp) return __LINE__;
+    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return __LINE__; }
+    fclose(fp);
+
+    {
+        u64 L = strlen(line);
+        while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r' ||
+                         line[L - 1] == ' ' || line[L - 1] == '\t'))
+            line[--L] = '\0';
+    }
+
+    if (strncmp(line, "gitdir:", 7) != 0) return __LINE__;
+    target = line + 7;
+    while (*target == ' ' || *target == '\t') target++;
+    target_len = strlen(target);
+    if (target_len == 0) return __LINE__;
+
+    /* If absolute, use directly; otherwise resolve against candidate's parent. */
+    if (target[0] == '/' || target[0] == '\\' ||
+        (target_len >= 2 && target[1] == ':')) {
+        if (target_len >= out_size) return __LINE__;
+        memcpy(out, target, target_len + 1);
+    } else {
+        /* Relative: parent dir of candidate + '/' + target */
+        char parent[2048];
+        const char *sep;
+        u64 plen = strlen(candidate);
+        if (plen >= sizeof(parent)) return __LINE__;
+        memcpy(parent, candidate, plen + 1);
+        sep = strrchr(parent, '/');
+        if (!sep) sep = strrchr(parent, '\\');
+        if (!sep) return __LINE__;
+        parent[sep - parent] = '\0';
+        if ((u64)snprintf(out, out_size, "%s/%s", parent, target) >= out_size)
+            return __LINE__;
+    }
+
+    /* Normalize backslashes to forward slashes so downstream snprintf
+     * concatenations don't end up with mixed separators. */
+    {
+        char *p;
+        for (p = out; *p; p++) if (*p == '\\') *p = '/';
+    }
+
+    return 0;
+}
+
+/* Read .git/config and return the configured object hash algo, or
+ * GUT_HASH_SHA1 if not set. */
+static gut_hash_algo read_hash_algo(const char *git_dir) {
+    char cfg_path[2048];
+    gut_config cfg;
+    const char *v = NULL;
+    gut_hash_algo algo = GUT_HASH_SHA1;
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", git_dir);
+    if (config_read(&cfg, cfg_path) != 0) return algo;
+    if (config_get(&v, &cfg, "extensions", "objectformat") == 0 && v) {
+        if (strcmp(v, "sha256") == 0) algo = GUT_HASH_SHA256;
+    }
+    config_destroy(&cfg);
+    return algo;
+}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -193,12 +284,14 @@ unsigned long repo_open(gut_repo *out, const char *path) {
         if (strlen(abs_path) >= sizeof(out->root_dir)) return __LINE__;
         memcpy(out->root_dir, abs_path, strlen(abs_path) + 1);
 
-        if (strlen(candidate) >= sizeof(out->git_dir)) return __LINE__;
-        memcpy(out->git_dir, candidate, strlen(candidate) + 1);
+        rc = resolve_git_dir(out->git_dir, sizeof(out->git_dir), candidate);
+        if (rc) return __LINE__;
 
-        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", candidate);
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->git_dir);
         rc = odb_open(&out->odb, obj_dir);
         if (rc) return __LINE__;
+        out->hash_algo = read_hash_algo(out->git_dir);
+        out->odb.hash_algo = out->hash_algo;
         return 0;
     }
 
@@ -215,12 +308,15 @@ unsigned long repo_open(gut_repo *out, const char *path) {
                 if (strlen(work) >= sizeof(out->root_dir)) return __LINE__;
                 memcpy(out->root_dir, work, strlen(work) + 1);
 
-                if (strlen(candidate) >= sizeof(out->git_dir)) return __LINE__;
-                memcpy(out->git_dir, candidate, strlen(candidate) + 1);
+                rc = resolve_git_dir(out->git_dir, sizeof(out->git_dir),
+                                     candidate);
+                if (rc) return __LINE__;
 
-                snprintf(obj_dir, sizeof(obj_dir), "%s/objects", candidate);
+                snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->git_dir);
                 rc = odb_open(&out->odb, obj_dir);
                 if (rc) return __LINE__;
+                out->hash_algo = read_hash_algo(out->git_dir);
+                out->odb.hash_algo = out->hash_algo;
                 return 0;
             }
 
@@ -277,14 +373,17 @@ unsigned long repo_resolve_ref(gut_oid *out, gut_repo *repo, const char *ref) {
     FILE *fp;
     char line[256];
     int n;
+    unsigned hex_len;
 
     if (!out) return __LINE__;
     if (!repo) return __LINE__;
     if (!ref) return __LINE__;
 
-    /* If ref looks like a hex OID, parse it directly */
-    if (strlen(ref) == GUT_OID_HEX_SIZE) {
-        unsigned long rc = oid_from_hex(out, ref);
+    hex_len = gut_oid_hex_size(repo->hash_algo);
+
+    /* If ref looks like a full hex OID, parse it directly */
+    if (strlen(ref) == hex_len) {
+        unsigned long rc = oid_from_hex_n(out, ref, hex_len);
         if (rc == 0) return 0;
     }
 
@@ -314,16 +413,17 @@ unsigned long repo_resolve_ref(gut_oid *out, gut_repo *repo, const char *ref) {
         return repo_resolve_ref(out, repo, line + 5);
     }
 
-    return oid_from_hex(out, line);
+    return oid_from_hex_n(out, line, hex_len);
 }
 
 unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
     char path[2048];
     char lock_path[2048];
-    char hex[GUT_OID_HEX_SIZE + 2];
+    char hex[GUT_OID_MAX_HEX_SIZE + 2];
     int fd;
     unsigned long rc;
     int n;
+    unsigned hex_len;
 
     if (!repo) return __LINE__;
     if (!ref) return __LINE__;
@@ -334,10 +434,11 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
     n = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
     if (n < 0 || (u64)n >= sizeof(lock_path)) return __LINE__;
 
-    rc = oid_to_hex(hex, oid);
+    hex_len = gut_oid_hex_size(repo->hash_algo);
+    rc = oid_to_hex_n(hex, oid, hex_len);
     if (rc) return __LINE__;
-    hex[GUT_OID_HEX_SIZE] = '\n';
-    hex[GUT_OID_HEX_SIZE + 1] = '\0';
+    hex[hex_len] = '\n';
+    hex[hex_len + 1] = '\0';
 
     /* Create .lock exclusively. If another writer holds it, fail. */
 #ifdef _WIN32
@@ -354,7 +455,7 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref, gut_oid *oid) {
 
     /* Write the ref content */
     {
-        u64 len = GUT_OID_HEX_SIZE + 1;
+        u64 len = (u64)hex_len + 1;
 #ifdef _WIN32
         int w = _write(fd, hex, (unsigned)len);
 #else

@@ -2,12 +2,14 @@
 #define GUT_REPO_H
 
 #include "gut/types.h"
+#include "gut/oid.h"
 #include "gut/odb.h"
 
 typedef struct {
-    char     root_dir[1024];     /* working directory */
-    char     git_dir[1024];      /* .git directory */
-    gut_odb  odb;
+    char          root_dir[1024];     /* working directory */
+    char          git_dir[1024];      /* .git directory */
+    gut_odb       odb;
+    gut_hash_algo hash_algo;          /* read from [extensions] objectformat; SHA-1 default */
 } gut_repo;
 
 /* Initialize a new repository at the given path */

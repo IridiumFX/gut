@@ -9,7 +9,41 @@
 
   sources: {
     dir:     "src/main/c",
-    headers: "src/main/h"
+    headers: "src/main/h",
+    include: [
+      "lib/apennines/c/addr.c",
+      "lib/apennines/c/asn1_der.c",
+      "lib/apennines/c/base.c",
+      "lib/apennines/c/bigint.c",
+      "lib/apennines/c/buf.c",
+      "lib/apennines/c/cipher.c",
+      "lib/apennines/c/ct.c",
+      "lib/apennines/c/deflate.c",
+      "lib/apennines/c/diff.c",
+      "lib/apennines/c/dns.c",
+      "lib/apennines/c/ec.c",
+      "lib/apennines/c/ecdsa.c",
+      "lib/apennines/c/entropy.c",
+      "lib/apennines/c/hash.c",
+      "lib/apennines/c/http.c",
+      "lib/apennines/c/http_client.c",
+      "lib/apennines/c/https_client.c",
+      "lib/apennines/c/json.c",
+      "lib/apennines/c/jwks.c",
+      "lib/apennines/c/jwt.c",
+      "lib/apennines/c/oauth2.c",
+      "lib/apennines/c/oauth2_client.c",
+      "lib/apennines/c/oidc.c",
+      "lib/apennines/c/pem.c",
+      "lib/apennines/c/pki.c",
+      "lib/apennines/c/rsa.c",
+      "lib/apennines/c/secret.c",
+      "lib/apennines/c/tcp.c",
+      "lib/apennines/c/tls.c",
+      "lib/apennines/c/ws.c",
+      "lib/apennines/c/x509.c",
+      "lib/apennines/c/zlib_wrap.c"
+    ]
   },
 
   output: { type: "executable", name: "gut" },
@@ -22,7 +56,7 @@
   },
 
   link: {
-    libs: []
+    libs: ["ws2_32", "bcrypt"]
   },
 
   tests: {
@@ -31,7 +65,6 @@
 
   profiles: {
     debug:   { compile: { flags: ["-g", "-O0"], defines: ["DEBUG"] } },
-    release: { compile: { flags: ["-O2"] }, link: { flags: ["-s"] } },
-    posix:   { link: { !libs: ["pthread", "m"] } }
+    release: { compile: { flags: ["-O2"] }, link: { flags: ["-s"] } }
   }
 }

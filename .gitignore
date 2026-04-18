@@ -10,3 +10,9 @@ target/
 cmake-build-*/
 .idea/
 compile_commands.json
+
+# Stale backups and Claude Code local state
+.gitbak/
+.gitbak2/
+.claude/
+file.txt

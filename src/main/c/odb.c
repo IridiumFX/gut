@@ -1,6 +1,7 @@
 #include "gut/odb.h"
 #include "gut/pack.h"
 #include "apennines/zlib_wrap.h"
+#include "apennines/hash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@ unsigned long odb_open(gut_odb *out, const char *objects_dir) {
     memcpy(out->objects_dir, objects_dir, strlen(objects_dir) + 1);
     out->pack_count = 0;
     out->packs_loaded = 0;
+    out->hash_algo = GUT_HASH_SHA1;  /* repo_open overrides if config says sha256 */
     return 0;
 }
 
@@ -51,7 +53,7 @@ static unsigned long odb_load_packs(gut_odb *odb) {
                 gut_pack *p = (gut_pack *)malloc(sizeof(gut_pack));
                 if (!p) continue;
                 snprintf(pack_path, sizeof(pack_path), "%s/%s", pack_dir, ent->d_name);
-                if (pack_open(p, pack_path) == 0) {
+                if (pack_open_algo(p, pack_path, odb->hash_algo) == 0) {
                     odb->packs[odb->pack_count++] = (void *)p;
                 } else {
                     free(p);
@@ -88,8 +90,10 @@ static unsigned long odb_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid
 }
 
 unsigned long odb_object_path(char *out, u64 out_size, gut_odb *odb, gut_oid *oid) {
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
     char prefix[3];
-    char suffix[39];
+    const char *suffix;
+    unsigned hex_len;
     int n;
     unsigned long rc;
 
@@ -97,10 +101,14 @@ unsigned long odb_object_path(char *out, u64 out_size, gut_odb *odb, gut_oid *oi
     if (!odb) return __LINE__;
     if (!oid) return __LINE__;
 
-    rc = oid_path_prefix(prefix, oid);
+    hex_len = gut_oid_hex_size(odb->hash_algo);
+    rc = oid_to_hex_n(hex, oid, hex_len);
     if (rc) return __LINE__;
-    rc = oid_path_suffix(suffix, oid);
-    if (rc) return __LINE__;
+
+    prefix[0] = hex[0];
+    prefix[1] = hex[1];
+    prefix[2] = 0;
+    suffix = hex + 2;
 
     n = snprintf(out, (size_t)out_size, "%s/%s/%s", odb->objects_dir, prefix, suffix);
     if (n < 0 || (u64)n >= out_size) return __LINE__;
@@ -218,10 +226,12 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
     gut_oid oid;
     char path[2048];
     char dir_path[2048];
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
     char prefix[3];
     FILE *fp;
     unsigned long rc;
     unsigned long exists;
+    unsigned oid_raw = gut_oid_raw_size(odb->hash_algo);
 
     if (!odb) return __LINE__;
     if (len > 0 && !data) return __LINE__;
@@ -233,8 +243,13 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
     rc = obj_serialize(&serialized, type, data, len);
     if (rc) { buf_destroy(&serialized); return __LINE__; }
 
-    /* Compute OID */
-    rc = oid_hash(&oid, serialized.data, serialized.len);
+    /* Compute OID using the repo's algo */
+    memset(&oid, 0, sizeof(oid));
+    if (odb->hash_algo == GUT_HASH_SHA256) {
+        rc = sha256_digest(oid.bytes, serialized.data, serialized.len);
+    } else {
+        rc = oid_hash(&oid, serialized.data, serialized.len);
+    }
     if (rc) { buf_destroy(&serialized); return __LINE__; }
 
     /* Check if already exists */
@@ -243,7 +258,7 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
 
     if (exists) {
         buf_destroy(&serialized);
-        if (out) memcpy(out->bytes, oid.bytes, GUT_OID_RAW_SIZE);
+        if (out) memcpy(out->bytes, oid.bytes, oid_raw);
         return 0;
     }
 
@@ -255,9 +270,10 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
     buf_destroy(&serialized);
     if (rc) { buf_destroy(&compressed); return __LINE__; }
 
-    /* Ensure fan-out directory exists */
-    rc = oid_path_prefix(prefix, &oid);
+    /* Ensure fan-out directory exists (first 2 hex chars) */
+    rc = oid_to_hex_n(hex, &oid, gut_oid_hex_size(odb->hash_algo));
     if (rc) { buf_destroy(&compressed); return __LINE__; }
+    prefix[0] = hex[0]; prefix[1] = hex[1]; prefix[2] = 0;
 
     snprintf(dir_path, sizeof(dir_path), "%s/%s", odb->objects_dir, prefix);
     gut_mkdir(dir_path);
@@ -278,27 +294,29 @@ unsigned long odb_write(gut_oid *out, gut_odb *odb, gut_obj_type type, u8 *data,
     fclose(fp);
     buf_destroy(&compressed);
 
-    if (out) memcpy(out->bytes, oid.bytes, GUT_OID_RAW_SIZE);
+    if (out) memcpy(out->bytes, oid.bytes, oid_raw);
     return 0;
 }
 
 unsigned long odb_resolve_prefix(gut_oid *out, gut_odb *odb, const char *prefix) {
     u64 prefix_len;
-    u8 prefix_bytes[GUT_OID_RAW_SIZE];
+    u8 prefix_bytes[GUT_OID_MAX_RAW_SIZE];
     int found_count = 0;
     gut_oid found_oid;
     u32 i;
+    unsigned full_hex;
 
     if (!out) return __LINE__;
     if (!odb) return __LINE__;
     if (!prefix) return __LINE__;
 
+    full_hex = gut_oid_hex_size(odb->hash_algo);
     prefix_len = strlen(prefix);
-    if (prefix_len < 4 || prefix_len > GUT_OID_HEX_SIZE) return __LINE__;
+    if (prefix_len < 4 || prefix_len > full_hex) return __LINE__;
 
     /* If full length, just parse directly */
-    if (prefix_len == GUT_OID_HEX_SIZE) {
-        return oid_from_hex(out, prefix);
+    if (prefix_len == full_hex) {
+        return oid_from_hex_n(out, prefix, (unsigned)prefix_len);
     }
 
     /* Parse prefix bytes */
@@ -332,13 +350,13 @@ unsigned long odb_resolve_prefix(gut_oid *out, gut_odb *odb, const char *prefix)
         d = opendir(dir_path);
         if (d) {
             while ((ent = readdir(d)) != NULL) {
-                char full_hex[GUT_OID_HEX_SIZE + 1];
+                char full_hex_buf[GUT_OID_MAX_HEX_SIZE + 1];
                 if (ent->d_name[0] == '.') continue;
-                snprintf(full_hex, sizeof(full_hex), "%s%s", hex2, ent->d_name);
-                if (strlen(full_hex) == GUT_OID_HEX_SIZE &&
-                    strncmp(full_hex, prefix, (size_t)prefix_len) == 0) {
+                snprintf(full_hex_buf, sizeof(full_hex_buf), "%s%s", hex2, ent->d_name);
+                if (strlen(full_hex_buf) == full_hex &&
+                    strncmp(full_hex_buf, prefix, (size_t)prefix_len) == 0) {
                     if (found_count == 0) {
-                        oid_from_hex(&found_oid, full_hex);
+                        oid_from_hex_n(&found_oid, full_hex_buf, full_hex);
                     }
                     found_count++;
                 }
@@ -349,39 +367,46 @@ unsigned long odb_resolve_prefix(gut_oid *out, gut_odb *odb, const char *prefix)
 
     /* Search pack indexes */
     odb_load_packs(odb);
-    for (i = 0; i < odb->pack_count; i++) {
-        gut_pack *p = (gut_pack *)odb->packs[i];
-        u32 lo, hi, first_byte;
-        first_byte = prefix_bytes[0];
+    {
+        unsigned oid_raw = gut_oid_raw_size(odb->hash_algo);
+        for (i = 0; i < odb->pack_count; i++) {
+            gut_pack *p = (gut_pack *)odb->packs[i];
+            u32 lo, hi, first_byte;
+            first_byte = prefix_bytes[0];
 
-        lo = (first_byte > 0) ? rd32_be((u8 *)p->idx.fanout + (first_byte - 1) * 4) : 0;
-        hi = rd32_be((u8 *)p->idx.fanout + first_byte * 4);
+            lo = (first_byte > 0) ? rd32_be((u8 *)p->idx.fanout + (first_byte - 1) * 4) : 0;
+            hi = rd32_be((u8 *)p->idx.fanout + first_byte * 4);
 
-        while (lo < hi) {
-            u8 *entry_oid = p->idx.oids + (u64)lo * GUT_OID_RAW_SIZE;
-            char entry_hex[GUT_OID_HEX_SIZE + 1];
-            oid_to_hex(entry_hex, (gut_oid *)entry_oid);
-            if (strncmp(entry_hex, prefix, (size_t)prefix_len) == 0) {
-                if (found_count == 0) {
-                    memcpy(found_oid.bytes, entry_oid, GUT_OID_RAW_SIZE);
-                } else {
-                    /* Check if it's a different OID */
-                    if (memcmp(found_oid.bytes, entry_oid, GUT_OID_RAW_SIZE) != 0) {
-                        found_count++;
+            while (lo < hi) {
+                u8 *entry_oid = p->idx.oids + (u64)lo * oid_raw;
+                char entry_hex[GUT_OID_MAX_HEX_SIZE + 1];
+                gut_oid tmp_oid;
+                memset(tmp_oid.bytes, 0, sizeof(tmp_oid.bytes));
+                memcpy(tmp_oid.bytes, entry_oid, oid_raw);
+                oid_to_hex_n(entry_hex, &tmp_oid, full_hex);
+                if (strncmp(entry_hex, prefix, (size_t)prefix_len) == 0) {
+                    if (found_count == 0) {
+                        memset(found_oid.bytes, 0, sizeof(found_oid.bytes));
+                        memcpy(found_oid.bytes, entry_oid, oid_raw);
+                    } else {
+                        /* Check if it's a different OID */
+                        if (memcmp(found_oid.bytes, entry_oid, oid_raw) != 0) {
+                            found_count++;
+                        }
                     }
+                    if (found_count == 0) found_count = 1;
+                } else if (found_count > 0 && strncmp(entry_hex, prefix, (size_t)prefix_len) != 0) {
+                    break; /* sorted, past the prefix range */
                 }
-                if (found_count == 0) found_count = 1;
-            } else if (found_count > 0 && strncmp(entry_hex, prefix, (size_t)prefix_len) != 0) {
-                break; /* sorted, past the prefix range */
+                lo++;
             }
-            lo++;
         }
     }
 
     if (found_count == 0) return __LINE__;
     if (found_count > 1) return __LINE__; /* ambiguous */
 
-    memcpy(out->bytes, found_oid.bytes, GUT_OID_RAW_SIZE);
+    memcpy(out->bytes, found_oid.bytes, gut_oid_raw_size(odb->hash_algo));
     return 0;
 }
 

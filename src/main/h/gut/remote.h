@@ -35,6 +35,7 @@ typedef struct {
     gut_remote_ref refs[GUT_REMOTE_MAX_REFS];
     u64 count;
     char capabilities[1024];
+    gut_hash_algo hash_algo;  /* detected from OID width / object-format= cap */
 } gut_remote_refs;
 
 /* Discover refs from a remote URL via smart HTTP.
@@ -43,11 +44,29 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url);
 
 /* Fetch a packfile from remote for the given want OIDs.
  * have_oids may be NULL (for clone, where we have nothing).
- * Writes the received packfile to pack_path. */
+ * Writes the received packfile to pack_path.
+ *
+ * depth > 0 requests a shallow fetch (depth N commits). Server responds
+ * with a list of boundary OIDs that become the caller's .git/shallow.
+ * If shallow_out is non-NULL, the caller receives the malloc'd boundary
+ * OID array; the caller must free it. Pass depth=0 / NULLs to skip. */
 unsigned long remote_fetch_pack(const char *url,
                                 gut_oid *want_oids, u64 want_count,
                                 gut_oid *have_oids, u64 have_count,
-                                const char *pack_path);
+                                const char *pack_path,
+                                int depth,
+                                gut_oid **shallow_out,
+                                u64     *shallow_count_out);
+
+/* Same as remote_fetch_pack, but hex width follows `algo`. */
+unsigned long remote_fetch_pack_algo(const char *url,
+                                     gut_oid *want_oids, u64 want_count,
+                                     gut_oid *have_oids, u64 have_count,
+                                     const char *pack_path,
+                                     int depth,
+                                     gut_oid **shallow_out,
+                                     u64     *shallow_count_out,
+                                     gut_hash_algo algo);
 
 /* Discover refs via git-receive-pack endpoint (used for push). */
 unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *url,
@@ -70,5 +89,12 @@ typedef struct {
 unsigned long remote_send_pack(char **server_msg, const char *url, const char *token,
                                gut_remote_update *updates, u64 update_count,
                                u8 *pack_data, u64 pack_len);
+
+/* Same as remote_send_pack, but hex width follows `algo`. */
+unsigned long remote_send_pack_algo(char **server_msg, const char *url,
+                                    const char *token,
+                                    gut_remote_update *updates, u64 update_count,
+                                    u8 *pack_data, u64 pack_len,
+                                    gut_hash_algo algo);
 
 #endif /* GUT_REMOTE_H */
