@@ -19,7 +19,7 @@
 #include "apennines/ssh.h"
 #include "apennines/buf.h"
 #include "apennines/pem.h"
-#include "apennines/addr.h"
+#include "apennines/ec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -490,39 +490,49 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
         }
     }
 
-    /* apennines' ssh_conn_create -> addr_sockaddr_create only accepts
-     * literal IP strings; it doesn't do DNS. Resolve here so hostnames
-     * like "github.com" work. */
-    {
-        ipv4_addr *ips = NULL;
-        u64 n_ips = 0;
-        char ip_str[64];
-        int verbose = getenv("GUT_SSH_DEBUG") != NULL;
-
-        rc = addr_resolve(&ips, &n_ips, u->host);
-        if (rc || n_ips == 0) {
-            fprintf(stderr, "error: cannot resolve '%s' (line %lu)\n",
-                    u->host, rc);
-            free(ips);
-            return __LINE__;
+    /* ssh_conn_create handles DNS internally since apennines 000121 —
+     * pass the hostname directly. */
+    rc = ssh_conn_create(&c, u->host, u->port);
+    if (rc) {
+        unsigned long sub = 0;
+        const char *where = "(unknown)";
+        if (rc == 5 && ssh_last_kex_sub_hatch(&sub) == 0) {
+            switch (sub) {
+                case 1: where = "kex: send KEXINIT"; break;
+                case 2: where = "kex: recv server KEXINIT"; break;
+                case 3: where = "kex: x25519 keygen"; break;
+                case 4: where = "kex: send ECDH_INIT"; break;
+                case 5: where = "kex: recv/parse ECDH_REPLY"; break;
+                case 6: where = "kex: x25519 DH"; break;
+                case 7: where = "kex: exchange-hash sha256"; break;
+                case 8: where = "kex: host-key signature verify"; break;
+                case 9: where = "kex: derive transport keys"; break;
+                case 10: where = "kex: send NEWKEYS"; break;
+                case 11: where = "kex: recv NEWKEYS"; break;
+                case 12: where = "kex: init AES-256-GCM"; break;
+                default: break;
+            }
         }
-        if (addr_ipv4_format(ip_str, sizeof(ip_str), &ips[0])) {
-            free(ips);
-            return __LINE__;
-        }
-        if (verbose) fprintf(stderr, "[ssh] resolved %s -> %s\n", u->host, ip_str);
-        free(ips);
-
-        rc = ssh_conn_create(&c, ip_str, u->port);
-        if (rc) {
-            fprintf(stderr, "error: ssh_conn_create failed (line %lu) — "
-                    "host=%s(%s) port=%u\n", rc, u->host, ip_str, u->port);
-            return __LINE__;
-        }
+        fprintf(stderr, "error: ssh_conn_create failed (rc=%lu sub=%lu) — "
+                "%s — host=%s port=%u\n",
+                rc, sub, where, u->host, u->port);
+        return __LINE__;
     }
     if (have_seed) {
-        if (verbose) fprintf(stderr, "[ssh] auth: pubkey (env-provided seed)\n");
-        rc = ssh_conn_auth_pubkey(c, u->user, seed, 32);
+        /* Expand the 32-byte seed into apennines' 64-byte expanded
+         * form (scalar || prefix = SHA-512(seed) with the standard
+         * ed25519 bit-pruning). ssh_conn_auth_pubkey expects the
+         * expanded shape, not the raw seed. */
+        ed25519_seed s;
+        ed25519_keypair kp;
+        memcpy(s.data, seed, 32);
+        if (ed25519_keygen_from_seed(&kp, &s)) {
+            fprintf(stderr, "error: ed25519_keygen_from_seed failed\n");
+            ssh_conn_destroy(c);
+            return __LINE__;
+        }
+        if (verbose) fprintf(stderr, "[ssh] auth: pubkey (env-provided seed, expanded)\n");
+        rc = ssh_conn_auth_pubkey(c, u->user, kp.priv.data, ED25519_PRIVKEY_LEN);
     } else {
         if (verbose) fprintf(stderr, "[ssh] auth: ssh-agent\n");
         rc = ssh_conn_auth_agent(c, u->user);

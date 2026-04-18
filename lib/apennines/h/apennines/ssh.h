@@ -63,6 +63,29 @@ unsigned long ssh_conn_open_channel(ssh_channel **out,
 
 unsigned long ssh_conn_destroy(ssh_conn *conn);
 
+/* ssh_last_kex_sub_hatch — diagnostic accessor for the inner hatch
+ * `ssh_key_exchange` returned before ssh_conn_create collapsed it to
+ * outer hatch 5. Returns the last recorded sub-hatch (1..12), or 0 if
+ * the last KEX was successful. Not thread-safe (single-caller only for
+ * now — a per-conn field will replace this when concurrency lands).
+ *
+ * Sub-hatches from ssh_key_exchange:
+ *   1  send client KEXINIT
+ *   2  recv server KEXINIT / unexpected msg
+ *   3  x25519_keygen
+ *   4  send KEX_ECDH_INIT
+ *   5  recv / parse KEX_ECDH_REPLY (incl. host-key / sig-blob parsing)
+ *   6  x25519_dh (shared secret)
+ *   7  sha256 hash build
+ *   8  ed25519_verify failed (sig invalid or verify function error)
+ *   9  transport key derivation
+ *   10 send NEWKEYS
+ *   11 recv NEWKEYS
+ *   12 aes256 init
+ *
+ * Hatches: 1=null out */
+unsigned long ssh_last_kex_sub_hatch(unsigned long *out);
+
 /* ---- Channel ---- */
 
 unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,

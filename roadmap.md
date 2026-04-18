@@ -278,6 +278,77 @@ offline lookup.
       Apennines already has the Ed25519 primitives (000106 crypto
       tier); incremental add when an auditor needs it.
 
+### Disaster recovery / rolling rebuild
+
+The strongest single reason to run drop-copy: when origin is lost
+(hardware failure, service termination, compromise) or has been
+acting maliciously (silently rewriting history, accepting poisoned
+pushes from an attacker with origin credentials), drop-copy is the
+authoritative record. Everything above already makes this viable
+without much new design — archive refs retain superseded state,
+reflog records the movement timeline, glacier hash stubs prevent
+retroactive rewrites, dual-channel attestation catches live
+tampering. What's missing is the **tooling to actually use drop-copy
+as a recovery source** when things go wrong.
+
+- [ ] **`gut dropcopy verify <ref>` / `--all`** — compare a
+      (possibly contaminated) repo's ref against drop-copy's current
+      tip plus its archive refs. Report exactly what diverges and
+      when: "last common ancestor was X on 2026-03-01; origin now
+      points at Y which is not in drop-copy's archive lineage; the
+      lost commits A, B, C are still reachable via
+      `refs/dropcopy/archive/refs/heads/main/2026-03-02T14-00-00Z-<abc>`."
+      Produces a structured diff that a human or an automated rebuild
+      script can act on.
+- [ ] **`gut dropcopy rollback <ref> --to <archive-entry>`** — rewind
+      a ref on the caller's repo (or origin, with appropriate
+      credentials) to a pre-attack archive snapshot. Writes a new
+      reflog line naming drop-copy as the authority
+      (`rollback: dropcopy <archive-ref> -> <oid>`), so the recovery
+      action itself is auditable.
+- [ ] **Fallback-origin mode** — `gut remote add
+      --drop-copy-fallback audit <url>` configures a remote that
+      only gets consulted if the primary origin fails a health /
+      integrity check (origin unreachable, origin ref diverged from
+      the last signed attestation, dual-channel mismatch in recent
+      history). Lets leechers automatically re-seed from drop-copy
+      when the primary is down or flagged, without requiring manual
+      intervention.
+- [ ] **Signed ref attestations** — the glacier-v2 Ed25519 signing
+      key does double-duty here: drop-copy signs periodic statements
+      of the form "at time T, I observed ref R at OID O, with
+      matched client+server channels". Any leecher can verify these
+      offline against the drop-copy public key — no transport trust
+      required. Makes the audit log transportable: shows up as
+      evidence in a compliance review, a downstream system's
+      verification step, or a forensic investigation without anyone
+      having to trust us.
+- [ ] **Threat-model note** — making drop-copy load-bearing for
+      recovery turns it into an active target. The integrity story
+      above (archive immutability + glacier stubs + signed
+      attestations) only holds if drop-copy's *signing key* is held
+      separately from origin's credentials, ideally by a different
+      operator. An attacker who compromises both origin and drop-copy
+      can forge consistent history. This is the standard operational
+      hygiene point of "separate concerns, separate keys" — document,
+      don't solve in code.
+
+### Cross-channel genuineness proof (smaller — bonus if signing is on)
+
+- [ ] **Server-issued "genuineness" token on matched dual-channel.**
+      When drop-copy receives both client-side and origin-side
+      reports for a given `push_id`, with matching `pack_sha256`,
+      within the reconciliation window, it emits a signed token
+      attesting "push P was observed identically on both channels at
+      time T." Origin can surface this token in its
+      `post-receive` response so the pushing client has a
+      non-repudiable receipt. Low incremental cost once the
+      attestation signing key from disaster-recovery above is in
+      place; marginal value beyond what the matched-dual-channel
+      event already provides internally — mostly useful for external
+      audit handoff (regulators, downstream attestation consumers)
+      that can't peek at the audit stream directly.
+
 ## Planned
 
 ### Delta encoder polish

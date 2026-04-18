@@ -5,6 +5,7 @@
 #include "apennines/hash.h"
 #include "apennines/ec.h"
 #include "apennines/cipher.h"
+#include "apennines/entropy.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,11 +16,40 @@
 #endif
 
 /* ================================================================
+ *  Diagnostic tracing — gated on APENNINES_SSH_DEBUG env var.
+ *
+ *  Set once at first use; fprintf's stderr when non-NULL/non-"0". Cheap
+ *  enough to leave compiled-in (env lookup happens once). Each trace
+ *  point names the KEX/auth/channel stage and the relevant byte counts
+ *  / message types so a consumer (gut, cookbook) can send us a
+ *  transcript when a handshake fails against a specific server.
+ * ================================================================ */
+
+static int ssh_dbg_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("APENNINES_SSH_DEBUG");
+        cached = (v && *v && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+#define SSH_DBG(...)                                     \
+    do {                                                  \
+        if (ssh_dbg_enabled()) {                          \
+            fprintf(stderr, "[apennines_ssh] " __VA_ARGS__); \
+            fflush(stderr);                               \
+        }                                                 \
+    } while (0)
+
+/* ================================================================
  *  SSH Transport — RFC 4253/4252 client implementation
  * ================================================================ */
 
 /* ---- SSH message types ---- */
 #define SSH_MSG_DISCONNECT           1
+#define SSH_MSG_SERVICE_REQUEST      5
+#define SSH_MSG_SERVICE_ACCEPT       6
 #define SSH_MSG_KEXINIT             20
 #define SSH_MSG_NEWKEYS             21
 #define SSH_MSG_KEX_ECDH_INIT      30
@@ -27,6 +57,7 @@
 #define SSH_MSG_USERAUTH_REQUEST   50
 #define SSH_MSG_USERAUTH_FAILURE   51
 #define SSH_MSG_USERAUTH_SUCCESS   52
+#define SSH_MSG_USERAUTH_BANNER    53
 #define SSH_MSG_CHANNEL_OPEN       90
 #define SSH_MSG_CHANNEL_OPEN_CONFIRM 91
 #define SSH_MSG_CHANNEL_OPEN_FAIL  92
@@ -73,11 +104,24 @@ struct ssh_conn {
     u8   session_id[32];
     u64  session_id_len;
 
+    /* Version strings (CR/LF stripped) — captured during version
+     * exchange, used by ssh_key_exchange when computing the proper
+     * RFC 4253 §8 exchange hash (V_C, V_S). */
+    u8   client_version[256];
+    u64  client_version_len;
+    u8   server_version[256];
+    u64  server_version_len;
+
     /* Channel tracking */
     ssh_channel **channels;
     u64           channel_count;
     u64           channel_cap;
     u32           next_channel_id;
+
+    /* Userauth service state — set once the server ACCEPTs our
+     * SSH_MSG_SERVICE_REQUEST "ssh-userauth" (RFC 4253 §10). Guards
+     * every auth method from re-requesting the service. */
+    int           service_accepted;
 };
 
 /* ================================================================
@@ -227,6 +271,39 @@ static unsigned long ssh_recv_packet(ssh_conn *conn,
     return 0;
 }
 
+/* ssh_recv_packet_filtered — recv + transparently drop SSH_MSG_IGNORE (2),
+ * SSH_MSG_DEBUG (4), and SSH_MSG_UNIMPLEMENTED (3). The spec (RFC 4253
+ * §11.2-11.4) says these can arrive at any time and receivers MUST tolerate
+ * them. Without this filter, a server that sends an unsolicited DEBUG
+ * message before its KEX_ECDH_REPLY would cause our KEX to fail with
+ * msg_type-mismatch. OpenSSH and several forges do this in practice.
+ *
+ * Also logs the message type if APENNINES_SSH_DEBUG is set so the caller
+ * can see what's arriving. */
+static unsigned long ssh_recv_packet_filtered(ssh_conn *conn,
+                                               u8 *payload_out, u64 payload_cap,
+                                               u64 *payload_len_out) {
+    for (;;) {
+        unsigned long rc = ssh_recv_packet(conn, payload_out, payload_cap, payload_len_out);
+        if (rc != 0) {
+            SSH_DBG("recv_packet rc=%lu\n", rc);
+            return rc;
+        }
+        if (*payload_len_out >= 1) {
+            u8 t = payload_out[0];
+            SSH_DBG("recv msg_type=%u len=%llu\n", (unsigned)t,
+                    (unsigned long long)*payload_len_out);
+            if (t == 2 /* SSH_MSG_IGNORE */ ||
+                t == 3 /* SSH_MSG_UNIMPLEMENTED */ ||
+                t == 4 /* SSH_MSG_DEBUG */ ||
+                t == SSH_MSG_USERAUTH_BANNER /* 53 — informational only */) {
+                continue;
+            }
+        }
+        return 0;
+    }
+}
+
 /* ================================================================
  *  Payload builder helpers
  * ================================================================ */
@@ -328,26 +405,56 @@ static unsigned long ssh_version_exchange(ssh_conn *conn) {
     u64 pos = 0;
     u64 rd;
     const char *ver = SSH_VERSION_STRING;
+    u64 ver_len = (u64)strlen(ver);
+    u64 vlen_no_crlf;
 
     /* Send our version */
-    if (tcp_send_all(&conn->tcp, (const u8 *)ver, (u64)strlen(ver)) != 0) return 1;
+    if (tcp_send_all(&conn->tcp, (const u8 *)ver, ver_len) != 0) return 1;
 
-    /* Read server version line (ends with \r\n or \n) */
-    while (pos < sizeof(buf) - 1) {
-        if (tcp_conn_read(&rd, &conn->tcp, buf + pos, 1) != 0) return 2;
-        if (rd == 0) return 2;
-        if (buf[pos] == '\n') {
-            buf[pos + 1] = '\0';
-            break;
-        }
-        pos++;
+    /* Store V_C with CR/LF stripped — RFC 4253 §8 hashes the version
+     * line without the trailing CR LF. SSH_VERSION_STRING is
+     * "SSH-2.0-apennines_1.0\r\n", so we drop the last 2 bytes. */
+    vlen_no_crlf = ver_len;
+    while (vlen_no_crlf > 0 &&
+           (ver[vlen_no_crlf - 1] == '\r' || ver[vlen_no_crlf - 1] == '\n')) {
+        vlen_no_crlf--;
     }
+    if (vlen_no_crlf > sizeof(conn->client_version)) return 4;
+    memcpy(conn->client_version, ver, (size_t)vlen_no_crlf);
+    conn->client_version_len = vlen_no_crlf;
 
-    /* Verify it starts with "SSH-2.0-" */
-    if (pos < 8) return 3;
-    if (memcmp(buf, "SSH-2.0-", 8) != 0) return 3;
-
-    return 0;
+    /* Read server version line (ends with \r\n or \n). OpenSSH and
+     * some servers may send banner lines *before* the version line —
+     * the spec (RFC 4253 §4.2) allows arbitrary lines before the one
+     * that starts with "SSH-2.0-" / "SSH-1.99-". Loop until we see
+     * one we recognise. */
+    for (;;) {
+        pos = 0;
+        while (pos < sizeof(buf) - 1) {
+            if (tcp_conn_read(&rd, &conn->tcp, buf + pos, 1) != 0) return 2;
+            if (rd == 0) return 2;
+            if (buf[pos] == '\n') break;
+            pos++;
+        }
+        /* pos points at '\n'; trim CR if present */
+        {
+            u64 line_len = pos;
+            if (line_len > 0 && buf[line_len - 1] == '\r') line_len--;
+            if (line_len >= 8 && memcmp(buf, "SSH-2.0-", 8) == 0) {
+                if (line_len > sizeof(conn->server_version)) return 3;
+                memcpy(conn->server_version, buf, (size_t)line_len);
+                conn->server_version_len = line_len;
+                return 0;
+            }
+            if (line_len >= 9 && memcmp(buf, "SSH-1.99-", 9) == 0) {
+                if (line_len > sizeof(conn->server_version)) return 3;
+                memcpy(conn->server_version, buf, (size_t)line_len);
+                conn->server_version_len = line_len;
+                return 0;
+            }
+            /* Else: treat as a pre-version banner line and keep reading. */
+        }
+    }
 }
 
 /* ================================================================
@@ -356,7 +463,14 @@ static unsigned long ssh_version_exchange(ssh_conn *conn) {
 
 static void build_kexinit(pkt_buf *pb) {
     u8 cookie[16];
-    memset(cookie, 0x42, 16);  /* non-random cookie for simplicity */
+
+    /* RFC 4253 §7.1 requires a random cookie. Some forges check it; we
+     * had a constant 0x42... which at best loses anti-replay, at worst
+     * trips server-side heuristics. Fall back to an all-zero cookie if
+     * entropy isn't available — better than crashing. */
+    if (entropy_get_system(cookie, 16) != 0) {
+        memset(cookie, 0, 16);
+    }
 
     pb_u8(pb, SSH_MSG_KEXINIT);
     pb_raw(pb, cookie, 16);
@@ -388,6 +502,49 @@ static void build_kexinit(pkt_buf *pb) {
 }
 
 /* ================================================================
+ *  SSH mpint encoding (RFC 4251 §5)
+ *
+ *  Multi-precision integer:
+ *    - Positive numbers with MSB set must be prefixed with 0x00 so
+ *      they don't look negative in two's complement.
+ *    - Leading zero bytes must be stripped (except when needed to
+ *      keep the number positive per the above rule).
+ *    - The result is length-prefixed as an SSH string.
+ *  Zero is a 4-byte length prefix of 0 followed by nothing.
+ *
+ *  Used for encoding K (the X25519 shared secret) in the exchange hash.
+ * ================================================================ */
+
+static void pb_mpint(pkt_buf *pb, const u8 *bytes, u64 len) {
+    u64 i = 0;
+
+    /* Strip leading zero bytes */
+    while (i < len && bytes[i] == 0) i++;
+
+    if (i == len) {
+        /* All zeros → empty mpint */
+        pb_u32(pb, 0);
+        return;
+    }
+
+    /* If the leading byte has MSB set, prepend 0x00 to mark positive. */
+    if (bytes[i] & 0x80) {
+        pb_u32(pb, (u32)(len - i + 1));
+        pb_u8(pb, 0);
+        if (pb->len + (len - i) <= pb->cap) {
+            memcpy(pb->buf + pb->len, bytes + i, (size_t)(len - i));
+            pb->len += (len - i);
+        }
+    } else {
+        pb_u32(pb, (u32)(len - i));
+        if (pb->len + (len - i) <= pb->cap) {
+            memcpy(pb->buf + pb->len, bytes + i, (size_t)(len - i));
+            pb->len += (len - i);
+        }
+    }
+}
+
+/* ================================================================
  *  Key derivation (RFC 4253 section 7.2)
  * ================================================================ */
 
@@ -398,12 +555,14 @@ static unsigned long derive_key(u8 *out, u64 out_len,
                                 const u8 *session_id, u64 sid_len) {
     sha256_ctx ctx;
     u8 hash[32];
-    u8 ss_buf[SSH_MAX_PACKET];
+    u8 ss_buf[64];
     pkt_buf sb;
 
-    /* Encode shared secret as SSH mpint */
+    /* Encode shared secret K as SSH mpint (RFC 4253 §7.2). Old code
+     * used pb_string (raw length-prefix), which mis-encodes negative-
+     * looking values (MSB set) and wouldn't match a peer's derivation. */
     pb_init(&sb, ss_buf, sizeof(ss_buf));
-    pb_string(&sb, shared_secret, ss_len);
+    pb_mpint(&sb, shared_secret, ss_len);
 
     if (sha256_init(&ctx) != 0) return 1;
     if (sha256_update(&ctx, sb.buf, sb.len) != 0) return 1;
@@ -425,9 +584,36 @@ static unsigned long derive_key(u8 *out, u64 out_len,
 
 /* ================================================================
  *  Key exchange (curve25519-sha256)
+ *
+ *  The inner function returns a detailed sub-hatch (1..12). The outer
+ *  wrapper captures that into `g_last_kex_sub_hatch` so a caller whose
+ *  ssh_conn_create hit hatch 5 can call `ssh_last_kex_sub_hatch()` to
+ *  see whether it was field-parse (5) vs sig-verify (8) etc. Poor-man's
+ *  errno — not thread-safe but fine for the current single-caller flow,
+ *  and saves changing the public hatch contract. (NOTE: replace with
+ *  thread-local or a per-conn field when multi-conn concurrency lands.)
  * ================================================================ */
 
+static unsigned long g_last_kex_sub_hatch = 0;
+
+unsigned long ssh_last_kex_sub_hatch(unsigned long *out);
+
+unsigned long ssh_last_kex_sub_hatch(unsigned long *out) {
+    if (!out) return 1;
+    *out = g_last_kex_sub_hatch;
+    return 0;
+}
+
+static unsigned long ssh_key_exchange_impl(ssh_conn *conn);
+
 static unsigned long ssh_key_exchange(ssh_conn *conn) {
+    unsigned long rc = ssh_key_exchange_impl(conn);
+    g_last_kex_sub_hatch = rc;
+    SSH_DBG("KEX: key_exchange returning sub-hatch %lu\n", rc);
+    return rc;
+}
+
+static unsigned long ssh_key_exchange_impl(ssh_conn *conn) {
     u8 payload[SSH_MAX_PACKET];
     u64 payload_len;
     pkt_buf pb;
@@ -436,26 +622,53 @@ static unsigned long ssh_key_exchange(ssh_conn *conn) {
     u8 exchange_hash[32];
     sha256_ctx hctx;
 
+    /* Saved copies for the exchange-hash computation (RFC 4253 §8).
+     * I_C = our KEXINIT payload, I_S = server KEXINIT payload.
+     * Must survive the two recv_packet calls that follow — the shared
+     * `payload` buffer gets overwritten on the next recv. */
+    u8  ic_buf[SSH_MAX_PACKET];  u64 ic_len = 0;
+    u8  is_buf[SSH_MAX_PACKET];  u64 is_len = 0;
+
     /* 1. Send our KEXINIT */
+    SSH_DBG("KEX: sending KEXINIT\n");
     pb_init(&pb, payload, sizeof(payload));
     build_kexinit(&pb);
     if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 1;
+    /* Save I_C — the full KEXINIT payload (including the type byte). */
+    if (pb.len > sizeof(ic_buf)) return 1;
+    memcpy(ic_buf, pb.buf, (size_t)pb.len);
+    ic_len = pb.len;
 
     /* 2. Receive server KEXINIT */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 2;
-    if (payload_len < 1 || payload[0] != SSH_MSG_KEXINIT) return 2;
+    SSH_DBG("KEX: awaiting server KEXINIT\n");
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 2;
+    if (payload_len < 1 || payload[0] != SSH_MSG_KEXINIT) {
+        SSH_DBG("KEX: expected SSH_MSG_KEXINIT(20) got %u\n",
+                payload_len >= 1 ? (unsigned)payload[0] : 0);
+        return 2;
+    }
+    /* Save I_S before the next recv clobbers payload. */
+    if (payload_len > sizeof(is_buf)) return 2;
+    memcpy(is_buf, payload, (size_t)payload_len);
+    is_len = payload_len;
 
     /* 3. Generate ephemeral X25519 keypair */
     if (x25519_keygen(&ephemeral) != 0) return 3;
 
     /* 4. Send KEX_ECDH_INIT with our public key */
+    SSH_DBG("KEX: sending KEX_ECDH_INIT (Q_C len=%d)\n", (int)X25519_KEY_LEN);
     pb_init(&pb, payload, sizeof(payload));
     pb_u8(&pb, SSH_MSG_KEX_ECDH_INIT);
     pb_string(&pb, ephemeral.pub.data, X25519_KEY_LEN);
     if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 4;
 
     /* 5. Receive KEX_ECDH_REPLY */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 5;
+    SSH_DBG("KEX: awaiting KEX_ECDH_REPLY\n");
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 5;
+    if (payload_len >= 1) {
+        SSH_DBG("KEX: recv msg_type=%u (expect 31 = KEX_ECDH_REPLY)\n",
+                (unsigned)payload[0]);
+    }
     {
         pkt_reader pr;
         u8 msg_type;
@@ -478,21 +691,77 @@ static unsigned long ssh_key_exchange(ssh_conn *conn) {
         /* 6. Compute shared secret K */
         if (x25519_dh(shared_secret, &ephemeral.priv, &server_pub) != 0) return 6;
 
-        /* 7. Compute exchange hash H = SHA-256(...) — simplified:
-         *    hash(shared_secret || server_pub || client_pub || host_key)
-         *    A real implementation hashes the full transcript per RFC 4253 s8. */
+        /* 7. Compute exchange hash H per RFC 4253 §8:
+         *     H = HASH( string(V_C) || string(V_S) || string(I_C) ||
+         *               string(I_S) || string(K_S) || string(Q_C) ||
+         *               string(Q_S) || mpint(K) )
+         *
+         * Every field is length-prefixed as an SSH string; K uses mpint
+         * encoding (strip leading zeros, prepend 0x00 if MSB set).
+         * The server signs this exact hash, so our computation must match
+         * byte-for-byte or sig verification (step 8) fails. */
+        SSH_DBG("KEX: computing exchange hash (V_C=%llu V_S=%llu I_C=%llu I_S=%llu K_S=%llu)\n",
+                (unsigned long long)conn->client_version_len,
+                (unsigned long long)conn->server_version_len,
+                (unsigned long long)ic_len,
+                (unsigned long long)is_len,
+                (unsigned long long)hk_len);
         if (sha256_init(&hctx) != 0) return 7;
-        if (sha256_update(&hctx, shared_secret, X25519_SHARED_LEN) != 0) return 7;
-        if (sha256_update(&hctx, server_pub.data, X25519_KEY_LEN) != 0) return 7;
-        if (sha256_update(&hctx, ephemeral.pub.data, X25519_KEY_LEN) != 0) return 7;
-        if (sha256_update(&hctx, host_key_blob, hk_len) != 0) return 7;
+        {
+            u8 hdr[4];
+
+            put_u32(hdr, (u32)conn->client_version_len);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, conn->client_version, conn->client_version_len) != 0) return 7;
+
+            put_u32(hdr, (u32)conn->server_version_len);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, conn->server_version, conn->server_version_len) != 0) return 7;
+
+            put_u32(hdr, (u32)ic_len);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, ic_buf, ic_len) != 0) return 7;
+
+            put_u32(hdr, (u32)is_len);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, is_buf, is_len) != 0) return 7;
+
+            put_u32(hdr, (u32)hk_len);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, host_key_blob, hk_len) != 0) return 7;
+
+            put_u32(hdr, X25519_KEY_LEN);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, ephemeral.pub.data, X25519_KEY_LEN) != 0) return 7;
+
+            put_u32(hdr, X25519_KEY_LEN);
+            if (sha256_update(&hctx, hdr, 4) != 0) return 7;
+            if (sha256_update(&hctx, server_pub.data, X25519_KEY_LEN) != 0) return 7;
+        }
+        /* mpint(K) */
+        {
+            u8 k_buf[64];
+            pkt_buf kb;
+            pb_init(&kb, k_buf, sizeof(k_buf));
+            pb_mpint(&kb, shared_secret, X25519_SHARED_LEN);
+            if (sha256_update(&hctx, kb.buf, kb.len) != 0) return 7;
+        }
         if (sha256_final(exchange_hash, &hctx) != 0) return 7;
 
         /* Session ID = first exchange hash */
         memcpy(conn->session_id, exchange_hash, 32);
         conn->session_id_len = 32;
 
+        if (ssh_dbg_enabled()) {
+            u32 i;
+            fprintf(stderr, "[apennines_ssh] KEX: exchange_hash H=");
+            for (i = 0; i < 32; i++) fprintf(stderr, "%02x", exchange_hash[i]);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+
         /* 8. Verify host key signature (Ed25519) */
+        SSH_DBG("KEX: parsing host key blob (hk_len=%llu)\n", (unsigned long long)hk_len);
         {
             pkt_reader skr;
             const u8 *key_type_str, *ed_pub_raw;
@@ -502,25 +771,74 @@ static unsigned long ssh_key_exchange(ssh_conn *conn) {
 
             /* Parse host key blob: string "ssh-ed25519" + string pubkey(32) */
             pr_init(&skr, host_key_blob, hk_len);
-            if (pr_string(&skr, &key_type_str, &kt_len) != 0) return 5;
-            if (pr_string(&skr, &ed_pub_raw, &ep_len) != 0) return 5;
-            if (ep_len != ED25519_PUBKEY_LEN) return 5;
+            if (pr_string(&skr, &key_type_str, &kt_len) != 0) {
+                SSH_DBG("KEX: host key kt parse failed\n");
+                return 5;
+            }
+            SSH_DBG("KEX: host key kt='%.*s' (len=%llu)\n",
+                    (int)kt_len, (const char *)key_type_str,
+                    (unsigned long long)kt_len);
+
+            if (pr_string(&skr, &ed_pub_raw, &ep_len) != 0) {
+                SSH_DBG("KEX: host key pub parse failed\n");
+                return 5;
+            }
+            if (ep_len != ED25519_PUBKEY_LEN) {
+                SSH_DBG("KEX: host key pub_len=%llu (expect 32)\n",
+                        (unsigned long long)ep_len);
+                return 5;
+            }
             memcpy(host_pub.data, ed_pub_raw, ED25519_PUBKEY_LEN);
 
+            if (ssh_dbg_enabled()) {
+                u32 i;
+                fprintf(stderr, "[apennines_ssh] KEX: host pub=");
+                for (i = 0; i < 32; i++) fprintf(stderr, "%02x", host_pub.data[i]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+
             /* Parse signature blob: string "ssh-ed25519" + string sig(64) */
+            SSH_DBG("KEX: parsing sig blob (sig_len=%llu)\n", (unsigned long long)sig_len);
             {
                 pkt_reader sigr;
                 const u8 *sig_type_str, *sig_raw;
                 u64 st_len, sr_len;
 
                 pr_init(&sigr, sig_blob, sig_len);
-                if (pr_string(&sigr, &sig_type_str, &st_len) != 0) return 5;
-                if (pr_string(&sigr, &sig_raw, &sr_len) != 0) return 5;
-                if (sr_len != ED25519_SIG_LEN) return 5;
+                if (pr_string(&sigr, &sig_type_str, &st_len) != 0) {
+                    SSH_DBG("KEX: sig kt parse failed\n");
+                    return 5;
+                }
+                SSH_DBG("KEX: sig kt='%.*s' (len=%llu)\n",
+                        (int)st_len, (const char *)sig_type_str,
+                        (unsigned long long)st_len);
 
-                if (ed25519_verify(&valid, &host_pub, sig_raw,
-                                   exchange_hash, 32) != 0) return 8;
-                if (!valid) return 8;
+                if (pr_string(&sigr, &sig_raw, &sr_len) != 0) {
+                    SSH_DBG("KEX: sig raw parse failed\n");
+                    return 5;
+                }
+                if (sr_len != ED25519_SIG_LEN) {
+                    SSH_DBG("KEX: sig raw_len=%llu (expect 64)\n",
+                            (unsigned long long)sr_len);
+                    return 5;
+                }
+
+                if (ssh_dbg_enabled()) {
+                    u32 i;
+                    fprintf(stderr, "[apennines_ssh] KEX: sig_raw=");
+                    for (i = 0; i < 64; i++) fprintf(stderr, "%02x", sig_raw[i]);
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+
+                {
+                    unsigned long vrc = ed25519_verify(&valid, &host_pub, sig_raw,
+                                                       exchange_hash, 32);
+                    SSH_DBG("KEX: ed25519_verify rc=%lu valid=%lu\n", vrc, valid);
+                    if (vrc != 0) return 8;
+                    if (!valid)   return 8;
+                }
             }
         }
     }
@@ -547,7 +865,7 @@ static unsigned long ssh_key_exchange(ssh_conn *conn) {
     }
 
     /* 11. Receive NEWKEYS */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 11;
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 11;
     if (payload_len < 1 || payload[0] != SSH_MSG_NEWKEYS) return 11;
 
     /* 12. Initialize AES-256-GCM contexts and switch to encrypted mode */
@@ -577,9 +895,34 @@ unsigned long ssh_conn_create(ssh_conn **out,
     conn = (ssh_conn *)calloc(1, sizeof(ssh_conn));
     if (!conn) return 6;
 
-    /* Resolve and connect via TCP */
+    /* Resolve host to an IP and connect via TCP. addr_sockaddr_create only
+     * accepts literal IPv4/IPv6, so if that fails (hostname was passed),
+     * fall back to addr_resolve and use the first address. This lets
+     * callers hand us "github.com" directly instead of pre-resolving. */
     rc = addr_sockaddr_create(&addr, host, port);
-    if (rc != 0) { free(conn); return 3; }
+    if (rc != 0) {
+        ipv4_addr *ips = NULL;
+        u64 n_ips = 0;
+        char ip_str[64];  /* enough for IPv4 ("255.255.255.255") + slack */
+
+        SSH_DBG("host %s is not an IP literal, resolving via DNS\n", host);
+        if (addr_resolve(&ips, &n_ips, host) != 0 || n_ips == 0) {
+            free(ips);
+            free(conn);
+            return 3;
+        }
+        if (addr_ipv4_format(ip_str, sizeof(ip_str), &ips[0]) != 0) {
+            free(ips);
+            free(conn);
+            return 3;
+        }
+        free(ips);
+        SSH_DBG("resolved %s -> %s\n", host, ip_str);
+        if (addr_sockaddr_create(&addr, ip_str, port) != 0) {
+            free(conn);
+            return 3;
+        }
+    }
 
     rc = tcp_conn_create(&conn->tcp, &addr);
     if (rc != 0) { free(conn); return 3; }
@@ -616,6 +959,46 @@ unsigned long ssh_conn_create(ssh_conn **out,
 }
 
 /* ================================================================
+ *  Userauth service negotiation (RFC 4253 §10).
+ *
+ *  Between the end of KEX and the start of any USERAUTH_REQUEST, the
+ *  client MUST send SSH_MSG_SERVICE_REQUEST with service name
+ *  "ssh-userauth", and wait for SSH_MSG_SERVICE_ACCEPT. Without this,
+ *  some servers (notably github.com's babeld) silently drop or buffer
+ *  USERAUTH_REQUEST messages and the client hangs forever.
+ *
+ *  Once per connection. `conn->service_accepted` short-circuits the
+ *  second caller so multiple auth method attempts don't re-negotiate.
+ * ================================================================ */
+
+static unsigned long ssh_request_userauth_service(ssh_conn *conn) {
+    u8  payload[256];
+    u64 payload_len;
+    pkt_buf pb;
+
+    if (conn->service_accepted) {
+        SSH_DBG("userauth: service already accepted, skipping\n");
+        return 0;
+    }
+
+    SSH_DBG("userauth: requesting ssh-userauth service\n");
+    pb_init(&pb, payload, sizeof(payload));
+    pb_u8(&pb, SSH_MSG_SERVICE_REQUEST);
+    pb_cstring(&pb, "ssh-userauth");
+    if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 1;
+
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 2;
+    if (payload_len < 1 || payload[0] != SSH_MSG_SERVICE_ACCEPT) {
+        SSH_DBG("userauth: expected SERVICE_ACCEPT(6) got %u\n",
+                payload_len >= 1 ? (unsigned)payload[0] : 0);
+        return 3;
+    }
+    SSH_DBG("userauth: service accepted\n");
+    conn->service_accepted = 1;
+    return 0;
+}
+
+/* ================================================================
  *  ssh_conn_auth_password
  * ================================================================ */
 
@@ -630,6 +1013,12 @@ unsigned long ssh_conn_auth_password(ssh_conn *conn,
     if (!username) return 2;
     if (!password) return 3;
 
+    /* RFC 4253 §10 — negotiate ssh-userauth service before any
+     * USERAUTH_REQUEST. Idempotent via conn->service_accepted flag. */
+    if (ssh_request_userauth_service(conn) != 0) return 5;
+
+    SSH_DBG("userauth: sending USERAUTH_REQUEST method=password user=%s\n", username);
+
     /* Build SSH_MSG_USERAUTH_REQUEST (password) */
     pb_init(&pb, payload, sizeof(payload));
     pb_u8(&pb, SSH_MSG_USERAUTH_REQUEST);
@@ -642,8 +1031,9 @@ unsigned long ssh_conn_auth_password(ssh_conn *conn,
     if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 5;
 
     /* Receive response */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 5;
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 5;
     if (payload_len < 1) return 5;
+    SSH_DBG("userauth: recv msg_type=%u\n", (unsigned)payload[0]);
 
     if (payload[0] == SSH_MSG_USERAUTH_SUCCESS) return 0;
     if (payload[0] == SSH_MSG_USERAUTH_FAILURE) return 4;
@@ -675,6 +1065,9 @@ unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
     if (!username) return 2;
     if (!privkey)  return 3;
     if (privkey_len != ED25519_PRIVKEY_LEN) return 3;
+
+    /* RFC 4253 §10 — ssh-userauth service negotiation. */
+    if (ssh_request_userauth_service(conn) != 0) return 6;
 
     memcpy(epriv.data, privkey, ED25519_PRIVKEY_LEN);
     if (ed25519_pubkey_from_privkey(&epub, &epriv) != 0) return 5;
@@ -714,14 +1107,24 @@ unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
     pb_string(&pb, pkb.buf, pkb.len);
     pb_string(&pb, sgb.buf, sgb.len);
 
+    SSH_DBG("userauth: sending USERAUTH_REQUEST method=publickey user=%s\n", username);
     if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 6;
 
     /* Receive response */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 6;
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 6;
     if (payload_len < 1) return 6;
+    SSH_DBG("userauth: recv msg_type=%u\n", (unsigned)payload[0]);
 
-    if (payload[0] == SSH_MSG_USERAUTH_SUCCESS) return 0;
-    if (payload[0] == SSH_MSG_USERAUTH_FAILURE) return 4;
+    if (payload[0] == SSH_MSG_USERAUTH_SUCCESS) {
+        memset(epriv.data, 0, ED25519_PRIVKEY_LEN);
+        memset(sig, 0, ED25519_SIG_LEN);
+        return 0;
+    }
+    if (payload[0] == SSH_MSG_USERAUTH_FAILURE) {
+        memset(epriv.data, 0, ED25519_PRIVKEY_LEN);
+        memset(sig, 0, ED25519_SIG_LEN);
+        return 4;
+    }
 
     /* Scrub private key material */
     memset(epriv.data, 0, ED25519_PRIVKEY_LEN);
@@ -975,6 +1378,10 @@ unsigned long ssh_conn_auth_agent(ssh_conn *conn,
     if (!conn)     return 1;
     if (!username) return 2;
 
+    /* RFC 4253 §10 — ssh-userauth service negotiation. Must happen
+     * before any USERAUTH_REQUEST regardless of auth method. */
+    if (ssh_request_userauth_service(conn) != 0) return 6;
+
     if (agent_open(&agent) != 0) return 3;
 
     /* 1. Request identities. Body is empty. */
@@ -1038,10 +1445,12 @@ unsigned long ssh_conn_auth_agent(ssh_conn *conn,
     pb_string(&pb, pubkey_blob, pubkey_blob_len);
     pb_string(&pb, sig_blob, sig_blob_len);
 
+    SSH_DBG("userauth: sending USERAUTH_REQUEST method=publickey (agent-signed) user=%s\n", username);
     if (ssh_send_packet(conn, pb.buf, pb.len) != 0) return 6;
 
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) return 6;
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) return 6;
     if (payload_len < 1) return 6;
+    SSH_DBG("userauth: recv msg_type=%u\n", (unsigned)payload[0]);
 
     if (payload[0] == SSH_MSG_USERAUTH_SUCCESS) { rc = 0; }
     else if (payload[0] == SSH_MSG_USERAUTH_FAILURE) { rc = 6; }
@@ -1101,7 +1510,7 @@ unsigned long ssh_conn_open_channel(ssh_channel **out,
     }
 
     /* Receive CHANNEL_OPEN_CONFIRMATION or FAILURE */
-    if (ssh_recv_packet(conn, payload, sizeof(payload), &payload_len) != 0) {
+    if (ssh_recv_packet_filtered(conn, payload, sizeof(payload), &payload_len) != 0) {
         free(ch);
         return 3;
     }
@@ -1174,7 +1583,7 @@ unsigned long ssh_channel_write(u64 *bytes_written, ssh_channel *ch,
             /* Wait for WINDOW_ADJUST — try reading one packet */
             u8 rxbuf[SSH_MAX_PACKET];
             u64 rxlen;
-            if (ssh_recv_packet(ch->conn, rxbuf, sizeof(rxbuf), &rxlen) != 0) return 5;
+            if (ssh_recv_packet_filtered(ch->conn, rxbuf, sizeof(rxbuf), &rxlen) != 0) return 5;
             if (rxlen >= 9 && rxbuf[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
                 u32 adjust = get_u32(rxbuf + 5);
                 ch->remote_window += adjust;
@@ -1294,7 +1703,7 @@ unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,
         u8 pkt[SSH_MAX_PACKET];
         u64 pkt_len;
 
-        if (ssh_recv_packet(ch->conn, pkt, sizeof(pkt), &pkt_len) != 0) return 4;
+        if (ssh_recv_packet_filtered(ch->conn, pkt, sizeof(pkt), &pkt_len) != 0) return 4;
         ssh_dispatch_channel_packet(ch->conn, pkt, pkt_len);
 
         /* Try again from buffer */
@@ -1366,7 +1775,7 @@ unsigned long ssh_channel_exec(ssh_channel *ch, const char *command) {
     /* Read until we see the request's success/failure reply. Drop any
      * interleaved WINDOW_ADJUST packets (server commonly sends one). */
     for (tries = 0; tries < 8; tries++) {
-        if (ssh_recv_packet(ch->conn, payload, sizeof(payload), &payload_len) != 0)
+        if (ssh_recv_packet_filtered(ch->conn, payload, sizeof(payload), &payload_len) != 0)
             return 4;
         if (payload_len < 1) return 4;
 
@@ -1454,5 +1863,28 @@ unsigned long ssh_conn_destroy(ssh_conn *conn) {
     memset(conn->iv_s2c, 0, 12);
 
     free(conn);
+    return 0;
+}
+
+/* ================================================================
+ *  Test-only hook: expose pb_mpint to the test suite. The mpint
+ *  encoding is load-bearing for the RFC 4253 §8 exchange hash — a
+ *  single off-by-one in the MSB-prefix / leading-zero logic makes
+ *  every handshake fail sig verification against a real server.
+ *  Not part of the public API; `_dbg` suffix warns callers.
+ * ================================================================ */
+
+unsigned long ssh_dbg_encode_mpint(u8 *out, u64 out_cap,
+                                                  u64 *out_len,
+                                                  const u8 *bytes, u64 len);
+
+unsigned long ssh_dbg_encode_mpint(u8 *out, u64 out_cap, u64 *out_len,
+                                    const u8 *bytes, u64 len) {
+    pkt_buf pb;
+    if (!out || !out_len) return 1;
+    if (len > 0 && !bytes) return 2;
+    pb_init(&pb, out, out_cap);
+    pb_mpint(&pb, bytes, len);
+    *out_len = pb.len;
     return 0;
 }
