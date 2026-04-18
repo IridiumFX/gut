@@ -6,6 +6,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Implemented in remote_ssh.c. Kept out of the public remote.h so
+ * HTTP-only callers don't pull in the SSH primitives, but still
+ * visible here so remote_* functions can dispatch by URL scheme. */
+int           url_is_ssh(const char *url);
+unsigned long ssh_discover_refs(gut_remote_refs *out, const char *url);
+unsigned long ssh_fetch_pack_algo(const char *url,
+                                  gut_oid *want_oids, u64 want_count,
+                                  gut_oid *have_oids, u64 have_count,
+                                  const char *pack_path,
+                                  int depth,
+                                  gut_oid **shallow_out,
+                                  u64     *shallow_count_out,
+                                  gut_hash_algo algo);
+unsigned long ssh_discover_refs_for_push(gut_remote_refs *out, const char *url);
+unsigned long ssh_send_pack_algo(char **server_msg, const char *url,
+                                 gut_remote_update *updates, u64 update_count,
+                                 u8 *pack_data, u64 pack_len,
+                                 gut_hash_algo algo);
+
 /* ---- pkt-line helpers ---- */
 
 /* Read a pkt-line length from 4 hex chars. Returns 0 for flush packet. */
@@ -240,6 +259,8 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
     if (!out) return __LINE__;
     if (!url) return __LINE__;
 
+    if (url_is_ssh(url)) return ssh_discover_refs(out, url);
+
     out->count = 0;
     out->capabilities[0] = '\0';
     out->hash_algo = GUT_HASH_SHA1;
@@ -378,6 +399,13 @@ unsigned long remote_fetch_pack_algo(const char *url,
     if (shallow_count_out) *shallow_count_out = 0;
 
     if (!url || !want_oids || want_count == 0 || !pack_path) return __LINE__;
+
+    if (url_is_ssh(url)) {
+        return ssh_fetch_pack_algo(url, want_oids, want_count,
+                                   have_oids, have_count,
+                                   pack_path, depth,
+                                   shallow_out, shallow_count_out, algo);
+    }
 
     {
         char clean_url[2048];
@@ -599,6 +627,8 @@ unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *ur
     unsigned long rc;
 
     if (!out || !url) return __LINE__;
+
+    if (url_is_ssh(url)) { (void)token; return ssh_discover_refs_for_push(out, url); }
     out->count = 0;
     out->capabilities[0] = '\0';
     out->hash_algo = GUT_HASH_SHA1;
@@ -724,6 +754,13 @@ unsigned long remote_send_pack_algo(char **server_msg, const char *url,
 
     if (server_msg) *server_msg = NULL;
     if (!url || !updates || update_count == 0) return __LINE__;
+
+    if (url_is_ssh(url)) {
+        (void)token;
+        return ssh_send_pack_algo(server_msg, url,
+                                  updates, update_count,
+                                  pack_data, pack_len, algo);
+    }
 
     {
         char clean_url[2048];
