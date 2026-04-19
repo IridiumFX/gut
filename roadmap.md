@@ -51,12 +51,12 @@
 - [x] **gut offer --patch** — targeted per-file patch proposal; receiver
       persists under `.git/offers/<id>.json`, `gut offers apply|reject`
 
-### Commands (30+)
+### Commands (40+)
 init, add, unstage, rm, branch, branches, tag, tags, checkout, merge,
-cherry-pick, diff, commit, log, reflog, status, last, amend, undo,
-restore, reset, hash-object, cat-file, clone, fetch, push, login,
-listen, leech, send, leechers, ask, offer, offers, sos, feeling,
-repack, pack-objects, index-pack
+cherry-pick, worktree, diff, commit, log, reflog, status, last,
+amend, undo, restore, reset, hash-object, cat-file, clone, fetch,
+push, login, listen, leech, send, leechers, ask, offer, offers, sos,
+feeling, repack, pack-objects, index-pack
 
 ## In Progress
 
@@ -69,14 +69,25 @@ replacement for `git` itself in any developer's daily workflow. The
 common gap is that each of these requires its own small subsystem,
 not just a command glued on top of existing primitives.
 
-- [ ] **SSH transport** — `git@host:path` URLs. Biggest gap: most
-      real-world clone URLs (github, gitlab) are SSH. Needs an SSH
-      client stack in apennines (key exchange, userauth with public
-      keys / agents, channel multiplexing, `git-upload-pack` /
-      `git-receive-pack` command streams). Once apennines has it,
-      `remote_discover_refs` + `remote_fetch_pack_algo` +
-      `remote_send_pack_algo` get SSH siblings (or a transport
-      abstraction layer).
+- [x] **SSH transport** — `git@host:path` URLs.
+      `gut clone git@github.com:octocat/Hello-World.git` completes
+      in 12s, 256 refs + 239 wants + pack + working tree + git
+      fsck reads it clean. Full stack: URL parsing (scp-form +
+      ssh:// + user@host:port/path), OpenSSH-key-v1 PEM parser
+      (ed25519 seed extraction), ed25519 seed→expanded conversion,
+      DNS resolution, TCP connect, SSH version exchange (banner-
+      tolerant), KEX (curve25519-sha256 + ssh-ed25519 host key +
+      RFC 4253 §8 transcript hash + mpint(K)), AES-256-GCM encrypted
+      transport (RFC 5647 §7.1 nonce + per-direction counters +
+      RFC 4253 §6 padding), service-request handshake (§10), pubkey
+      userauth via env-seed or agent, GLOBAL_REQUEST +
+      CHANNEL_EXTENDED_DATA filters, drain-until-pktline-flush for
+      refs + drain-until-closed for pack. Known_hosts parser shipped
+      on our side (OpenSSH format, HMAC-SHA1 hashed entries,
+      pinning lookup) — pending apennines verifier-hook to enforce
+      during connect.
+      Eight apennines iterations (000120→000128) over one evening
+      got this to green.
 
 - [ ] **Interactive rebase** — `gut rebase -i <upstream>`. We have
       `gut squash N` and `gut amend` as partial building blocks.
@@ -113,12 +124,22 @@ not just a command glued on top of existing primitives.
       Not yet wired: expiration / `reflog expire`, `HEAD@{<time>}`
       syntax, detached-HEAD ref-update reflog.
 
-- [ ] **Worktree add** — `gut worktree add <path> <branch>`. Parent
-      repo keeps the `.git/` dir; new worktrees at arbitrary paths
-      get a gitfile (`.git` as text file pointing back). We already
-      added gitfile support for submodules, so `repo_open` handles
-      the indirection. Missing: the `.git/worktrees/<id>/` metadata
-      dir and the list/remove/prune subcommands.
+- [x] **Worktree add + list** (MVP).
+      `gut worktree add <path> <branch>` creates
+      `.git/worktrees/<id>/` metadata (HEAD, commondir, gitdir),
+      writes `<path>/.git` as a gitfile, and materializes the
+      branch's tree into the new path. `gut worktree list` shows
+      main + secondary with tip + branch. Blocks branches already
+      checked out (scans `.git/worktrees/*/HEAD` + main HEAD).
+      **Verified interop**: real `git status` / `git commit` / `git
+      worktree list` inside and outside the new worktree, round-trip
+      commit from secondary updates shared refs correctly.
+      **Deferred**: `repo_open` of a secondary worktree (needs a
+      `common_dir` field on `gut_repo` plus ~150 call-site updates
+      to split refs/objects/config vs HEAD/index/logs-HEAD). The
+      created worktree is fully usable with real `git` today;
+      `gut` tools that read HEAD + index work. `gut worktree remove`
+      / `prune` also follow-ups.
 
 - [ ] **Partial clone / `--filter`** — `gut clone --filter=blob:none`
       / `--filter=tree:0`. We have `--depth` (shallow); partial

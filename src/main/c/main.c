@@ -72,6 +72,7 @@ static void usage(void) {
         "  checkout        Switch branches\n"
         "  merge           Merge a branch into HEAD\n"
         "  cherry-pick <c> Apply one commit's diff onto HEAD\n"
+        "  worktree        Manage linked worktrees (add <path> <branch> | list)\n"
         "  reset           Move HEAD (--soft or --hard)\n"
         "  stash           Snapshot working tree, reset to HEAD\n"
         "                    subcommands: pop, list\n"
@@ -120,7 +121,7 @@ static void suggest_command(const char *typo) {
         "ask", "offer", "offers", "sos", "feeling", "login",
         "add", "unstage", "rm", "mv", "ls-files", "config",
         "branch", "branches", "tag", "tags",
-        "checkout", "merge", "cherry-pick", "diff", "commit", "wip", "squash",
+        "checkout", "merge", "cherry-pick", "worktree", "diff", "commit", "wip", "squash",
         "log", "reflog", "show", "status", "last", "amend", "undo", "restore",
         "reset", "stash", "blame", "bisect", "revert-file",
         "hash-object", "cat-file", "server", "help", NULL
@@ -609,6 +610,438 @@ static int cmd_submodule(int argc, char **argv) {
     }
 
     fprintf(stderr, "usage: gut submodule update [--init] [--recursive]\n");
+    return 1;
+}
+
+/* ---- gut worktree ----
+ *
+ * MVP scope:
+ *   gut worktree add <path> <branch>   create a secondary worktree
+ *   gut worktree list                   list main + secondary worktrees
+ *
+ * The `add` subcommand writes all state needed for real `git` to
+ * accept the new worktree: the `.git/worktrees/<id>/` metadata dir
+ * inside the main repo (HEAD, commondir, gitdir files) plus the
+ * `.git` gitfile inside the new worktree's path.
+ *
+ * `repo_open` on a secondary worktree is a separate concern because
+ * it requires a `common_dir` field on gut_repo so refs/objects/config
+ * resolve against the main `.git/` while HEAD/index resolve against
+ * the per-worktree `.git/worktrees/<id>/`. Tracked for follow-up;
+ * the worktree created here is fully usable with real `git` today,
+ * and by gut tools that don't cross the commondir boundary (i.e.
+ * anything reading HEAD and index only).
+ */
+
+/* Sanitize a basename into a worktree id: replace each non-
+ * alphanumeric, non-`_`, non-`-`, non-`.` byte with `_`. */
+static void worktree_sanitize_id(char *id) {
+    char *p;
+    for (p = id; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
+            *p = '_';
+        }
+    }
+}
+
+/* Return 1 if any existing worktree metadata dir references the given
+ * branch name in its HEAD file, including the main worktree. Used to
+ * block `gut worktree add` on a branch that's already checked out. */
+static int worktree_branch_in_use(gut_repo *repo, const char *branch) {
+    char head_path[2048];
+    char wt_base[2048];
+    FILE *fp;
+    char line[512];
+    char expected[512];
+    DIR *d;
+    struct dirent *de;
+
+    snprintf(expected, sizeof(expected), "ref: refs/heads/%s", branch);
+
+    /* Main worktree's HEAD */
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", repo->git_dir);
+    fp = fopen(head_path, "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            u64 L = strlen(line);
+            while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+            if (strcmp(line, expected) == 0) { fclose(fp); return 1; }
+        }
+        fclose(fp);
+    }
+
+    /* Per-worktree HEADs under .git/worktrees/<id>/HEAD */
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    d = opendir(wt_base);
+    if (!d) return 0;
+    while ((de = readdir(d)) != NULL) {
+        char whead[2048];
+        if (de->d_name[0] == '.') continue;
+        snprintf(whead, sizeof(whead), "%s/%s/HEAD", wt_base, de->d_name);
+        fp = fopen(whead, "r");
+        if (!fp) continue;
+        if (fgets(line, sizeof(line), fp)) {
+            u64 L = strlen(line);
+            while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+            if (strcmp(line, expected) == 0) { fclose(fp); closedir(d); return 1; }
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    return 0;
+}
+
+static int cmd_worktree_add(gut_repo *repo, const char *path,
+                            const char *branch) {
+    char abs_target[2048];
+    char wt_id[256];
+    char wt_dir[2048];
+    char head_path[2048];
+    char gd_path[2048];
+    char gf_path[2048];
+    char idx_path[2048];
+    char tmp[2048];
+    gut_oid branch_oid;
+    gut_object commit_obj;
+    gut_commit commit;
+    gut_oid tree_oid;
+    gut_index new_idx;
+    struct stat st;
+    unsigned long rc;
+    FILE *fp;
+
+    /* 1. Branch must exist. */
+    {
+        char branch_ref[256];
+        snprintf(branch_ref, sizeof(branch_ref), "refs/heads/%s", branch);
+        rc = repo_resolve_ref(&branch_oid, repo, branch_ref);
+        if (rc) {
+            fprintf(stderr, "error: branch '%s' not found "
+                            "(create it first with 'gut branch %s')\n",
+                    branch, branch);
+            return 1;
+        }
+    }
+
+    /* 2. Branch must not already be checked out. */
+    if (worktree_branch_in_use(repo, branch)) {
+        fprintf(stderr,
+                "error: branch '%s' is already checked out in another worktree\n",
+                branch);
+        return 1;
+    }
+
+    /* 3. Resolve the target path to absolute form. */
+    {
+        /* repo.c's resolve_path is static; replicate the one-off
+         * resolution inline. For an existing dir, we refuse unless
+         * empty; for a non-existent path, we'll create it. */
+        if (path[0] == '/' ||
+            (path[0] != '\0' && path[1] == ':')) {
+            if (strlen(path) >= sizeof(abs_target)) return 1;
+            snprintf(abs_target, sizeof(abs_target), "%s", path);
+        } else {
+            char cwd[2048];
+            if (!gut_getcwd(cwd, sizeof(cwd))) {
+                fprintf(stderr, "error: cannot get current directory\n");
+                return 1;
+            }
+            snprintf(abs_target, sizeof(abs_target), "%s/%s", cwd, path);
+        }
+        /* Normalize. */
+        {
+            char *p;
+            for (p = abs_target; *p; p++) if (*p == '\\') *p = '/';
+            {
+                u64 L = strlen(abs_target);
+                while (L > 1 && abs_target[L - 1] == '/') abs_target[--L] = 0;
+            }
+        }
+    }
+
+    /* 4. Target must not already exist as a non-empty directory or as
+     *    a file, and must not already be a repo. */
+    if (stat(abs_target, &st) == 0) {
+        if (st.st_mode & S_IFREG) {
+            fprintf(stderr, "error: '%s' already exists as a file\n", abs_target);
+            return 1;
+        }
+        if (st.st_mode & S_IFDIR) {
+            DIR *d = opendir(abs_target);
+            struct dirent *de;
+            int empty = 1;
+            while (d && (de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.' &&
+                    (de->d_name[1] == 0 ||
+                     (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
+                empty = 0; break;
+            }
+            if (d) closedir(d);
+            if (!empty) {
+                fprintf(stderr, "error: '%s' exists and is not empty\n",
+                        abs_target);
+                return 1;
+            }
+        }
+    }
+    snprintf(tmp, sizeof(tmp), "%s/.git", abs_target);
+    if (stat(tmp, &st) == 0) {
+        fprintf(stderr, "error: '%s' is already a gut/git repo\n", abs_target);
+        return 1;
+    }
+
+    /* 5. Pick the worktree id — basename sanitized. Collision-check
+     *    against existing entries under .git/worktrees/. */
+    {
+        const char *base = strrchr(abs_target, '/');
+        base = base ? base + 1 : abs_target;
+        snprintf(wt_id, sizeof(wt_id), "%s", base);
+        worktree_sanitize_id(wt_id);
+        if (wt_id[0] == 0) snprintf(wt_id, sizeof(wt_id), "worktree");
+    }
+    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->git_dir, wt_id);
+    if (stat(wt_dir, &st) == 0) {
+        fprintf(stderr, "error: worktree id '%s' already exists at '%s' "
+                        "(pick a different target path)\n",
+                wt_id, wt_dir);
+        return 1;
+    }
+
+    /* 6. Create `<main>/worktrees/<id>/` and its files. */
+    if (ensure_parent_dirs(wt_dir) != 0) {
+        fprintf(stderr, "error: cannot create %s\n", wt_dir);
+        return 1;
+    }
+#ifdef _WIN32
+    _mkdir(wt_dir);
+#else
+    mkdir(wt_dir, 0755);
+#endif
+
+    /* HEAD: symbolic ref pointing at refs/heads/<branch>. */
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", wt_dir);
+    fp = fopen(head_path, "w");
+    if (!fp) { fprintf(stderr, "error: cannot write %s\n", head_path); return 1; }
+    fprintf(fp, "ref: refs/heads/%s\n", branch);
+    fclose(fp);
+
+    /* commondir: relative path back to the shared git_dir.
+     * Two levels up from `<git_dir>/worktrees/<id>/` → `<git_dir>/`. */
+    snprintf(tmp, sizeof(tmp), "%s/commondir", wt_dir);
+    fp = fopen(tmp, "w");
+    if (!fp) return 1;
+    fprintf(fp, "../..\n");
+    fclose(fp);
+
+    /* gitdir: absolute path of the gitfile we're about to write at
+     * `<abs_target>/.git`. Git uses this for backreference checks
+     * during prune / remove. */
+    snprintf(gf_path, sizeof(gf_path), "%s/.git", abs_target);
+    snprintf(gd_path, sizeof(gd_path), "%s/gitdir", wt_dir);
+    fp = fopen(gd_path, "w");
+    if (!fp) return 1;
+    fprintf(fp, "%s\n", gf_path);
+    fclose(fp);
+
+    /* 7. Create `<abs_target>/` and write its gitfile. */
+#ifdef _WIN32
+    _mkdir(abs_target);
+#else
+    mkdir(abs_target, 0755);
+#endif
+    fp = fopen(gf_path, "w");
+    if (!fp) {
+        fprintf(stderr, "error: cannot write %s\n", gf_path);
+        return 1;
+    }
+    fprintf(fp, "gitdir: %s\n", wt_dir);
+    fclose(fp);
+
+    /* 8. Load the branch commit + its tree; build an index. */
+    rc = odb_read(&commit_obj, &repo->odb, &branch_oid);
+    if (rc) { fprintf(stderr, "error: cannot read branch commit\n"); return 1; }
+    rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+    object_destroy(&commit_obj);
+    if (rc) { fprintf(stderr, "error: cannot parse commit\n"); return 1; }
+    memcpy(tree_oid.bytes, commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+    commit_destroy(&commit);
+
+    rc = index_read_tree(&new_idx, &repo->odb, &tree_oid);
+    if (rc) { fprintf(stderr, "error: cannot materialize tree\n"); return 1; }
+
+    /* 9. Materialize the working tree under the new path.
+     * workdir_write_from_index uses `repo->root_dir` + `repo->odb` —
+     * temporarily swap root_dir so files land under the target, then
+     * restore. The odb is shared (same objects on disk). */
+    {
+        char saved_root[1024];
+        snprintf(saved_root, sizeof(saved_root), "%s", repo->root_dir);
+        snprintf(repo->root_dir, sizeof(repo->root_dir), "%s", abs_target);
+        if (workdir_write_from_index(repo, &new_idx) != 0) {
+            snprintf(repo->root_dir, sizeof(repo->root_dir), "%s", saved_root);
+            index_destroy(&new_idx);
+            fprintf(stderr, "error: failed to materialize working tree\n");
+            return 1;
+        }
+        snprintf(repo->root_dir, sizeof(repo->root_dir), "%s", saved_root);
+    }
+
+    /* 10. Write the per-worktree index inside <wt_dir>/index. */
+    snprintf(idx_path, sizeof(idx_path), "%s/index", wt_dir);
+    rc = index_write(&new_idx, idx_path);
+    index_destroy(&new_idx);
+    if (rc) {
+        fprintf(stderr, "error: cannot write per-worktree index\n");
+        return 1;
+    }
+
+    /* Success. */
+    {
+        char hex[GUT_OID_MAX_HEX_SIZE + 1];
+        unsigned hlen = gut_oid_hex_size(repo->hash_algo);
+        oid_to_hex_n(hex, &branch_oid, hlen);
+        hex[hlen] = 0;
+        printf("Preparing worktree (new branch '%s' checked out at '%s')\n",
+               branch, abs_target);
+        printf("HEAD is now at %.*s\n", 7, hex);
+    }
+    return 0;
+}
+
+static int cmd_worktree_list(gut_repo *repo) {
+    char wt_base[2048];
+    char head_path[2048];
+    char gd_path[2048];
+    char line[2048];
+    DIR *d;
+    struct dirent *de;
+    FILE *fp;
+
+    /* Main worktree first. */
+    {
+        char hex[GUT_OID_MAX_HEX_SIZE + 1];
+        char hr[256];
+        if (repo_head_ref(hr, sizeof(hr), repo) == 0) {
+            gut_oid o;
+            unsigned hlen = gut_oid_hex_size(repo->hash_algo);
+            if (repo_resolve_ref(&o, repo, hr) == 0) {
+                oid_to_hex_n(hex, &o, hlen);
+                hex[hlen] = 0;
+                printf("%-40s %.*s [%s]\n",
+                       repo->root_dir, 7, hex,
+                       strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
+            } else {
+                printf("%-40s <unborn> [%s]\n", repo->root_dir,
+                       strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
+            }
+        }
+    }
+
+    /* Secondary worktrees. */
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    d = opendir(wt_base);
+    if (!d) return 0;
+    while ((de = readdir(d)) != NULL) {
+        char head_ref[256] = "";
+        char target_path[2048] = "";
+        char tip_hex[GUT_OID_MAX_HEX_SIZE + 1] = "";
+        unsigned hlen;
+        if (de->d_name[0] == '.') continue;
+
+        snprintf(head_path, sizeof(head_path), "%s/%s/HEAD", wt_base, de->d_name);
+        snprintf(gd_path, sizeof(gd_path), "%s/%s/gitdir", wt_base, de->d_name);
+
+        fp = fopen(head_path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                u64 L = strlen(line);
+                while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+                snprintf(head_ref, sizeof(head_ref), "%s", line);
+            }
+            fclose(fp);
+        }
+
+        fp = fopen(gd_path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                u64 L = strlen(line);
+                while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+                /* Trim trailing "/.git" to show the worktree's root. */
+                {
+                    u64 LL = strlen(line);
+                    if (LL >= 5 && strcmp(line + LL - 5, "/.git") == 0)
+                        line[LL - 5] = 0;
+                }
+                snprintf(target_path, sizeof(target_path), "%s", line);
+            }
+            fclose(fp);
+        }
+
+        /* Resolve the branch tip if the HEAD is symbolic. */
+        hlen = gut_oid_hex_size(repo->hash_algo);
+        if (strncmp(head_ref, "ref: ", 5) == 0) {
+            gut_oid o;
+            if (repo_resolve_ref(&o, repo, head_ref + 5) == 0) {
+                oid_to_hex_n(tip_hex, &o, hlen);
+                tip_hex[hlen] = 0;
+            }
+        }
+
+        {
+            const char *branch = "detached";
+            if (strncmp(head_ref, "ref: refs/heads/", 16) == 0)
+                branch = head_ref + 16;
+            else if (strncmp(head_ref, "ref: ", 5) == 0)
+                branch = head_ref + 5;
+
+            printf("%-40s %.*s [%s]\n",
+                   target_path[0] ? target_path : de->d_name,
+                   7, tip_hex[0] ? tip_hex : "<?>",
+                   branch);
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int cmd_worktree(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    unsigned long rc;
+    const char *sub;
+
+    if (argc == 0) {
+        fprintf(stderr, "usage: gut worktree <subcommand> [args]\n"
+                        "  subcommands: add <path> <branch> | list\n");
+        return 1;
+    }
+    sub = argv[0];
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n");
+        return 1;
+    }
+
+    if (strcmp(sub, "add") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "usage: gut worktree add <path> <branch>\n");
+            return 1;
+        }
+        return cmd_worktree_add(&repo, argv[1], argv[2]);
+    }
+    if (strcmp(sub, "list") == 0) {
+        return cmd_worktree_list(&repo);
+    }
+
+    fprintf(stderr, "usage: gut worktree <subcommand> [args]\n"
+                    "  subcommands: add <path> <branch> | list\n");
     return 1;
 }
 
@@ -10301,6 +10734,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "cherry-pick") == 0) {
         return cmd_cherry_pick(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "worktree") == 0) {
+        return cmd_worktree(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "diff") == 0) {
         return cmd_diff(argc - 2, argv + 2);
