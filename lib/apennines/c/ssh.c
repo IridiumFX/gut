@@ -58,11 +58,15 @@ static int ssh_dbg_enabled(void) {
 #define SSH_MSG_USERAUTH_FAILURE   51
 #define SSH_MSG_USERAUTH_SUCCESS   52
 #define SSH_MSG_USERAUTH_BANNER    53
+#define SSH_MSG_GLOBAL_REQUEST     80
+#define SSH_MSG_REQUEST_SUCCESS    81
+#define SSH_MSG_REQUEST_FAILURE    82
 #define SSH_MSG_CHANNEL_OPEN       90
 #define SSH_MSG_CHANNEL_OPEN_CONFIRM 91
 #define SSH_MSG_CHANNEL_OPEN_FAIL  92
 #define SSH_MSG_CHANNEL_WINDOW_ADJUST 93
 #define SSH_MSG_CHANNEL_DATA       94
+#define SSH_MSG_CHANNEL_EXTENDED_DATA 95
 #define SSH_MSG_CHANNEL_EOF        96
 #define SSH_MSG_CHANNEL_CLOSE      97
 #define SSH_MSG_CHANNEL_REQUEST    98
@@ -84,6 +88,15 @@ struct ssh_channel {
     u8       *recv_buf;
     u64       recv_len;
     u64       recv_cap;
+
+    /* Separate stderr ring for SSH_MSG_CHANNEL_EXTENDED_DATA with
+     * data_type_code = SSH_EXTENDED_DATA_STDERR (1). For the
+     * git-over-ssh flow this carries `git-upload-pack`'s error output.
+     * Drain via ssh_channel_read_stderr. */
+    u8       *err_recv_buf;
+    u64       err_recv_len;
+    u64       err_recv_cap;
+
     ssh_conn *conn;     /* back-pointer for I/O */
 };
 
@@ -122,6 +135,16 @@ struct ssh_conn {
      * SSH_MSG_SERVICE_REQUEST "ssh-userauth" (RFC 4253 §10). Guards
      * every auth method from re-requesting the service. */
     int           service_accepted;
+
+    /* AES-GCM invocation counter (RFC 5647 §7.1). At NEWKEYS these
+     * are seeded from iv_c2s[4..11] / iv_s2c[4..11] as big-endian
+     * u64. The nonce for each packet is iv[0..3] || BE64(counter);
+     * the counter increments by 1 after each use. Separate from the
+     * protocol sequence number seq_c2s/seq_s2c which is unused for
+     * aes256-gcm@openssh.com (it has no separate MAC — AEAD tag
+     * replaces HMAC). */
+    u64           gcm_ctr_c2s;
+    u64           gcm_ctr_s2c;
 };
 
 /* ================================================================
@@ -138,6 +161,24 @@ static void put_u32(u8 *dst, u32 v) {
 static u32 get_u32(const u8 *src) {
     return ((u32)src[0] << 24) | ((u32)src[1] << 16) |
            ((u32)src[2] << 8)  | (u32)src[3];
+}
+
+static void put_u64(u8 *dst, u64 v) {
+    dst[0] = (u8)(v >> 56);
+    dst[1] = (u8)(v >> 48);
+    dst[2] = (u8)(v >> 40);
+    dst[3] = (u8)(v >> 32);
+    dst[4] = (u8)(v >> 24);
+    dst[5] = (u8)(v >> 16);
+    dst[6] = (u8)(v >> 8);
+    dst[7] = (u8)(v);
+}
+
+static u64 get_u64(const u8 *src) {
+    return ((u64)src[0] << 56) | ((u64)src[1] << 48) |
+           ((u64)src[2] << 40) | ((u64)src[3] << 32) |
+           ((u64)src[4] << 24) | ((u64)src[5] << 16) |
+           ((u64)src[6] << 8)  | (u64)src[7];
 }
 
 /* ================================================================
@@ -174,8 +215,14 @@ static unsigned long ssh_send_packet(ssh_conn *conn, const u8 *payload, u64 payl
     u64 unpadded, total_len;
     u64 wr;
 
-    /* minimum 4 bytes padding, total (4+1+payload+pad) must be multiple of block_size */
-    unpadded = 4 + 1 + payload_len;
+    /* RFC 4253 §6: "the total length of the packet (not counting the
+     * 'mac' or the length field) is a multiple of the block size."
+     * The "encrypted portion" is padding_length(1) + payload + padding.
+     * The 4-byte length field is NOT counted. For AES-GCM the block
+     * size is 16; previous code mistakenly aligned 4+1+payload+pad to
+     * 16, giving an encrypted portion ≡ 12 mod 16, which strict
+     * servers (e.g. GitHub's babeld) silently drop. */
+    unpadded = 1 + payload_len;
     pad_len = (u8)(block_size - (unpadded % block_size));
     if (pad_len < 4) pad_len += (u8)block_size;
 
@@ -193,23 +240,48 @@ static unsigned long ssh_send_packet(ssh_conn *conn, const u8 *payload, u64 payl
         u8 enc_buf[SSH_MAX_PACKET];
         u8 tag[16];
         u8 nonce[12];
-        u8 seq_buf[4];
         u64 enc_len = total_len - 4;  /* encrypt everything after length field */
 
-        /* Build nonce: IV XOR sequence number (in big-endian, zero-padded to 12 bytes) */
-        memcpy(nonce, conn->iv_c2s, 12);
-        put_u32(seq_buf, (u32)conn->seq_c2s);
-        nonce[8]  ^= seq_buf[0];
-        nonce[9]  ^= seq_buf[1];
-        nonce[10] ^= seq_buf[2];
-        nonce[11] ^= seq_buf[3];
+        /* RFC 5647 §7.1 nonce: first 4 bytes from iv_c2s[0..3] (fixed),
+         * last 8 bytes are the big-endian invocation counter. The counter
+         * starts at iv_c2s[4..11] as BE64 at NEWKEYS, and increments by 1
+         * per packet. This is NOT the XOR-with-seq-num used by some SSH
+         * AEAD constructions — aes*-gcm@openssh.com uses RFC 5647. */
+        memcpy(nonce, conn->iv_c2s, 4);
+        put_u64(nonce + 4, conn->gcm_ctr_c2s);
 
-        /* AAD = packet_length (first 4 bytes, unencrypted) */
+        if (ssh_dbg_enabled()) {
+            u32 i;
+            fprintf(stderr, "[apennines_ssh] enc send seq=%llu ctr=%llu nonce=",
+                    (unsigned long long)conn->seq_c2s,
+                    (unsigned long long)conn->gcm_ctr_c2s);
+            for (i = 0; i < 12; i++) fprintf(stderr, "%02x", nonce[i]);
+            fprintf(stderr, " aad_len=4 pt_len=%llu\n", (unsigned long long)enc_len);
+            fflush(stderr);
+        }
+
+        /* AAD = packet_length (first 4 bytes, unencrypted on wire). */
         if (aes256_gcm_encrypt(enc_buf, tag, &conn->aes_c2s,
                                nonce, pkt, 4,
                                pkt + 4, enc_len) != 0) return 2;
 
+        /* Advance the invocation counter now that this nonce was consumed. */
+        conn->gcm_ctr_c2s++;
+
         /* Send: length(4) + encrypted_body + tag(16) */
+        if (ssh_dbg_enabled()) {
+            u32 i;
+            u32 n = (u32)(enc_len > 16 ? 16 : enc_len);
+            fprintf(stderr, "[apennines_ssh] enc send wire first4=%02x%02x%02x%02x ct_first16=",
+                    pkt[0], pkt[1], pkt[2], pkt[3]);
+            for (i = 0; i < n; i++) fprintf(stderr, "%02x", enc_buf[i]);
+            fprintf(stderr, " tag=");
+            for (i = 0; i < 16; i++) fprintf(stderr, "%02x", tag[i]);
+            fprintf(stderr, " (enc_len=%llu total_wire=%llu)\n",
+                    (unsigned long long)enc_len,
+                    (unsigned long long)(4 + enc_len + 16));
+            fflush(stderr);
+        }
         if (tcp_send_all(&conn->tcp, pkt, 4) != 0) return 3;
         if (tcp_send_all(&conn->tcp, enc_buf, enc_len) != 0) return 3;
         if (tcp_send_all(&conn->tcp, tag, 16) != 0) return 3;
@@ -240,22 +312,32 @@ static unsigned long ssh_recv_packet(ssh_conn *conn,
         u8 enc_body[SSH_MAX_PACKET];
         u8 tag[16];
         u8 nonce[12];
-        u8 seq_buf[4];
 
         if (tcp_recv_exact(&conn->tcp, enc_body, packet_length) != 0) return 1;
         if (tcp_recv_exact(&conn->tcp, tag, 16) != 0) return 1;
 
-        memcpy(nonce, conn->iv_s2c, 12);
-        put_u32(seq_buf, (u32)conn->seq_s2c);
-        nonce[8]  ^= seq_buf[0];
-        nonce[9]  ^= seq_buf[1];
-        nonce[10] ^= seq_buf[2];
-        nonce[11] ^= seq_buf[3];
+        /* RFC 5647 §7.1 nonce for s2c direction. */
+        memcpy(nonce, conn->iv_s2c, 4);
+        put_u64(nonce + 4, conn->gcm_ctr_s2c);
+
+        if (ssh_dbg_enabled()) {
+            u32 i;
+            fprintf(stderr, "[apennines_ssh] enc recv seq=%llu ctr=%llu nonce=",
+                    (unsigned long long)conn->seq_s2c,
+                    (unsigned long long)conn->gcm_ctr_s2c);
+            for (i = 0; i < 12; i++) fprintf(stderr, "%02x", nonce[i]);
+            fprintf(stderr, " aad_len=4 ct_len=%llu\n",
+                    (unsigned long long)packet_length);
+            fflush(stderr);
+        }
 
         if (aes256_gcm_decrypt(body, &conn->aes_s2c,
                                nonce, hdr, 4,
                                enc_body, packet_length,
                                tag) != 0) return 3;
+
+        /* Advance the invocation counter after successful decrypt. */
+        conn->gcm_ctr_s2c++;
     } else {
         if (tcp_recv_exact(&conn->tcp, body, packet_length) != 0) return 1;
     }
@@ -271,15 +353,38 @@ static unsigned long ssh_recv_packet(ssh_conn *conn,
     return 0;
 }
 
-/* ssh_recv_packet_filtered — recv + transparently drop SSH_MSG_IGNORE (2),
- * SSH_MSG_DEBUG (4), and SSH_MSG_UNIMPLEMENTED (3). The spec (RFC 4253
- * §11.2-11.4) says these can arrive at any time and receivers MUST tolerate
- * them. Without this filter, a server that sends an unsolicited DEBUG
- * message before its KEX_ECDH_REPLY would cause our KEX to fail with
- * msg_type-mismatch. OpenSSH and several forges do this in practice.
+/* Forward declarations — pr_init / pr_u8 / pr_string are defined
+ * below in the payload-reader block but we need them here to parse
+ * GLOBAL_REQUEST bodies inside the noise filter. */
+typedef struct { const u8 *data; u64 len; u64 pos; } pkt_reader;
+static void pr_init(pkt_reader *pr, const u8 *data, u64 len);
+static int  pr_u8(pkt_reader *pr, u8 *out);
+static int  pr_string(pkt_reader *pr, const u8 **out, u64 *out_len);
+
+/* ssh_recv_packet_filtered — recv + transparently drop unsolicited
+ * informational / control messages that callers shouldn't see.
  *
- * Also logs the message type if APENNINES_SSH_DEBUG is set so the caller
- * can see what's arriving. */
+ * Filtered types:
+ *   SSH_MSG_IGNORE (2)          RFC 4253 §11.2
+ *   SSH_MSG_UNIMPLEMENTED (3)   RFC 4253 §11.4
+ *   SSH_MSG_DEBUG (4)           RFC 4253 §11.3
+ *   SSH_MSG_USERAUTH_BANNER (53) RFC 4252 §5.4 (informational login notice)
+ *   SSH_MSG_GLOBAL_REQUEST (80) RFC 4254 §4 (e.g. GitHub's
+ *                                hostkeys-00@openssh.com announcement
+ *                                sent between CHANNEL_OPEN and
+ *                                CHANNEL_OPEN_CONFIRMATION). If
+ *                                want_reply=TRUE, we MUST reply with
+ *                                REQUEST_FAILURE per §4; we don't
+ *                                implement any extension so we always
+ *                                refuse.
+ *   SSH_MSG_REQUEST_SUCCESS/FAILURE (81/82) — defensive, never
+ *                                expected unsolicited.
+ *
+ * Without this filter a server that sends any of these between our
+ * CHANNEL_OPEN and its CHANNEL_OPEN_CONFIRMATION would cause us to
+ * treat the interleaved message as the confirmation — exactly what
+ * gut hit against github.com in the 03:30 trace.
+ */
 static unsigned long ssh_recv_packet_filtered(ssh_conn *conn,
                                                u8 *payload_out, u64 payload_cap,
                                                u64 *payload_len_out) {
@@ -296,7 +401,34 @@ static unsigned long ssh_recv_packet_filtered(ssh_conn *conn,
             if (t == 2 /* SSH_MSG_IGNORE */ ||
                 t == 3 /* SSH_MSG_UNIMPLEMENTED */ ||
                 t == 4 /* SSH_MSG_DEBUG */ ||
-                t == SSH_MSG_USERAUTH_BANNER /* 53 — informational only */) {
+                t == SSH_MSG_USERAUTH_BANNER /* 53 */ ||
+                t == SSH_MSG_REQUEST_SUCCESS  /* 81 — defensive */ ||
+                t == SSH_MSG_REQUEST_FAILURE  /* 82 — defensive */) {
+                continue;
+            }
+            if (t == SSH_MSG_GLOBAL_REQUEST) {
+                /* Parse: string request_name || bool want_reply || <data>
+                 * We don't implement any global-request extension, so if
+                 * the server wants a reply, refuse with REQUEST_FAILURE. */
+                pkt_reader gr;
+                u8 msg_type;
+                const u8 *name = NULL;
+                u64 name_len = 0;
+                u8 want_reply = 0;
+
+                pr_init(&gr, payload_out, *payload_len_out);
+                (void)pr_u8(&gr, &msg_type);
+                (void)pr_string(&gr, &name, &name_len);
+                (void)pr_u8(&gr, &want_reply);
+
+                SSH_DBG("filter: dropped GLOBAL_REQUEST name='%.*s' want_reply=%u\n",
+                        (int)name_len, (const char *)(name ? name : (const u8 *)""),
+                        (unsigned)want_reply);
+
+                if (want_reply) {
+                    u8 resp = SSH_MSG_REQUEST_FAILURE;
+                    (void)ssh_send_packet(conn, &resp, 1);
+                }
                 continue;
             }
         }
@@ -354,12 +486,8 @@ static void pb_raw(pkt_buf *pb, const u8 *data, u64 len) {
     }
 }
 
-/* Read helpers for received payloads */
-typedef struct {
-    const u8 *data;
-    u64       len;
-    u64       pos;
-} pkt_reader;
+/* Read helpers for received payloads. (pkt_reader typedef is forward-
+ * declared earlier so the noise filter can use it.) */
 
 static void pr_init(pkt_reader *pr, const u8 *data, u64 len) {
     pr->data = data;
@@ -871,6 +999,17 @@ static unsigned long ssh_key_exchange_impl(ssh_conn *conn) {
     /* 12. Initialize AES-256-GCM contexts and switch to encrypted mode */
     if (aes256_init(&conn->aes_c2s, conn->enc_key_c2s) != 0) return 12;
     if (aes256_init(&conn->aes_s2c, conn->enc_key_s2c) != 0) return 12;
+
+    /* Seed AES-GCM invocation counters from iv[4..11] per RFC 5647 §7.1.
+     * These increment per packet; nonce = iv[0..3] || BE64(counter). */
+    conn->gcm_ctr_c2s = get_u64(conn->iv_c2s + 4);
+    conn->gcm_ctr_s2c = get_u64(conn->iv_s2c + 4);
+    SSH_DBG("KEX: gcm counters seeded c2s=%llu s2c=%llu (fixed c2s=%02x%02x%02x%02x s2c=%02x%02x%02x%02x)\n",
+            (unsigned long long)conn->gcm_ctr_c2s,
+            (unsigned long long)conn->gcm_ctr_s2c,
+            conn->iv_c2s[0], conn->iv_c2s[1], conn->iv_c2s[2], conn->iv_c2s[3],
+            conn->iv_s2c[0], conn->iv_s2c[1], conn->iv_s2c[2], conn->iv_s2c[3]);
+
     conn->encrypted = 1;
 
     /* Scrub shared secret from stack */
@@ -1652,6 +1791,48 @@ static void ssh_dispatch_channel_packet(ssh_conn *conn, const u8 *payload, u64 p
         }
         memcpy(ch->recv_buf + ch->recv_len, data_ptr, data_len);
         ch->recv_len += data_len;
+    } else if (msg_type == SSH_MSG_CHANNEL_EXTENDED_DATA && payload_len >= 13) {
+        /* RFC 4254 §5.2: byte msg_type || u32 channel || u32 data_type_code
+         * || string data. data_type_code=1 is SSH_EXTENDED_DATA_STDERR.
+         * We only route stderr to the err ring; other data_type_codes are
+         * undefined for session channels and we drop them. */
+        u32 type_code = get_u32(payload + 5);
+        u32 data_len  = get_u32(payload + 9);
+        const u8 *data_ptr = payload + 13;
+
+        if (13 + (u64)data_len > payload_len) return;
+
+        if (ssh_dbg_enabled()) {
+            /* Surface the first 256 bytes of stderr inline so consumers
+             * without an ssh_channel_read_stderr call still see errors in
+             * diagnostic traces. Primary reason this was added: gut's
+             * clone was getting 7 bytes of stderr from git-upload-pack
+             * and silently dropping them, producing "empty repository"
+             * instead of the real error. */
+            u32 n = data_len > 256 ? 256 : data_len;
+            fprintf(stderr,
+                    "[apennines_ssh] CHANNEL_EXTENDED_DATA ch=%u type=%u len=%u data=<%.*s>\n",
+                    ch_id, type_code, data_len, (int)n, (const char *)data_ptr);
+            fflush(stderr);
+        }
+
+        if (type_code == 1 /* SSH_EXTENDED_DATA_STDERR */) {
+            u64 needed = ch->err_recv_len + data_len;
+            if (needed > ch->err_recv_cap) {
+                u64 new_cap = ch->err_recv_cap > 0 ? ch->err_recv_cap : 256;
+                while (new_cap < needed) new_cap *= 2;
+                {
+                    u8 *new_buf = (u8 *)realloc(ch->err_recv_buf, new_cap);
+                    if (!new_buf) return;
+                    ch->err_recv_buf = new_buf;
+                    ch->err_recv_cap = new_cap;
+                }
+            }
+            memcpy(ch->err_recv_buf + ch->err_recv_len, data_ptr, data_len);
+            ch->err_recv_len += data_len;
+        }
+        /* NOTE: do NOT set ch->closed here — extended_data is just
+         * out-of-band bytes, not a channel-state change. */
     } else if (msg_type == SSH_MSG_CHANNEL_WINDOW_ADJUST && payload_len >= 9) {
         u32 adjust = get_u32(payload + 5);
         ch->remote_window += adjust;
@@ -1727,6 +1908,40 @@ unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,
                 ssh_send_packet(ch->conn, wpb.buf, wpb.len);
             }
         }
+    }
+
+    return 0;
+}
+
+/* ================================================================
+ *  ssh_channel_read_stderr — drain bytes that arrived via
+ *  SSH_MSG_CHANNEL_EXTENDED_DATA with data_type_code = 1 (stderr).
+ *
+ *  Non-blocking: returns whatever's already been buffered by earlier
+ *  dispatch calls. If the buffer is empty, returns 0 with *bytes_read=0
+ *  (does NOT try to pull a new packet — that would steal stdout bytes
+ *  from ssh_channel_read). Typical use: call after the main read loop
+ *  observes an EOF or error to surface the server's diagnostic output.
+ * ================================================================ */
+
+unsigned long ssh_channel_read_stderr(u64 *bytes_read,
+                                                     ssh_channel *ch,
+                                                     u8 *buf, u64 len) {
+    if (!bytes_read) return 1;
+    if (!ch)         return 2;
+    if (!buf)        return 3;
+
+    *bytes_read = 0;
+
+    if (ch->err_recv_len > 0) {
+        u64 copy = (ch->err_recv_len < len) ? ch->err_recv_len : len;
+        memcpy(buf, ch->err_recv_buf, copy);
+        if (copy < ch->err_recv_len) {
+            memmove(ch->err_recv_buf, ch->err_recv_buf + copy,
+                    ch->err_recv_len - copy);
+        }
+        ch->err_recv_len -= copy;
+        *bytes_read = copy;
     }
 
     return 0;
@@ -1818,6 +2033,11 @@ unsigned long ssh_channel_close(ssh_channel *ch) {
     ch->recv_len = 0;
     ch->recv_cap = 0;
 
+    free(ch->err_recv_buf);
+    ch->err_recv_buf = NULL;
+    ch->err_recv_len = 0;
+    ch->err_recv_cap = 0;
+
     return 0;
 }
 
@@ -1846,6 +2066,7 @@ unsigned long ssh_conn_destroy(ssh_conn *conn) {
     for (i = 0; i < conn->channel_count; i++) {
         if (conn->channels[i]) {
             free(conn->channels[i]->recv_buf);
+            free(conn->channels[i]->err_recv_buf);
             free(conn->channels[i]);
         }
     }

@@ -433,30 +433,92 @@ static unsigned long pktline_flush_ch(ssh_channel *ch) {
  *  the HTTP path which already works on a full response buffer.
  * ==================================================================== */
 
-static unsigned long drain_channel(u8 **out, u64 *out_len, ssh_channel *ch) {
+/* Scan a pkt-line stream starting at offset 0 for a flush packet
+ * (length "0000"). Returns 1 if a flush is present AND the walk up to
+ * it is consistent (each pkt-line's length points at the next valid
+ * pkt-line). Returns 0 if no flush yet OR the walk is still
+ * incomplete (needs more bytes). This is how we know an SSH
+ * git-upload-pack refs advertisement is fully received — the
+ * advertisement always ends with a flush. */
+static int has_pktline_flush(const u8 *buf_data, u64 len) {
+    u64 pos = 0;
+    while (pos + 4 <= len) {
+        u32 plen = pktline_len(buf_data + pos);
+        if (plen == 0) return 1;
+        if (plen < 4) return 0;
+        if (pos + plen > len) return 0;
+        pos += plen;
+    }
+    return 0;
+}
+
+/* Drain a channel until one of:
+ *   mode = DRAIN_UNTIL_PKTLINE_FLUSH — stop when a pkt-line flush
+ *     packet (0000) is found in the accumulated stdout buffer (used
+ *     for the refs advertisement phase)
+ *   mode = DRAIN_UNTIL_CLOSED — stop after several consecutive empty
+ *     reads (best heuristic we have while apennines doesn't expose a
+ *     channel-closed accessor; used for the pack data phase where the
+ *     server closes when done)
+ * stderr is always polled and written to the user's stderr, so git-
+ * upload-pack error messages aren't lost. */
+#define DRAIN_UNTIL_PKTLINE_FLUSH  1
+#define DRAIN_UNTIL_CLOSED         2
+
+static unsigned long drain_channel_until(u8 **out, u64 *out_len,
+                                         ssh_channel *ch, int mode) {
     buf b;
     u8 chunk[8192];
     u64 n;
     unsigned long rc;
+    int empty_strikes = 0;
+    const int MAX_EMPTY_STRIKES = 8;
 
     if (buf_create(&b, 8192)) return __LINE__;
 
     for (;;) {
+        int got_something = 0;
+
         rc = ssh_channel_read(&n, ch, chunk, sizeof(chunk));
-        if (rc) {
-            /* Channel closed / EOF is how we know the server finished.
-             * Treat any error as "done reading" — the accumulated buffer
-             * is what we have. */
-            break;
+        if (rc) break;
+        if (n > 0) {
+            if (buf_append(&b, chunk, n)) { buf_destroy(&b); return __LINE__; }
+            got_something = 1;
         }
-        if (n == 0) break;
-        if (buf_append(&b, chunk, n)) { buf_destroy(&b); return __LINE__; }
+
+        {
+            u64 en;
+            u8 echunk[1024];
+            if (ssh_channel_read_stderr(&en, ch, echunk, sizeof(echunk)) == 0 &&
+                en > 0) {
+                fwrite(echunk, 1, (size_t)en, stderr);
+                got_something = 1;
+            }
+        }
+
+        if (mode == DRAIN_UNTIL_PKTLINE_FLUSH) {
+            /* As soon as we see a complete pkt-line flush in the
+             * accumulated buffer, we're done with this phase — the
+             * server is now waiting for our wants/haves/done. */
+            if (has_pktline_flush(b.data, b.len)) break;
+        }
+
+        if (got_something) {
+            empty_strikes = 0;
+        } else {
+            if (++empty_strikes >= MAX_EMPTY_STRIKES) break;
+        }
     }
 
     *out = b.data;
     *out_len = b.len;
-    /* Ownership transfers to caller; don't destroy the buf. */
     return 0;
+}
+
+/* Back-compat wrapper used by the legacy code paths. New call sites
+ * should pass a mode explicitly. */
+static unsigned long drain_channel(u8 **out, u64 *out_len, ssh_channel *ch) {
+    return drain_channel_until(out, out_len, ch, DRAIN_UNTIL_CLOSED);
 }
 
 /* ====================================================================
@@ -689,9 +751,11 @@ unsigned long ssh_discover_refs(gut_remote_refs *out, const char *url) {
     rc = ssh_exec_open(&c, &ch, &u, cmd);
     if (rc) return __LINE__;
 
-    /* Send an immediate flush so the server knows we're done with this
-     * channel — it will write the advertisement + flush, then we close. */
-    rc = drain_channel(&body, &body_len, ch);
+    /* Read until we see the flush that terminates the refs
+     * advertisement. git-upload-pack then waits for our wants/haves
+     * — which ssh_fetch_pack_algo will send on a fresh channel. */
+    rc = drain_channel_until(&body, &body_len, ch,
+                             DRAIN_UNTIL_PKTLINE_FLUSH);
     if (rc == 0) rc = parse_ref_advertisement(out, body, body_len, &pos);
     free(body);
 
@@ -792,8 +856,9 @@ unsigned long ssh_fetch_pack_algo(const char *url,
     if (rc) goto out;
 
     /* Read the whole server response — advertisement, possibly ACK
-     * lines, then NAK + sideband-muxed pack. */
-    rc = drain_channel(&body, &body_len, ch);
+     * lines, then NAK + sideband-muxed pack. The pack data phase ends
+     * when the server closes its side of the channel. */
+    rc = drain_channel_until(&body, &body_len, ch, DRAIN_UNTIL_CLOSED);
     if (rc) goto out;
 
     /* Skip the refs advertisement (ends at the first flush packet). */
@@ -914,7 +979,8 @@ unsigned long ssh_discover_refs_for_push(gut_remote_refs *out, const char *url) 
     rc = ssh_exec_open(&c, &ch, &u, cmd);
     if (rc) return __LINE__;
 
-    rc = drain_channel(&body, &body_len, ch);
+    rc = drain_channel_until(&body, &body_len, ch,
+                             DRAIN_UNTIL_PKTLINE_FLUSH);
     if (rc == 0) rc = parse_ref_advertisement(out, body, body_len, &pos);
     free(body);
 

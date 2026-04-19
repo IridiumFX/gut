@@ -90,6 +90,22 @@ unsigned long ssh_last_kex_sub_hatch(unsigned long *out);
 
 unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,
                                               u8 *buf, u64 len);
+
+/* ssh_channel_read_stderr — drain bytes from the channel's stderr
+ * side buffer (populated by SSH_MSG_CHANNEL_EXTENDED_DATA with
+ * data_type_code = 1). Non-blocking: returns 0 with *bytes_read=0
+ * if nothing is buffered (does NOT pull a new packet, to avoid
+ * stealing stdout bytes from the main read loop).
+ *
+ * Typical use: after ssh_channel_read observes EOF or the command's
+ * exit status indicates failure, call this to surface whatever
+ * error text the remote side wrote to stderr.
+ *
+ * Hatches: 1=null bytes_read, 2=null ch, 3=null buf */
+unsigned long ssh_channel_read_stderr(u64 *bytes_read,
+                                                     ssh_channel *ch,
+                                                     u8 *buf, u64 len);
+
 unsigned long ssh_channel_write(u64 *bytes_written, ssh_channel *ch,
                                                const u8 *data, u64 len);
 
