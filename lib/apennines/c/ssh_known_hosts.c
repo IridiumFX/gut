@@ -1,22 +1,20 @@
 /*
- * OpenSSH known_hosts parser + pinning lookup.
+ * OpenSSH known_hosts parser + host-key pinning.
  *
- * Designed to run offline against `~/.ssh/known_hosts` without any
- * ssh connection state. Integrates with apennines' SSH client via
- * a verifier hook (once apennines exposes one) or by calling the
- * lookup after a connection's KEX completes and before any userauth
- * message is sent.
+ * Absorbed from gut (commit f77598e) — see mailbox `gut-for-apennines/`
+ * entry 2026-04-19 for the original. Renamed gut_khosts → ssh_khosts,
+ * dropped the gut/ includes in favour of apennines', switched
+ * __LINE__-style debug hatches to sequential numeric hatches.
  *
- * HMAC-SHA1 is implemented inline on top of gut's own SHA-1 (for git
- * OIDs) because apennines' hash module only exposes HMAC-SHA256/512.
- * OpenSSH's HashKnownHosts format specifically requires SHA-1 (the
- * leading "|1|" in hashed entries is a version marker pinning the
- * hash algorithm). ~50 lines of HMAC on top of existing SHA-1 is
- * cheaper than another round trip with apennines.
+ * HMAC-SHA1 is implemented inline. Our public hmac_create only
+ * exposes SHA-256/512; SHA-1 is needed solely for OpenSSH's
+ * HashKnownHosts format (the leading "|1|" pins the hash algorithm),
+ * and lives here rather than being promoted to t2/crypto because
+ * ws.c and otp.c also keep their own inline SHA-1 copies — the
+ * promotion can happen when a 4th consumer shows up.
  */
 
-#include "gut/known_hosts.h"
-#include "gut/sha1.h"
+#include "apennines/ssh_known_hosts.h"
 #include "apennines/base.h"
 #include "apennines/buf.h"
 
@@ -27,59 +25,145 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <direct.h>
-#define gut_mkdir(p) _mkdir(p)
+#define khosts_mkdir(p) _mkdir(p)
 #else
 #include <unistd.h>
-#define gut_mkdir(p) mkdir(p, 0755)
+#define khosts_mkdir(p) mkdir(p, 0755)
 #endif
 
 /* ====================================================================
- *  HMAC-SHA1 on top of gut/sha1.c
+ *  Inline SHA-1 (FIPS 180-4 §6.1) + HMAC-SHA1
  * ==================================================================== */
 
-#define HMAC_SHA1_BLOCK  GUT_SHA1_BLOCK_SIZE   /* 64 */
-#define HMAC_SHA1_DIGEST GUT_SHA1_DIGEST_SIZE  /* 20 */
+#define SHA1_BLOCK_SIZE  64
+#define SHA1_DIGEST_SIZE 20
 
-static unsigned long hmac_sha1(u8 *out,
-                               const u8 *key, u64 key_len,
-                               const u8 *data, u64 data_len) {
-    u8 k_prime[HMAC_SHA1_BLOCK];
-    u8 ipad[HMAC_SHA1_BLOCK];
-    u8 opad[HMAC_SHA1_BLOCK];
-    u8 inner[HMAC_SHA1_DIGEST];
-    sha1_ctx ctx;
+typedef struct {
+    u32 state[5];
+    u8  buf[SHA1_BLOCK_SIZE];
+    u32 buf_len;
+    u64 total_len;
+} sha1_ctx_t;
+
+static u32 sha1_rotl(u32 x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+static void sha1_compress(sha1_ctx_t *ctx, const u8 block[SHA1_BLOCK_SIZE]) {
+    u32 w[80];
+    u32 a, b, c, d, e;
+    int i;
+    for (i = 0; i < 16; i++) {
+        w[i] = ((u32)block[i*4] << 24) | ((u32)block[i*4+1] << 16) |
+               ((u32)block[i*4+2] << 8) | (u32)block[i*4+3];
+    }
+    for (i = 16; i < 80; i++) {
+        w[i] = sha1_rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    }
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2];
+    d = ctx->state[3]; e = ctx->state[4];
+    for (i = 0; i < 80; i++) {
+        u32 f, k;
+        if (i < 20)      { f = (b & c) | ((~b) & d);          k = 0x5A827999u; }
+        else if (i < 40) { f = b ^ c ^ d;                     k = 0x6ED9EBA1u; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d);   k = 0x8F1BBCDCu; }
+        else             { f = b ^ c ^ d;                     k = 0xCA62C1D6u; }
+        {
+            u32 temp = sha1_rotl(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = sha1_rotl(b, 30);
+            b = a;
+            a = temp;
+        }
+    }
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c;
+    ctx->state[3] += d; ctx->state[4] += e;
+}
+
+static void sha1_init(sha1_ctx_t *ctx) {
+    ctx->state[0] = 0x67452301u;
+    ctx->state[1] = 0xEFCDAB89u;
+    ctx->state[2] = 0x98BADCFEu;
+    ctx->state[3] = 0x10325476u;
+    ctx->state[4] = 0xC3D2E1F0u;
+    ctx->buf_len  = 0;
+    ctx->total_len = 0;
+}
+
+static void sha1_update(sha1_ctx_t *ctx, const u8 *data, u64 len) {
+    ctx->total_len += len;
+    while (len > 0) {
+        u32 space = SHA1_BLOCK_SIZE - ctx->buf_len;
+        u32 take = (len < space) ? (u32)len : space;
+        memcpy(ctx->buf + ctx->buf_len, data, take);
+        ctx->buf_len += take;
+        data += take;
+        len  -= take;
+        if (ctx->buf_len == SHA1_BLOCK_SIZE) {
+            sha1_compress(ctx, ctx->buf);
+            ctx->buf_len = 0;
+        }
+    }
+}
+
+static void sha1_final(sha1_ctx_t *ctx, u8 digest[SHA1_DIGEST_SIZE]) {
+    u64 bit_len = ctx->total_len * 8;
+    u8 pad = 0x80;
+    int i;
+    sha1_update(ctx, &pad, 1);
+    pad = 0x00;
+    while (ctx->buf_len != SHA1_BLOCK_SIZE - 8) {
+        sha1_update(ctx, &pad, 1);
+    }
+    for (i = 7; i >= 0; i--) {
+        u8 b = (u8)(bit_len >> (i * 8));
+        sha1_update(ctx, &b, 1);
+    }
+    for (i = 0; i < 5; i++) {
+        digest[i*4]   = (u8)(ctx->state[i] >> 24);
+        digest[i*4+1] = (u8)(ctx->state[i] >> 16);
+        digest[i*4+2] = (u8)(ctx->state[i] >> 8);
+        digest[i*4+3] = (u8)(ctx->state[i]);
+    }
+}
+
+static void hmac_sha1(u8 *out,
+                      const u8 *key, u64 key_len,
+                      const u8 *data, u64 data_len) {
+    u8 k_prime[SHA1_BLOCK_SIZE];
+    u8 ipad[SHA1_BLOCK_SIZE];
+    u8 opad[SHA1_BLOCK_SIZE];
+    u8 inner[SHA1_DIGEST_SIZE];
+    sha1_ctx_t ctx;
     u64 i;
 
-    /* Reduce oversized keys via SHA-1, pad short keys with zeros. */
     memset(k_prime, 0, sizeof(k_prime));
-    if (key_len > HMAC_SHA1_BLOCK) {
+    if (key_len > SHA1_BLOCK_SIZE) {
         sha1_init(&ctx);
         sha1_update(&ctx, key, key_len);
-        sha1_final(k_prime, &ctx);
+        sha1_final(&ctx, k_prime);
     } else {
         memcpy(k_prime, key, (size_t)key_len);
     }
 
-    for (i = 0; i < HMAC_SHA1_BLOCK; i++) {
+    for (i = 0; i < SHA1_BLOCK_SIZE; i++) {
         ipad[i] = (u8)(k_prime[i] ^ 0x36);
         opad[i] = (u8)(k_prime[i] ^ 0x5c);
     }
 
-    /* inner = SHA1(ipad || data) */
     sha1_init(&ctx);
-    sha1_update(&ctx, ipad, HMAC_SHA1_BLOCK);
+    sha1_update(&ctx, ipad, SHA1_BLOCK_SIZE);
     sha1_update(&ctx, data, data_len);
-    sha1_final(inner, &ctx);
+    sha1_final(&ctx, inner);
 
-    /* out = SHA1(opad || inner) */
     sha1_init(&ctx);
-    sha1_update(&ctx, opad, HMAC_SHA1_BLOCK);
-    sha1_update(&ctx, inner, HMAC_SHA1_DIGEST);
-    sha1_final(out, &ctx);
-
-    return 0;
+    sha1_update(&ctx, opad, SHA1_BLOCK_SIZE);
+    sha1_update(&ctx, inner, SHA1_DIGEST_SIZE);
+    sha1_final(&ctx, out);
 }
 
 /* ====================================================================
@@ -87,8 +171,8 @@ static unsigned long hmac_sha1(u8 *out,
  * ==================================================================== */
 
 typedef enum {
-    ENTRY_NORMAL       = 0,
-    ENTRY_REVOKED      = 1,
+    ENTRY_NORMAL         = 0,
+    ENTRY_REVOKED        = 1,
     ENTRY_CERT_AUTHORITY = 2
 } entry_kind;
 
@@ -97,25 +181,24 @@ typedef enum {
     KEY_OTHER   = 2
 } key_kind;
 
-/* A single pattern from the comma-separated host list. */
 typedef struct {
-    char   *pattern;   /* heap-alloc'd, NUL-terminated */
-    int     negated;   /* 1 if originally prefixed with '!' */
-    int     hashed;    /* 1 if this is a "|1|salt|hmac" entry */
-    u8      salt[64];  /* HMAC-SHA1 salt (base64-decoded); valid if hashed */
+    char   *pattern;                    /* heap-alloc'd, NUL-terminated */
+    int     negated;                    /* 1 if prefixed with '!' */
+    int     hashed;                     /* 1 if this is a "|1|salt|hmac" entry */
+    u8      salt[64];                   /* HMAC-SHA1 salt; valid if hashed */
     u64     salt_len;
-    u8      hmac[HMAC_SHA1_DIGEST];   /* valid if hashed */
+    u8      hmac[SHA1_DIGEST_SIZE];     /* valid if hashed */
 } pattern_t;
 
 typedef struct {
-    entry_kind   kind;
-    key_kind     key;
-    pattern_t   *patterns;
-    u64          pattern_count;
-    u8           ed25519_pub[32];   /* valid if key == KEY_ED25519 */
+    entry_kind  kind;
+    key_kind    key;
+    pattern_t  *patterns;
+    u64         pattern_count;
+    u8          ed25519_pub[32];        /* valid if key == KEY_ED25519 */
 } entry_t;
 
-struct gut_khosts {
+struct ssh_khosts {
     entry_t *entries;
     u64      count;
     u64      capacity;
@@ -137,7 +220,7 @@ static void entry_destroy(entry_t *e) {
     memset(e, 0, sizeof(*e));
 }
 
-unsigned long khosts_close(gut_khosts *k) {
+unsigned long ssh_khosts_close(ssh_khosts *k) {
     u64 i;
     if (!k) return 0;
     for (i = 0; i < k->count; i++) entry_destroy(&k->entries[i]);
@@ -152,14 +235,11 @@ unsigned long khosts_close(gut_khosts *k) {
 
 static int is_hspace(char c) { return c == ' ' || c == '\t'; }
 
-/* Consume whitespace at p. */
 static const char *skip_hspace(const char *p) {
     while (*p && is_hspace(*p)) p++;
     return p;
 }
 
-/* Scan a whitespace-delimited field. Returns pointer past the field,
- * writes start/len into out args. */
 static const char *read_field(const char **start_out, u64 *len_out,
                               const char *p) {
     const char *start;
@@ -171,7 +251,6 @@ static const char *read_field(const char **start_out, u64 *len_out,
     return p;
 }
 
-/* ASCII-lowercase a hostname in place (up to len bytes). */
 static void ascii_lower(char *s, u64 len) {
     u64 i;
     for (i = 0; i < len; i++) {
@@ -183,8 +262,8 @@ static void ascii_lower(char *s, u64 len) {
  *  Pattern matching
  * ==================================================================== */
 
-/* fnmatch-subset: * matches any run of chars (no /), ? matches one.
- * Hostnames don't contain '/', so the simpler * suffices. */
+/* fnmatch-subset: * matches any run of chars, ? matches one. Hostnames
+ * don't contain '/', so the simpler form suffices. */
 static int glob_match(const char *pat, const char *s) {
     const char *star = NULL;
     const char *ss = NULL;
@@ -209,20 +288,17 @@ static int glob_match(const char *pat, const char *s) {
     return *pat == 0;
 }
 
-/* Does `name` (already lowercase) match the pattern entry? For hashed
- * patterns, computes HMAC-SHA1(salt, name) and compares against the
- * stored hmac. */
 static int pattern_matches(const pattern_t *p, const char *name) {
     if (p->hashed) {
-        u8 got[HMAC_SHA1_DIGEST];
+        u8 got[SHA1_DIGEST_SIZE];
         hmac_sha1(got, p->salt, p->salt_len,
                   (const u8 *)name, strlen(name));
-        return memcmp(got, p->hmac, HMAC_SHA1_DIGEST) == 0;
+        return memcmp(got, p->hmac, SHA1_DIGEST_SIZE) == 0;
     }
     return glob_match(p->pattern, name);
 }
 
-/* Build the match key for a host+port pair:
+/* Build the OpenSSH-convention match name for (host, port):
  *   port == 22:  "host"
  *   otherwise:   "[host]:port"
  * OpenSSH hashes the "[host]:port" form when the port is non-default,
@@ -237,8 +313,6 @@ static void build_match_name(char *out, u64 out_size,
     ascii_lower(out, strlen(out));
 }
 
-/* Check whether the entry as a whole matches the host. Returns 1 if
- * any non-negated pattern matches AND no negated pattern matches. */
 static int entry_matches_host(const entry_t *e,
                               const char *plain_name,
                               const char *bracketed_name) {
@@ -246,13 +320,9 @@ static int entry_matches_host(const entry_t *e,
     u64 i;
     for (i = 0; i < e->pattern_count; i++) {
         const pattern_t *p = &e->patterns[i];
-        /* For hashed patterns, we always test against bracketed_name
-         * (OpenSSH's convention when the port differs) and plain when
-         * it matches. We try both, cheap. */
         int this_hit = 0;
         if (pattern_matches(p, plain_name)) this_hit = 1;
         if (!this_hit && pattern_matches(p, bracketed_name)) this_hit = 1;
-
         if (!this_hit) continue;
         if (p->negated) return 0;
         any_pos = 1;
@@ -264,20 +334,16 @@ static int entry_matches_host(const entry_t *e,
  *  Line parsing
  * ==================================================================== */
 
-/* Parse a single pattern (one element from a comma-separated list)
- * into a pattern_t. The pattern text is `text`, length `text_len`.
- * Handles the leading '!' for negation and the "|1|salt|hmac"
- * hashed form. */
 static unsigned long parse_pattern(pattern_t *out,
                                    const char *text, u64 text_len) {
     char *pat_str;
     memset(out, 0, sizeof(*out));
-    if (text_len == 0) return __LINE__;
+    if (text_len == 0) return 1;
 
     if (text[0] == '!') {
         out->negated = 1;
         text++; text_len--;
-        if (text_len == 0) return __LINE__;
+        if (text_len == 0) return 2;
     }
 
     if (text_len >= 3 && text[0] == '|' && text[1] == '1' && text[2] == '|') {
@@ -286,45 +352,38 @@ static unsigned long parse_pattern(pattern_t *out,
         const char *p = text + 3;
         const char *end = text + text_len;
         const char *bar = memchr(p, '|', (size_t)(end - p));
-        if (!bar) return __LINE__;
-        {
-            /* salt = base64-decode(p .. bar) */
-            if (buf_create(&salt_buf, 64)) return __LINE__;
-            if (base64_decode(&salt_buf, (u8 *)p, (u64)(bar - p))) {
-                buf_destroy(&salt_buf);
-                return __LINE__;
-            }
-            if (salt_buf.len > sizeof(out->salt)) {
-                buf_destroy(&salt_buf);
-                return __LINE__;
-            }
-            memcpy(out->salt, salt_buf.data, (size_t)salt_buf.len);
-            out->salt_len = salt_buf.len;
+        if (!bar) return 3;
+        if (buf_create(&salt_buf, 64)) return 4;
+        if (base64_decode(&salt_buf, (u8 *)p, (u64)(bar - p))) {
             buf_destroy(&salt_buf);
+            return 5;
         }
-        {
-            /* hmac = base64-decode(bar+1 .. end) */
-            if (buf_create(&hmac_buf, 32)) return __LINE__;
-            if (base64_decode(&hmac_buf, (u8 *)(bar + 1),
-                              (u64)(end - (bar + 1)))) {
-                buf_destroy(&hmac_buf);
-                return __LINE__;
-            }
-            if (hmac_buf.len != HMAC_SHA1_DIGEST) {
-                buf_destroy(&hmac_buf);
-                return __LINE__;
-            }
-            memcpy(out->hmac, hmac_buf.data, HMAC_SHA1_DIGEST);
+        if (salt_buf.len > sizeof(out->salt)) {
+            buf_destroy(&salt_buf);
+            return 6;
+        }
+        memcpy(out->salt, salt_buf.data, (size_t)salt_buf.len);
+        out->salt_len = salt_buf.len;
+        buf_destroy(&salt_buf);
+
+        if (buf_create(&hmac_buf, 32)) return 7;
+        if (base64_decode(&hmac_buf, (u8 *)(bar + 1),
+                          (u64)(end - (bar + 1)))) {
             buf_destroy(&hmac_buf);
+            return 8;
         }
+        if (hmac_buf.len != SHA1_DIGEST_SIZE) {
+            buf_destroy(&hmac_buf);
+            return 9;
+        }
+        memcpy(out->hmac, hmac_buf.data, SHA1_DIGEST_SIZE);
+        buf_destroy(&hmac_buf);
         out->hashed = 1;
-        /* pattern string kept NULL — hashed entries never use glob */
         return 0;
     }
 
-    /* Plain pattern: copy + lowercase. */
     pat_str = (char *)malloc((size_t)text_len + 1);
-    if (!pat_str) return __LINE__;
+    if (!pat_str) return 10;
     memcpy(pat_str, text, (size_t)text_len);
     pat_str[text_len] = '\0';
     ascii_lower(pat_str, text_len);
@@ -332,8 +391,6 @@ static unsigned long parse_pattern(pattern_t *out,
     return 0;
 }
 
-/* Parse a comma-separated pattern list. Allocates and fills
- * `out_patterns` + `out_count`. */
 static unsigned long parse_pattern_list(pattern_t **out_patterns,
                                         u64 *out_count,
                                         const char *text, u64 text_len) {
@@ -357,7 +414,7 @@ static unsigned long parse_pattern_list(pattern_t **out_patterns,
                         u64 k;
                         for (k = 0; k < n; k++) pattern_destroy(&arr[k]);
                         free(arr);
-                        return __LINE__;
+                        return 1;
                     }
                     arr = grown;
                     cap = new_cap;
@@ -366,18 +423,13 @@ static unsigned long parse_pattern_list(pattern_t **out_patterns,
             }
             /* bad patterns skipped silently — be liberal in what we accept */
         }
-        i = j + 1;  /* skip the comma or run past end */
+        i = j + 1;
     }
     *out_patterns = arr;
     *out_count = n;
     return 0;
 }
 
-/* Parse the "ssh-ed25519 <base64>" portion. Writes the 32-byte
- * pubkey into `out32` and returns KEY_ED25519 on success. Other
- * key types return KEY_OTHER (caller stores the entry as KEY_OTHER
- * so it still participates in @revoked matching but is skipped by
- * ed25519 lookups). */
 static key_kind parse_key_blob(u8 *out32,
                                const char *type_str, u64 type_len,
                                const char *b64_str, u64 b64_len) {
@@ -390,7 +442,6 @@ static key_kind parse_key_blob(u8 *out32,
         buf_destroy(&decoded);
         return KEY_OTHER;
     }
-    /* Decoded blob: string "ssh-ed25519" (4+11) + string pub(4+32). */
     if (decoded.len < 4 + 11 + 4 + 32) {
         buf_destroy(&decoded);
         return KEY_OTHER;
@@ -416,20 +467,15 @@ static key_kind parse_key_blob(u8 *out32,
     return KEY_ED25519;
 }
 
-/* Parse one non-empty, non-comment line into an entry. Returns 0 on
- * success even for KEY_OTHER entries (they're kept for @revoked
- * matching). Returns non-zero only if the pattern list fails to
- * parse or alloc fails. */
 static unsigned long parse_line(entry_t *out, const char *line, u64 line_len) {
     const char *p = line;
-    const char *end = line + line_len;
+    const char *end;
     const char *field_s;
     u64 field_l;
     entry_kind kind = ENTRY_NORMAL;
 
     memset(out, 0, sizeof(*out));
 
-    /* Strip trailing LF/CR and trailing whitespace first. */
     while (line_len > 0 && (line[line_len - 1] == '\n' ||
                             line[line_len - 1] == '\r' ||
                             line[line_len - 1] == ' ' ||
@@ -440,9 +486,8 @@ static unsigned long parse_line(entry_t *out, const char *line, u64 line_len) {
     p = line;
     p = skip_hspace(p);
 
-    if (p >= end || *p == '#' || *p == '\0') return __LINE__; /* empty/comment */
+    if (p >= end || *p == '#' || *p == '\0') return 1;
 
-    /* Optional @marker prefix. */
     if (p < end && *p == '@') {
         const char *start = p;
         while (p < end && !is_hspace(*p)) p++;
@@ -453,56 +498,48 @@ static unsigned long parse_line(entry_t *out, const char *line, u64 line_len) {
             } else if (mlen == 15 && memcmp(start, "@cert-authority", 15) == 0) {
                 kind = ENTRY_CERT_AUTHORITY;
             } else {
-                return __LINE__; /* unknown marker */
+                return 2;
             }
         }
     }
 
-    /* patterns */
     p = read_field(&field_s, &field_l, p);
-    if (field_l == 0) return __LINE__;
+    if (field_l == 0) return 3;
     if (parse_pattern_list(&out->patterns, &out->pattern_count,
-                           field_s, field_l)) return __LINE__;
-    if (out->pattern_count == 0) return __LINE__;
+                           field_s, field_l)) return 4;
+    if (out->pattern_count == 0) return 5;
 
-    /* key type */
     {
         const char *type_s;
         u64 type_l;
         p = read_field(&type_s, &type_l, p);
-        if (type_l == 0) goto bad;
+        if (type_l == 0) { entry_destroy(out); return 6; }
 
-        /* key blob (base64) */
         {
             const char *b64_s;
             u64 b64_l;
             p = read_field(&b64_s, &b64_l, p);
-            if (b64_l == 0) goto bad;
+            if (b64_l == 0) { entry_destroy(out); return 7; }
 
             out->kind = kind;
             out->key = parse_key_blob(out->ed25519_pub,
                                       type_s, type_l, b64_s, b64_l);
-            /* Comment field (if any) ignored. */
         }
     }
 
     return 0;
-
-bad:
-    entry_destroy(out);
-    return __LINE__;
 }
 
 /* ====================================================================
  *  File loading
  * ==================================================================== */
 
-static unsigned long append_entry(gut_khosts *k, entry_t *e) {
+static unsigned long append_entry(ssh_khosts *k, entry_t *e) {
     if (k->count == k->capacity) {
         u64 new_cap = k->capacity ? k->capacity * 2 : 32;
         entry_t *grown = (entry_t *)realloc(k->entries,
                                             (size_t)new_cap * sizeof(entry_t));
-        if (!grown) return __LINE__;
+        if (!grown) return 1;
         k->entries = grown;
         k->capacity = new_cap;
     }
@@ -510,22 +547,20 @@ static unsigned long append_entry(gut_khosts *k, entry_t *e) {
     return 0;
 }
 
-unsigned long khosts_open(gut_khosts **out, const char *path) {
+unsigned long ssh_khosts_open(ssh_khosts **out, const char *path) {
     FILE *fp;
     char line[4096];
-    gut_khosts *k;
+    ssh_khosts *k;
 
-    if (!out) return __LINE__;
+    if (!out) return 1;
     *out = NULL;
 
-    k = (gut_khosts *)calloc(1, sizeof(gut_khosts));
-    if (!k) return __LINE__;
+    k = (ssh_khosts *)calloc(1, sizeof(ssh_khosts));
+    if (!k) return 2;
 
     fp = fopen(path, "rb");
     if (!fp) {
-        /* Missing file is a normal, non-error condition: zero entries,
-         * all lookups return UNKNOWN. Users bootstrap known_hosts by
-         * pinning on first connect. */
+        /* Missing file: empty entry set, every lookup returns UNKNOWN. */
         *out = k;
         return 0;
     }
@@ -537,8 +572,8 @@ unsigned long khosts_open(gut_khosts **out, const char *path) {
             if (append_entry(k, &e) != 0) {
                 entry_destroy(&e);
                 fclose(fp);
-                khosts_close(k);
-                return __LINE__;
+                ssh_khosts_close(k);
+                return 3;
             }
         }
         /* malformed / comment / empty — skip */
@@ -553,44 +588,36 @@ unsigned long khosts_open(gut_khosts **out, const char *path) {
  *  Lookup
  * ==================================================================== */
 
-unsigned long khosts_lookup_ed25519(gut_khosts_match *match_out,
-                                    gut_khosts *k,
-                                    const char *host,
-                                    u16 port,
-                                    const u8 *server_pub) {
+unsigned long ssh_khosts_lookup_ed25519(ssh_khosts_match *match_out,
+                                                       ssh_khosts *k,
+                                                       const char *host,
+                                                       u16 port,
+                                                       const u8 *server_pub) {
     char plain[512];
     char bracketed[520];
-    int any_matched_host = 0;
     int pinned_hit = 0;
     int mismatch_hit = 0;
     u64 i;
 
-    if (!match_out) return __LINE__;
-    if (!k) { *match_out = KHOSTS_MATCH_UNKNOWN; return 0; }
-    if (!host) return __LINE__;
-    if (!server_pub) return __LINE__;
+    if (!match_out) return 1;
+    if (!host) return 2;
+    if (!server_pub) return 3;
+    if (!k) { *match_out = SSH_KHOSTS_MATCH_UNKNOWN; return 0; }
 
-    /* Build both forms: plain name matches entries that don't pin
-     * a port; "[host]:port" matches port-specific entries. When the
-     * port is 22, both forms are the same bare hostname. */
     build_match_name(plain, sizeof(plain), host, 22);
     build_match_name(bracketed, sizeof(bracketed), host, port);
 
     for (i = 0; i < k->count; i++) {
         entry_t *e = &k->entries[i];
         if (!entry_matches_host(e, plain, bracketed)) continue;
-        any_matched_host = 1;
 
-        /* @revoked is terminal: even if the pubkey differs, the host
-         * is blacklisted. */
         if (e->kind == ENTRY_REVOKED) {
-            *match_out = KHOSTS_MATCH_REVOKED;
+            *match_out = SSH_KHOSTS_MATCH_REVOKED;
             return 0;
         }
 
-        if (e->kind == ENTRY_CERT_AUTHORITY) continue;   /* skip — we don't do SSH certs */
-
-        if (e->key != KEY_ED25519) continue;   /* RSA/ECDSA ignored for ed25519 lookups */
+        if (e->kind == ENTRY_CERT_AUTHORITY) continue;
+        if (e->key != KEY_ED25519) continue;
 
         if (memcmp(e->ed25519_pub, server_pub, 32) == 0) {
             pinned_hit = 1;
@@ -599,10 +626,9 @@ unsigned long khosts_lookup_ed25519(gut_khosts_match *match_out,
         }
     }
 
-    if (pinned_hit) { *match_out = KHOSTS_MATCH_PINNED; return 0; }
-    if (mismatch_hit) { *match_out = KHOSTS_MATCH_MISMATCH; return 0; }
-    *match_out = any_matched_host ? KHOSTS_MATCH_UNKNOWN
-                                  : KHOSTS_MATCH_UNKNOWN;
+    if (pinned_hit) { *match_out = SSH_KHOSTS_MATCH_PINNED; return 0; }
+    if (mismatch_hit) { *match_out = SSH_KHOSTS_MATCH_MISMATCH; return 0; }
+    *match_out = SSH_KHOSTS_MATCH_UNKNOWN;
     return 0;
 }
 
@@ -614,69 +640,68 @@ static unsigned long mkdirs_for(const char *path) {
     char parent[2048];
     u64 plen;
     const char *slash;
-    /* Find the last slash so we know the parent directory. */
+
     slash = strrchr(path, '/');
     if (!slash) slash = strrchr(path, '\\');
-    if (!slash) return 0;  /* no parent to create */
+    if (!slash) return 0;
     plen = (u64)(slash - path);
-    if (plen >= sizeof(parent)) return __LINE__;
+    if (plen >= sizeof(parent)) return 1;
     memcpy(parent, path, (size_t)plen);
     parent[plen] = '\0';
 
-    /* Walk and mkdir each segment. */
     {
         u64 i;
         for (i = 1; i < plen; i++) {
             if (parent[i] == '/' || parent[i] == '\\') {
                 char saved = parent[i];
                 parent[i] = '\0';
-                (void)gut_mkdir(parent);
+                (void)khosts_mkdir(parent);
                 parent[i] = saved;
             }
         }
-        (void)gut_mkdir(parent);
+        (void)khosts_mkdir(parent);
     }
     return 0;
 }
 
-unsigned long khosts_append_ed25519(const char *path,
-                                    const char *host,
-                                    u16 port,
-                                    const u8 *server_pub) {
-    buf wire;      /* SSH wire blob: string("ssh-ed25519") || string(pub) */
+unsigned long ssh_khosts_append_ed25519(const char *path,
+                                                       const char *host,
+                                                       u16 port,
+                                                       const u8 *server_pub) {
+    buf wire;
     buf b64;
     FILE *fp;
-    unsigned long rc;
 
-    if (!path || !host || !server_pub) return __LINE__;
+    if (!path) return 1;
+    if (!host) return 2;
+    if (!server_pub) return 3;
 
-    rc = mkdirs_for(path);
-    if (rc) return __LINE__;
+    if (mkdirs_for(path) != 0) return 4;
 
-    if (buf_create(&wire, 64)) return __LINE__;
+    if (buf_create(&wire, 64)) return 5;
     {
         u8 hdr[4];
         u32 n = 11;  /* strlen("ssh-ed25519") */
         hdr[0] = (u8)(n >> 24); hdr[1] = (u8)(n >> 16);
         hdr[2] = (u8)(n >> 8);  hdr[3] = (u8)n;
         buf_append(&wire, hdr, 4);
-        buf_append(&wire, (const u8 *)"ssh-ed25519", 11);
+        buf_append(&wire, (u8 *)"ssh-ed25519", 11);
         n = 32;
         hdr[0] = (u8)(n >> 24); hdr[1] = (u8)(n >> 16);
         hdr[2] = (u8)(n >> 8);  hdr[3] = (u8)n;
         buf_append(&wire, hdr, 4);
-        buf_append(&wire, server_pub, 32);
+        buf_append(&wire, (u8 *)server_pub, 32);
     }
 
-    if (buf_create(&b64, 128)) { buf_destroy(&wire); return __LINE__; }
+    if (buf_create(&b64, 128)) { buf_destroy(&wire); return 5; }
     if (base64_encode(&b64, wire.data, wire.len)) {
         buf_destroy(&wire); buf_destroy(&b64);
-        return __LINE__;
+        return 5;
     }
     buf_destroy(&wire);
 
     fp = fopen(path, "ab");
-    if (!fp) { buf_destroy(&b64); return __LINE__; }
+    if (!fp) { buf_destroy(&b64); return 4; }
     if (port == 22) {
         fprintf(fp, "%s ssh-ed25519 %.*s\n",
                 host, (int)b64.len, (const char *)b64.data);
@@ -693,7 +718,7 @@ unsigned long khosts_append_ed25519(const char *path,
  *  Default path resolver
  * ==================================================================== */
 
-unsigned long khosts_default_path(char *out, u64 out_size) {
+unsigned long ssh_khosts_default_path(char *out, u64 out_size) {
     const char *home = getenv("HOME");
 #ifdef _WIN32
     char home_buf[1024];
@@ -712,10 +737,10 @@ unsigned long khosts_default_path(char *out, u64 out_size) {
         }
     }
 #endif
-    if (!home) return __LINE__;
+    if (!out) return 1;
+    if (!home) return 2;
     if ((u64)snprintf(out, (size_t)out_size, "%s/.ssh/known_hosts", home)
-        >= out_size) return __LINE__;
-    /* Normalize backslashes. */
+        >= out_size) return 3;
     {
         char *p;
         for (p = out; *p; p++) if (*p == '\\') *p = '/';

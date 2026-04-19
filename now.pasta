@@ -39,6 +39,7 @@
       "lib/apennines/c/rsa.c",
       "lib/apennines/c/secret.c",
       "lib/apennines/c/ssh.c",
+      "lib/apennines/c/ssh_known_hosts.c",
       "lib/apennines/c/tcp.c",
       "lib/apennines/c/tls.c",
       "lib/apennines/c/uds.c",

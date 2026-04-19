@@ -9,7 +9,7 @@
 #include "gut/leech.h"
 #include "gut/login.h"
 #include "gut/submodule.h"
-#include "gut/known_hosts.h"
+#include "apennines/ssh_known_hosts.h"
 #include "gut/cred_helper.h"
 #include <dirent.h>
 #include "apennines/diff.h"
@@ -7500,13 +7500,13 @@ static int cmd_credential_test(int argc, char **argv) {
 }
 
 static int cmd_khosts_check(int argc, char **argv) {
-    gut_khosts *k = NULL;
+    ssh_khosts *k = NULL;
     char path[1024];
     const char *host;
     u16 port = 22;
     const char *hex;
     u8 pub[32];
-    gut_khosts_match m;
+    ssh_khosts_match m;
     unsigned long rc;
     const char *env;
     int i;
@@ -7544,38 +7544,38 @@ static int cmd_khosts_check(int argc, char **argv) {
     if (env) {
         snprintf(path, sizeof(path), "%s", env);
     } else {
-        rc = khosts_default_path(path, sizeof(path));
+        rc = ssh_khosts_default_path(path, sizeof(path));
         if (rc) {
             fprintf(stderr, "error: cannot resolve ~/.ssh/known_hosts\n");
             return 1;
         }
     }
 
-    rc = khosts_open(&k, path);
+    rc = ssh_khosts_open(&k, path);
     if (rc) {
-        fprintf(stderr, "error: khosts_open failed (line %lu)\n", rc);
+        fprintf(stderr, "error: ssh_khosts_open failed (line %lu)\n", rc);
         return 1;
     }
 
-    rc = khosts_lookup_ed25519(&m, k, host, port, pub);
-    khosts_close(k);
+    rc = ssh_khosts_lookup_ed25519(&m, k, host, port, pub);
+    ssh_khosts_close(k);
     if (rc) {
-        fprintf(stderr, "error: khosts_lookup_ed25519 failed (line %lu)\n", rc);
+        fprintf(stderr, "error: ssh_khosts_lookup_ed25519 failed (line %lu)\n", rc);
         return 1;
     }
 
     switch (m) {
-        case KHOSTS_MATCH_PINNED:
+        case SSH_KHOSTS_MATCH_PINNED:
             printf("PINNED   %s:%u  (known, key matches)\n", host, port);
             return 0;
-        case KHOSTS_MATCH_MISMATCH:
+        case SSH_KHOSTS_MATCH_MISMATCH:
             printf("MISMATCH %s:%u  (known, key DIFFERS — possible MITM)\n",
                    host, port);
             return 2;
-        case KHOSTS_MATCH_REVOKED:
+        case SSH_KHOSTS_MATCH_REVOKED:
             printf("REVOKED  %s:%u  (entry explicitly @revoked)\n", host, port);
             return 3;
-        case KHOSTS_MATCH_UNKNOWN:
+        case SSH_KHOSTS_MATCH_UNKNOWN:
         default:
             printf("UNKNOWN  %s:%u  (no ed25519 entry — TOFU on first use)\n",
                    host, port);

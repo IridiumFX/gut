@@ -16,7 +16,7 @@
  */
 
 #include "gut/remote.h"
-#include "gut/known_hosts.h"
+#include "apennines/ssh_known_hosts.h"
 #include "apennines/ssh.h"
 #include "apennines/buf.h"
 #include "apennines/pem.h"
@@ -520,7 +520,7 @@ static unsigned long drain_channel(u8 **out, u64 *out_len, ssh_channel *ch) {
  * opt-in TOFU flag (when set, unknown hosts are accepted on first
  * use and appended to the known_hosts file). */
 typedef struct {
-    gut_khosts *khosts;
+    ssh_khosts *khosts;
     char        path[1024];   /* known_hosts path we loaded from */
     int         tofu_accept;  /* non-zero → accept UNKNOWN and append */
     int         verbose;
@@ -536,7 +536,7 @@ typedef struct {
 static unsigned long gut_ssh_verifier(void *ctx, const char *host, u16 port,
                                       const u8 *hostkey_blob, u64 blob_len) {
     verify_ctx_t *v = (verify_ctx_t *)ctx;
-    gut_khosts_match m;
+    ssh_khosts_match m;
     const u8 *pub;
 
     if (!v || !v->khosts) return 0;  /* no pinning configured → accept */
@@ -560,17 +560,17 @@ static unsigned long gut_ssh_verifier(void *ctx, const char *host, u16 port,
     }
     pub = hostkey_blob + 4 + 11 + 4;
 
-    if (khosts_lookup_ed25519(&m, v->khosts, host, port, pub) != 0) {
-        fprintf(stderr, "error: khosts_lookup_ed25519 failed\n");
+    if (ssh_khosts_lookup_ed25519(&m, v->khosts, host, port, pub) != 0) {
+        fprintf(stderr, "error: ssh_khosts_lookup_ed25519 failed\n");
         return 1;
     }
 
     switch (m) {
-        case KHOSTS_MATCH_PINNED:
+        case SSH_KHOSTS_MATCH_PINNED:
             if (v->verbose)
                 fprintf(stderr, "[ssh] host key PINNED for %s:%u\n", host, port);
             return 0;
-        case KHOSTS_MATCH_MISMATCH:
+        case SSH_KHOSTS_MATCH_MISMATCH:
             fprintf(stderr,
                 "error: host key mismatch for %s:%u — possible MITM, "
                 "refusing connection\n", host, port);
@@ -578,19 +578,19 @@ static unsigned long gut_ssh_verifier(void *ctx, const char *host, u16 port,
                 "  if the remote legitimately rotated its key, remove the "
                 "old entry from %s first\n", v->path);
             return 2;
-        case KHOSTS_MATCH_REVOKED:
+        case SSH_KHOSTS_MATCH_REVOKED:
             fprintf(stderr,
                 "error: host key for %s:%u is @revoked — refusing connection\n",
                 host, port);
             return 3;
-        case KHOSTS_MATCH_UNKNOWN:
+        case SSH_KHOSTS_MATCH_UNKNOWN:
         default:
             if (v->tofu_accept) {
                 if (v->verbose || 1)
                     fprintf(stderr,
                         "warning: unknown host %s:%u — pinning key on first use\n",
                         host, port);
-                (void)khosts_append_ed25519(v->path, host, port, pub);
+                (void)ssh_khosts_append_ed25519(v->path, host, port, pub);
                 return 0;
             }
             fprintf(stderr,
@@ -614,7 +614,7 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
     ssh_channel *ch = NULL;
     unsigned long rc;
     verify_ctx_t vctx;
-    gut_khosts *k = NULL;
+    ssh_khosts *k = NULL;
 
     /* Key-file path is opt-in for testing: only try to load a seed
      * from disk if the caller explicitly pointed us at one. Otherwise
@@ -640,11 +640,11 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
         const char *override = getenv("GUT_KHOSTS_FILE");
         if (override) {
             snprintf(vctx.path, sizeof(vctx.path), "%s", override);
-        } else if (khosts_default_path(vctx.path, sizeof(vctx.path)) != 0) {
+        } else if (ssh_khosts_default_path(vctx.path, sizeof(vctx.path)) != 0) {
             vctx.path[0] = '\0';
         }
         if (vctx.path[0]) {
-            if (khosts_open(&k, vctx.path) == 0) {
+            if (ssh_khosts_open(&k, vctx.path) == 0) {
                 vctx.khosts = k;
                 if (verbose)
                     fprintf(stderr, "[ssh] loaded known_hosts from %s\n", vctx.path);
@@ -685,10 +685,10 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                     "%s — host=%s port=%u\n",
                     rc, sub, where, u->host, u->port);
         }
-        khosts_close(k);
+        ssh_khosts_close(k);
         return __LINE__;
     }
-    khosts_close(k);
+    ssh_khosts_close(k);
     vctx.khosts = NULL;
     if (have_seed) {
         /* Since apennines 000129, ssh_conn_auth_pubkey accepts either
