@@ -183,13 +183,26 @@ not just a command glued on top of existing primitives.
       HTTP for lazy resolution, `pack_index.v3`-style marking of
       missing objects.
 
-- [ ] **Credential helpers** — the standard
-      `credential.helper` protocol (`helper get/store/erase` via
-      stdin/stdout). Currently `gut login` uses OIDC device flow to
-      write to its own credential store; what's missing is cooperating
-      with the system keychain helpers (`manager-core` on Windows,
-      `osxkeychain` on Mac, `libsecret` on Linux) so users who already
-      have git-credentials cached don't re-authenticate.
+- [x] **Credential helpers** (get side; MVP). New
+      `src/main/c/cred_helper.c` + header: spawns
+      `git-credential-<name> get` over a bidirectional pipe
+      (CreateProcess on Windows, fork/exec on POSIX), feeds the
+      `protocol/host/path/username` key=value payload on stdin,
+      parses `username=/password=` from stdout. Helper name
+      resolution mirrors git: absolute path → direct, bare name →
+      `git-credential-<name>` on PATH; shell-exec `!cmd` form
+      rejected for MVP (injection surface deserves its own
+      scrutiny). Config lookup via `credential.helper` in
+      `.git/config`, with `GUT_CREDENTIAL_HELPER` env override.
+      Debug subcommand `gut credential-test <url>` exercises the
+      full lookup and prints masked creds. Verified end-to-end
+      against a `.bat` mock helper on Windows (full pipe
+      roundtrip) and against the real `git-credential-manager`
+      (clean "no creds" fall-through without hanging).
+      **Deferred**: `store`/`erase` ops (follow-ups), shell-exec
+      form, global `~/.gitconfig` lookup, auto-invocation on HTTPS
+      401. The module is ready; plumbing into `remote.c`'s
+      `http_post` path is the next-session wire-up.
 
 ## Tier 5: Drop-copy audit channel
 

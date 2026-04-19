@@ -10,6 +10,7 @@
 #include "gut/login.h"
 #include "gut/submodule.h"
 #include "gut/known_hosts.h"
+#include "gut/cred_helper.h"
 #include <dirent.h>
 #include "apennines/diff.h"
 #include "apennines/base.h"
@@ -7415,6 +7416,89 @@ static int cmd_reflog(int argc, char **argv) {
  * Not documented in help/usage — this is an integration-test tool
  * until we wire the lookup into the SSH path via apennines' verifier
  * hook. */
+/* ---- gut credential-test — debug helper for the credential-helper client ----
+ *
+ * Usage:
+ *   gut credential-test <url>
+ *
+ * Reads `credential.helper` from .git/config (if in a repo) or the
+ * `GUT_CREDENTIAL_HELPER` env var, parses <url> into a credential
+ * request, invokes the helper's `get`, prints the resulting
+ * username + masked password. No credentials are persisted by this
+ * subcommand; it only exercises the lookup path.
+ *
+ * Not advertised in help/usage — it's a dogfooding probe until the
+ * full HTTPS auth path wires the lookup in on 401. */
+static int cmd_credential_test(int argc, char **argv) {
+    gut_repo repo;
+    char cwd[2048];
+    char helper[256] = "";
+    const char *url;
+    gut_cred_request req;
+    gut_cred_response resp;
+    const char *env_helper;
+    int in_repo = 0;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut credential-test <url>\n");
+        return 1;
+    }
+    url = argv[0];
+
+    env_helper = getenv("GUT_CREDENTIAL_HELPER");
+    if (env_helper && *env_helper) {
+        snprintf(helper, sizeof(helper), "%s", env_helper);
+    } else if (gut_getcwd(cwd, sizeof(cwd)) && repo_open(&repo, cwd) == 0) {
+        in_repo = 1;
+        if (cred_helper_from_config(helper, sizeof(helper), repo.git_dir) != 0) {
+            helper[0] = '\0';
+        }
+    }
+    if (!helper[0]) {
+        fprintf(stderr,
+                "error: no credential helper configured — set "
+                "credential.helper in .git/config or GUT_CREDENTIAL_HELPER\n");
+        return 1;
+    }
+
+    if (cred_request_from_url(&req, url)) {
+        fprintf(stderr, "error: cannot parse URL '%s'\n", url);
+        return 1;
+    }
+
+    printf("helper:   %s\n", helper);
+    printf("protocol: %s\n", req.protocol);
+    printf("host:     %s\n", req.host);
+    if (req.path[0])     printf("path:     %s\n", req.path);
+    if (req.username[0]) printf("username: %s (from URL)\n", req.username);
+
+    if (cred_helper_get(&resp, helper, &req) != 0) {
+        fprintf(stderr, "error: helper returned no credentials "
+                        "(exit non-zero, or no username/password in reply)\n");
+        (void)in_repo;
+        return 2;
+    }
+
+    printf("\n");
+    printf("got username: %s\n", resp.username);
+    /* Mask the password so tool output in logs doesn't leak it. */
+    {
+        u64 L = strlen(resp.password);
+        if (L <= 2) {
+            printf("got password: %s\n", resp.password);
+        } else if (L <= 8) {
+            printf("got password: %c***%c (%llu chars)\n",
+                   resp.password[0], resp.password[L - 1],
+                   (unsigned long long)L);
+        } else {
+            printf("got password: %.3s...%.3s (%llu chars)\n",
+                   resp.password, resp.password + L - 3,
+                   (unsigned long long)L);
+        }
+    }
+    return 0;
+}
+
 static int cmd_khosts_check(int argc, char **argv) {
     gut_khosts *k = NULL;
     char path[1024];
@@ -12319,6 +12403,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "khosts-check") == 0) {
         return cmd_khosts_check(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "credential-test") == 0) {
+        return cmd_credential_test(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "status") == 0) {
         return cmd_status(argc - 2, argv + 2);
