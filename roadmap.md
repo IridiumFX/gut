@@ -108,11 +108,29 @@ not just a command glued on top of existing primitives.
       `--continue`/`--abort` state machine yet (the rollback on
       conflict is more conservative than git's "fix and continue"
       flow); no `--onto`, `--root`, `-i`.
-- [ ] **Interactive rebase** — `gut rebase -i <upstream>`. Building
-      blocks all shipped now: non-interactive rebase above,
-      `gut squash` for squash/fixup, `gut amend` for reword. Needs
-      a todo-script editor-launch loop, state file under
-      `.git/rebase-merge/` for `--continue`/`--abort`.
+- [x] **Interactive rebase** (MVP) — `gut rebase -i <upstream>`.
+      Generates a todo-script under `.git/rebase-merge/git-rebase-todo`,
+      launches `$GIT_EDITOR / $VISUAL / $EDITOR` (or
+      `GUT_REBASE_TODO_INLINE=<path>` bypass for tests), parses the
+      post-edit script, executes the actions in order. Supports
+      `pick`, `drop`, `squash`, `fixup`, `reword` — covers ~95% of
+      real usage. `reword` launches `$EDITOR` on the commit message
+      (bypass: `GUT_REBASE_MESSAGE_INLINE`). `squash` melds into the
+      previous pick with combined messages; `fixup` melds with the
+      previous pick's message only. On any conflict, aborts and
+      rolls back to the original HEAD. All five actions + the
+      conflict-abort path verified end-to-end; `git log` / `git fsck`
+      read the rebased history cleanly.
+      **Bonus fix**: while building this, corrected a latent 3-way-
+      merge bug in `rebase_apply_pick` where a file that was in base
+      + theirs but not ours would be re-added unconditionally —
+      broken for the "drop an ancestor commit that introduced a file"
+      case. Now the merge correctly treats our absence as a delete
+      when theirs hasn't modified the file, and flags modify/delete
+      conflict when theirs has.
+      **Deferred**: `edit` (needs cross-invocation state machine for
+      `--continue`/`--abort`), `exec`, `--onto`, `--root`. The
+      rebase-merge state dir cleans up on success and on abort.
 
 - [x] **Cherry-pick** — `gut cherry-pick <commit>` replays one
       commit's diff (commit − parent(commit)) onto HEAD via the

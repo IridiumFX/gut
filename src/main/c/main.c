@@ -10847,14 +10847,36 @@ static int rebase_apply_pick(gut_repo *repo,
                 }
             }
         }
-        /* Files new in the pick. */
+        /* Files in theirs. Three relevant subcases when they're not
+         * already in `ours`:
+         *   - In base with same content as theirs  → our absence is
+         *     an intentional delete (e.g. we dropped an ancestor
+         *     commit that introduced the file). Keep it deleted.
+         *   - In base with different content       → modify/delete
+         *     conflict: theirs modified a file we deleted.
+         *   - Not in base                           → genuine addition
+         *     by theirs; include it. */
         for (i = 0; i < their_idx.count; i++) {
             const char *path = their_idx.entries[i].path;
-            u64 our_pos;
+            u64 our_pos, base_pos;
             index_find(&our_pos, &our_idx, path);
             if (our_pos < our_idx.count &&
                 strcmp(our_idx.entries[our_pos].path, path) == 0)
+                continue;   /* handled in first loop */
+
+            index_find(&base_pos, &base_idx, path);
+            if (base_pos < base_idx.count &&
+                strcmp(base_idx.entries[base_pos].path, path) == 0) {
+                long c;
+                oid_compare(&c, &their_idx.entries[i].oid,
+                            &base_idx.entries[base_pos].oid);
+                if (c == 0) continue;   /* our delete wins */
+                fprintf(stderr, "CONFLICT (modify/delete): %s\n", path);
+                has_conflicts = 1;
                 continue;
+            }
+
+            /* Genuinely new in theirs. */
             index_add(&merged_idx, path, &their_idx.entries[i].oid,
                       their_idx.entries[i].mode, 0, 0);
         }
@@ -11019,6 +11041,9 @@ static int rebase_hard_reset(gut_repo *repo,
     return rc ? 1 : 0;
 }
 
+/* Forward decl — the interactive entry point lives after this. */
+static int cmd_rebase_interactive(int argc, char **argv);
+
 static int cmd_rebase(int argc, char **argv) {
     gut_repo repo;
     gut_oid our_oid, our_orig_oid, upstream_oid, base_oid;
@@ -11028,18 +11053,39 @@ static int cmd_rebase(int argc, char **argv) {
     char final_short[GUT_OID_MAX_HEX_SIZE + 1];
     unsigned long rc;
     long cmp;
-    const char *upstream_arg;
+    const char *upstream_arg = NULL;
     gut_oid *picks = NULL;
     u64 n_picks = 0;
     u64 cap = 0;
     u64 i;
     unsigned hex_len;
+    int ai;
 
-    if (argc < 1) {
-        fprintf(stderr, "usage: gut rebase <upstream>\n");
+    for (ai = 0; ai < argc; ai++) {
+        if (strcmp(argv[ai], "-i") == 0 || strcmp(argv[ai], "--interactive") == 0) {
+            /* Strip the -i flag and hand off to the interactive entry.
+             * Any remaining args (upstream + future -onto etc.) flow
+             * through unchanged. */
+            int j, k = 0;
+            char **sub = (char **)malloc((size_t)argc * sizeof(char *));
+            if (!sub) return 1;
+            for (j = 0; j < argc; j++) {
+                if (j == ai) continue;
+                sub[k++] = argv[j];
+            }
+            {
+                int rci = cmd_rebase_interactive(k, sub);
+                free(sub);
+                return rci;
+            }
+        }
+        if (argv[ai][0] != '-') upstream_arg = argv[ai];
+    }
+
+    if (!upstream_arg) {
+        fprintf(stderr, "usage: gut rebase [-i] <upstream>\n");
         return 1;
     }
-    upstream_arg = argv[0];
 
     if (!gut_getcwd(cwd, sizeof(cwd))) {
         fprintf(stderr, "error: cannot get current directory\n");
@@ -11241,6 +11287,883 @@ static int cmd_rebase(int argc, char **argv) {
            7, upstream_short);
     (void)final_short;
     return 0;
+}
+
+/* ---- gut rebase -i ----
+ *
+ * Interactive rebase MVP — picks/drops/squashes/fixups/rewords the
+ * commits between HEAD and <upstream>. Missing vs. git: `edit`
+ * (requires a --continue state machine across invocations) and
+ * `exec`. Conflict handling still follows the non-interactive path:
+ * hit a conflict, abort the whole rebase, restore the branch tip.
+ *
+ * Editor bypass for tests + scripting:
+ *   GUT_REBASE_TODO_INLINE=<path>     — skip $EDITOR launch on the
+ *                                       todo-script; use file contents
+ *   GUT_REBASE_MESSAGE_INLINE=<path>  — skip $EDITOR on reword; use
+ *                                       file contents as the new
+ *                                       commit message
+ *
+ * Todo file lives at `.git/rebase-merge/git-rebase-todo` (matches
+ * git's path so a user's existing editor config / syntax highlighting
+ * kicks in). Cleaned up on success or abort.
+ */
+
+typedef enum {
+    TODO_PICK   = 1,
+    TODO_REWORD = 2,
+    TODO_SQUASH = 3,
+    TODO_FIXUP  = 4,
+    TODO_DROP   = 5
+} todo_action_t;
+
+typedef struct {
+    todo_action_t action;
+    gut_oid       oid;
+    char          subject[160];
+} todo_entry_t;
+
+static const char *todo_action_word(todo_action_t a) {
+    switch (a) {
+        case TODO_PICK:   return "pick";
+        case TODO_REWORD: return "reword";
+        case TODO_SQUASH: return "squash";
+        case TODO_FIXUP:  return "fixup";
+        case TODO_DROP:   return "drop";
+        default:          return "?";
+    }
+}
+
+static int todo_action_parse(todo_action_t *out, const char *s, u64 len) {
+    /* Accept full word or single-letter short form (git's convention). */
+    if ((len == 1 && s[0] == 'p') ||
+        (len == 4 && memcmp(s, "pick", 4) == 0))   { *out = TODO_PICK;   return 0; }
+    if ((len == 1 && s[0] == 'r') ||
+        (len == 6 && memcmp(s, "reword", 6) == 0)) { *out = TODO_REWORD; return 0; }
+    if ((len == 1 && s[0] == 's') ||
+        (len == 6 && memcmp(s, "squash", 6) == 0)) { *out = TODO_SQUASH; return 0; }
+    if ((len == 1 && s[0] == 'f') ||
+        (len == 5 && memcmp(s, "fixup", 5) == 0))  { *out = TODO_FIXUP;  return 0; }
+    if ((len == 1 && s[0] == 'd') ||
+        (len == 4 && memcmp(s, "drop", 4) == 0))   { *out = TODO_DROP;   return 0; }
+    return 1;
+}
+
+/* Read the first line of a commit's message (the "subject"). */
+static void commit_subject_for_todo(char *out, u64 out_sz, const char *msg) {
+    u64 i = 0;
+    if (!msg) { out[0] = 0; return; }
+    while (msg[i] && msg[i] != '\n' && i + 1 < out_sz) {
+        out[i] = msg[i];
+        i++;
+    }
+    out[i] = 0;
+}
+
+/* Launch $GIT_EDITOR / $VISUAL / $EDITOR / fallback on <path>. Returns
+ * 0 on success, non-zero on launch failure or editor non-zero exit. */
+static int launch_editor(const char *path) {
+    const char *editor = getenv("GIT_EDITOR");
+    if (!editor || !*editor) editor = getenv("VISUAL");
+    if (!editor || !*editor) editor = getenv("EDITOR");
+    if (!editor || !*editor) {
+#ifdef _WIN32
+        editor = "notepad";
+#else
+        editor = "vi";
+#endif
+    }
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\"", editor, path);
+        return system(cmd);
+    }
+}
+
+/* If GUT_REBASE_TODO_INLINE (or GUT_REBASE_MESSAGE_INLINE) is set,
+ * copy the contents of that file over `path`. Otherwise launch the
+ * editor. The test-bypass path lets integration tests supply the
+ * post-edit content without any interactive prompt. */
+static int edit_file_via_env_or_editor(const char *path, const char *env_var) {
+    const char *bypass = getenv(env_var);
+    if (bypass && *bypass) {
+        FILE *src = fopen(bypass, "rb");
+        FILE *dst;
+        char buf[4096];
+        size_t n;
+        if (!src) {
+            fprintf(stderr, "error: %s='%s' but file unreadable\n",
+                    env_var, bypass);
+            return 1;
+        }
+        dst = fopen(path, "wb");
+        if (!dst) { fclose(src); return 1; }
+        while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+            fwrite(buf, 1, n, dst);
+        fclose(src);
+        fclose(dst);
+        return 0;
+    }
+    return launch_editor(path);
+}
+
+/* Slurp a file into a freshly-malloc'd buffer. Caller frees. */
+static unsigned long slurp_into(char **out, u64 *out_len, const char *path) {
+    FILE *fp;
+    long sz;
+    char *b;
+    size_t n;
+
+    fp = fopen(path, "rb");
+    if (!fp) return __LINE__;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return __LINE__; }
+    sz = ftell(fp);
+    if (sz < 0) { fclose(fp); return __LINE__; }
+    rewind(fp);
+    b = (char *)malloc((size_t)sz + 1);
+    if (!b) { fclose(fp); return __LINE__; }
+    n = fread(b, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (n != (size_t)sz) { free(b); return __LINE__; }
+    b[sz] = 0;
+    *out = b;
+    *out_len = (u64)sz;
+    return 0;
+}
+
+/* Parse the post-editor todo script. Blank and comment (#) lines are
+ * skipped. Unknown action words abort parsing. */
+static int parse_todo_script(todo_entry_t **out_entries, u64 *out_n,
+                             const char *script, u64 script_len,
+                             gut_repo *repo) {
+    todo_entry_t *arr = NULL;
+    u64 cap = 0, n = 0;
+    u64 i = 0;
+    unsigned hex_len = gut_oid_hex_size(repo->hash_algo);
+
+    *out_entries = NULL;
+    *out_n = 0;
+
+    while (i < script_len) {
+        /* Extract one line. */
+        u64 line_start = i;
+        u64 line_end;
+        while (i < script_len && script[i] != '\n') i++;
+        line_end = i;
+        if (i < script_len) i++;  /* skip the \n */
+
+        /* Trim trailing \r, leading whitespace. */
+        while (line_end > line_start &&
+               (script[line_end - 1] == '\r' ||
+                script[line_end - 1] == ' '  ||
+                script[line_end - 1] == '\t')) line_end--;
+        while (line_start < line_end &&
+               (script[line_start] == ' ' || script[line_start] == '\t'))
+            line_start++;
+
+        if (line_start == line_end) continue;
+        if (script[line_start] == '#') continue;
+
+        /* Action word. */
+        {
+            u64 w_start = line_start, w_end = w_start;
+            todo_action_t act;
+            const char *oid_start;
+            u64 oid_end;
+            while (w_end < line_end && script[w_end] != ' ' && script[w_end] != '\t')
+                w_end++;
+            if (todo_action_parse(&act, script + w_start, w_end - w_start) != 0) {
+                fprintf(stderr, "error: unknown todo action '%.*s'\n",
+                        (int)(w_end - w_start), script + w_start);
+                free(arr);
+                return 1;
+            }
+            /* OID */
+            while (w_end < line_end && (script[w_end] == ' ' || script[w_end] == '\t'))
+                w_end++;
+            oid_start = script + w_end;
+            oid_end = w_end;
+            while (oid_end < line_end && script[oid_end] != ' ' && script[oid_end] != '\t')
+                oid_end++;
+            {
+                u64 ol = oid_end - w_end;
+                gut_oid oid;
+                /* Accept short OIDs via odb_resolve_prefix — user might
+                 * have abbreviated them while editing the script. */
+                if (ol == hex_len) {
+                    if (oid_from_hex_n(&oid, oid_start, (unsigned)ol) != 0) {
+                        fprintf(stderr, "error: malformed oid in todo\n");
+                        free(arr);
+                        return 1;
+                    }
+                } else if (ol >= 4 && ol < hex_len) {
+                    char short_hex[GUT_OID_MAX_HEX_SIZE + 1];
+                    memcpy(short_hex, oid_start, (size_t)ol);
+                    short_hex[ol] = 0;
+                    if (odb_resolve_prefix(&oid, &repo->odb, short_hex) != 0) {
+                        fprintf(stderr, "error: ambiguous or unknown short oid "
+                                        "'%s' in todo\n", short_hex);
+                        free(arr);
+                        return 1;
+                    }
+                } else {
+                    fprintf(stderr, "error: malformed oid length %llu in todo\n",
+                            (unsigned long long)ol);
+                    free(arr);
+                    return 1;
+                }
+
+                if (n == cap) {
+                    cap = cap ? cap * 2 : 16;
+                    arr = (todo_entry_t *)realloc(arr,
+                                                  (size_t)cap * sizeof(todo_entry_t));
+                    if (!arr) return 1;
+                }
+                memset(&arr[n], 0, sizeof(arr[n]));
+                arr[n].action = act;
+                memcpy(arr[n].oid.bytes, oid.bytes, GUT_OID_MAX_RAW_SIZE);
+                /* Subject: everything past the oid up to the end of line. */
+                {
+                    u64 subj_start = oid_end;
+                    u64 slen;
+                    while (subj_start < line_end &&
+                           (script[subj_start] == ' ' ||
+                            script[subj_start] == '\t')) subj_start++;
+                    slen = line_end - subj_start;
+                    if (slen >= sizeof(arr[n].subject))
+                        slen = sizeof(arr[n].subject) - 1;
+                    memcpy(arr[n].subject, script + subj_start, (size_t)slen);
+                    arr[n].subject[slen] = 0;
+                }
+                n++;
+            }
+        }
+    }
+
+    *out_entries = arr;
+    *out_n = n;
+    return 0;
+}
+
+/* Meld `new_oid` into `prev_oid`: produce a commit whose tree is
+ * new_oid's tree, whose parents are prev_oid's parents, whose author
+ * is prev_oid's author, whose message is either prev+new concatenated
+ * (squash) or prev only (fixup). Updates HEAD to the new commit. */
+static int meld_commits(gut_repo *repo, const char *head_ref,
+                        const gut_oid *prev_oid, const gut_oid *new_oid,
+                        int fixup, gut_oid *out_oid, const char *reflog_reason) {
+    gut_object prev_obj, new_obj;
+    gut_commit prev_commit, new_commit;
+    buf commit_buf;
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+    gut_oid melded_oid;
+    u64 i;
+    unsigned hex_len = gut_oid_hex_size(repo->hash_algo);
+    char timestamp[128];
+    char cn_buf[256], ce_buf[256];
+    const char *cn, *ce;
+    gut_config cfg;
+    int have_cfg = 0;
+
+    if (odb_read(&prev_obj, &repo->odb, prev_oid)) return 1;
+    if (commit_parse(&prev_commit, prev_obj.data.data, prev_obj.data.len)) {
+        object_destroy(&prev_obj);
+        return 1;
+    }
+    if (odb_read(&new_obj, &repo->odb, new_oid)) {
+        commit_destroy(&prev_commit);
+        object_destroy(&prev_obj);
+        return 1;
+    }
+    if (commit_parse(&new_commit, new_obj.data.data, new_obj.data.len)) {
+        commit_destroy(&prev_commit);
+        object_destroy(&prev_obj);
+        object_destroy(&new_obj);
+        return 1;
+    }
+
+    /* Committer identity (current user). */
+    cn = getenv("GUT_COMMITTER_NAME");
+    if (!cn) cn = getenv("GUT_AUTHOR_NAME");
+    if (!cn) cn = getenv("GIT_COMMITTER_NAME");
+    if (!cn) cn = getenv("GIT_AUTHOR_NAME");
+    ce = getenv("GUT_COMMITTER_EMAIL");
+    if (!ce) ce = getenv("GUT_AUTHOR_EMAIL");
+    if (!ce) ce = getenv("GIT_COMMITTER_EMAIL");
+    if (!ce) ce = getenv("GIT_AUTHOR_EMAIL");
+    if (!cn || !ce) {
+        char cp[2048];
+        snprintf(cp, sizeof(cp), "%s/config", repo->git_dir);
+        if (config_read(&cfg, cp) == 0) {
+            const char *v;
+            have_cfg = 1;
+            if (!cn && config_get(&v, &cfg, "user", "name") == 0) cn = v;
+            if (!ce && config_get(&v, &cfg, "user", "email") == 0) ce = v;
+        }
+    }
+    if (!cn) cn = "Unknown";
+    if (!ce) ce = "unknown@example.com";
+    snprintf(cn_buf, sizeof(cn_buf), "%s", cn);
+    snprintf(ce_buf, sizeof(ce_buf), "%s", ce);
+    if (have_cfg) config_destroy(&cfg);
+
+    {
+        time_t now = time(NULL);
+        long tz = 0;
+#ifdef _WIN32
+        TIME_ZONE_INFORMATION tzi;
+        if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID)
+            tz = -(long)tzi.Bias;
+#else
+        struct tm *lt = localtime(&now);
+        if (lt) tz = lt->tm_gmtoff / 60;
+#endif
+        snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
+                 (long long)now, tz / 60, labs(tz) % 60);
+    }
+
+    buf_create(&commit_buf, 512);
+
+    /* tree (from the NEW commit — it's the post-meld state) */
+    oid_to_hex_n(hex, &new_commit.tree_oid, hex_len);
+    buf_append(&commit_buf, (u8 *)"tree ", 5);
+    buf_append(&commit_buf, (u8 *)hex, hex_len);
+    buf_append_byte(&commit_buf, '\n');
+
+    /* parents (from the PREV commit — the meld takes prev's place
+     * in the history graph). Usually one parent; preserve all if it
+     * was a merge (unlikely in rebase but defensive). */
+    for (i = 0; i < prev_commit.parent_count; i++) {
+        oid_to_hex_n(hex, &prev_commit.parent_oids[i], hex_len);
+        buf_append(&commit_buf, (u8 *)"parent ", 7);
+        buf_append(&commit_buf, (u8 *)hex, hex_len);
+        buf_append_byte(&commit_buf, '\n');
+    }
+
+    /* author: preserve prev's */
+    if (prev_commit.author) {
+        buf_append(&commit_buf, (u8 *)"author ", 7);
+        buf_append(&commit_buf, (u8 *)prev_commit.author,
+                   (u64)strlen(prev_commit.author));
+        buf_append_byte(&commit_buf, '\n');
+    } else {
+        char line[512];
+        int n = snprintf(line, sizeof(line), "author %s <%s> %s\n",
+                         cn_buf, ce_buf, timestamp);
+        buf_append(&commit_buf, (u8 *)line, (u64)n);
+    }
+    {
+        char line[512];
+        int n = snprintf(line, sizeof(line), "committer %s <%s> %s\n",
+                         cn_buf, ce_buf, timestamp);
+        buf_append(&commit_buf, (u8 *)line, (u64)n);
+    }
+    buf_append_byte(&commit_buf, '\n');
+
+    /* Message. */
+    if (prev_commit.message) {
+        u64 pl = strlen(prev_commit.message);
+        buf_append(&commit_buf, (u8 *)prev_commit.message, pl);
+        if (pl == 0 || prev_commit.message[pl - 1] != '\n')
+            buf_append_byte(&commit_buf, '\n');
+    }
+    if (!fixup && new_commit.message) {
+        u64 nl = strlen(new_commit.message);
+        buf_append_byte(&commit_buf, '\n');
+        buf_append(&commit_buf, (u8 *)new_commit.message, nl);
+        if (nl == 0 || new_commit.message[nl - 1] != '\n')
+            buf_append_byte(&commit_buf, '\n');
+    }
+
+    odb_write(&melded_oid, &repo->odb, GUT_OBJ_COMMIT,
+              commit_buf.data, commit_buf.len);
+    buf_destroy(&commit_buf);
+
+    commit_destroy(&prev_commit);
+    object_destroy(&prev_obj);
+    commit_destroy(&new_commit);
+    object_destroy(&new_obj);
+
+    repo_update_ref(repo, head_ref, &melded_oid, reflog_reason);
+    memcpy(out_oid->bytes, melded_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+    return 0;
+}
+
+/* Reword: take the commit at `target_oid`, launch editor on its
+ * message, rewrite the commit with the new message (author
+ * preserved, committer refreshed), update HEAD. */
+static int reword_commit(gut_repo *repo, const char *head_ref,
+                         const gut_oid *target_oid, gut_oid *out_oid,
+                         const char *reflog_reason) {
+    char msg_path[2048];
+    gut_object obj;
+    gut_commit c;
+    buf commit_buf;
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+    gut_oid new_oid;
+    char *new_msg = NULL;
+    u64 new_msg_len = 0;
+    u64 i;
+    unsigned hex_len = gut_oid_hex_size(repo->hash_algo);
+    char timestamp[128];
+
+    snprintf(msg_path, sizeof(msg_path),
+             "%s/rebase-merge/COMMIT_EDITMSG", repo->git_dir);
+
+    if (odb_read(&obj, &repo->odb, target_oid)) return 1;
+    if (commit_parse(&c, obj.data.data, obj.data.len)) {
+        object_destroy(&obj);
+        return 1;
+    }
+
+    /* Seed the message file with the current message. */
+    {
+        FILE *fp = fopen(msg_path, "wb");
+        if (!fp) { commit_destroy(&c); object_destroy(&obj); return 1; }
+        if (c.message) fputs(c.message, fp);
+        fclose(fp);
+    }
+
+    if (edit_file_via_env_or_editor(msg_path, "GUT_REBASE_MESSAGE_INLINE")) {
+        commit_destroy(&c);
+        object_destroy(&obj);
+        fprintf(stderr, "error: editor exited non-zero for reword\n");
+        return 1;
+    }
+    if (slurp_into(&new_msg, &new_msg_len, msg_path)) {
+        commit_destroy(&c);
+        object_destroy(&obj);
+        return 1;
+    }
+
+    /* Refresh timestamp for the committer line. */
+    {
+        time_t now = time(NULL);
+        long tz = 0;
+#ifdef _WIN32
+        TIME_ZONE_INFORMATION tzi;
+        if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID)
+            tz = -(long)tzi.Bias;
+#else
+        struct tm *lt = localtime(&now);
+        if (lt) tz = lt->tm_gmtoff / 60;
+#endif
+        snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
+                 (long long)now, tz / 60, labs(tz) % 60);
+    }
+
+    buf_create(&commit_buf, 512);
+    oid_to_hex_n(hex, &c.tree_oid, hex_len);
+    buf_append(&commit_buf, (u8 *)"tree ", 5);
+    buf_append(&commit_buf, (u8 *)hex, hex_len);
+    buf_append_byte(&commit_buf, '\n');
+    for (i = 0; i < c.parent_count; i++) {
+        oid_to_hex_n(hex, &c.parent_oids[i], hex_len);
+        buf_append(&commit_buf, (u8 *)"parent ", 7);
+        buf_append(&commit_buf, (u8 *)hex, hex_len);
+        buf_append_byte(&commit_buf, '\n');
+    }
+    if (c.author) {
+        buf_append(&commit_buf, (u8 *)"author ", 7);
+        buf_append(&commit_buf, (u8 *)c.author, (u64)strlen(c.author));
+        buf_append_byte(&commit_buf, '\n');
+    }
+    if (c.committer) {
+        /* Replace the original committer line's timestamp with the
+         * refreshed one. For simplicity we just rewrite a fresh
+         * committer line using the author's identity (which mirrors
+         * git's reword behavior — author unchanged, committer updated). */
+        /* Extract "<Name> <email>" — everything before the last two
+         * whitespace-separated tokens (ts + tz). */
+        const char *end = c.committer + strlen(c.committer);
+        const char *p = end;
+        int seen_ws = 0;
+        /* Walk back over "ts tz" (two fields). */
+        while (p > c.committer && *p != ' ') p--;   /* over tz */
+        if (p > c.committer) p--;                    /* space */
+        while (p > c.committer && *p != ' ') p--;   /* over ts */
+        /* p now points at the space before ts. */
+        if (p > c.committer) {
+            char ident[256];
+            u64 ilen = (u64)(p - c.committer);
+            if (ilen < sizeof(ident)) {
+                char line[512];
+                int n;
+                memcpy(ident, c.committer, ilen);
+                ident[ilen] = 0;
+                n = snprintf(line, sizeof(line), "committer %s %s\n",
+                             ident, timestamp);
+                buf_append(&commit_buf, (u8 *)line, (u64)n);
+            }
+        }
+        (void)seen_ws; (void)end;
+    }
+    buf_append_byte(&commit_buf, '\n');
+    buf_append(&commit_buf, (u8 *)new_msg, new_msg_len);
+    if (new_msg_len == 0 || new_msg[new_msg_len - 1] != '\n')
+        buf_append_byte(&commit_buf, '\n');
+
+    odb_write(&new_oid, &repo->odb, GUT_OBJ_COMMIT,
+              commit_buf.data, commit_buf.len);
+    buf_destroy(&commit_buf);
+    commit_destroy(&c);
+    object_destroy(&obj);
+    free(new_msg);
+
+    repo_update_ref(repo, head_ref, &new_oid, reflog_reason);
+    memcpy(out_oid->bytes, new_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+    return 0;
+}
+
+static int cmd_rebase_interactive(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid our_oid, our_orig_oid, upstream_oid, base_oid;
+    char cwd[2048];
+    char head_ref[256];
+    char upstream_short[GUT_OID_MAX_HEX_SIZE + 1];
+    char rebase_dir[2048];
+    char todo_path[2048];
+    unsigned long rc;
+    long cmp;
+    const char *upstream_arg = NULL;
+    gut_oid *picks = NULL;
+    u64 n_picks = 0;
+    u64 cap = 0;
+    u64 i;
+    unsigned hex_len;
+    FILE *fp;
+    todo_entry_t *todos = NULL;
+    u64 n_todos = 0;
+    gut_oid last_pick_oid;
+    char *todo_text = NULL;
+    u64 todo_text_len = 0;
+    int had_nonfixup_predecessor = 0;
+
+    for (i = 0; i < (u64)argc; i++) {
+        if (argv[i][0] != '-') { upstream_arg = argv[i]; break; }
+    }
+    if (!upstream_arg) {
+        fprintf(stderr, "usage: gut rebase -i <upstream>\n");
+        return 1;
+    }
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository\n");
+        return 1;
+    }
+    hex_len = gut_oid_hex_size(repo.hash_algo);
+
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    rc = repo_resolve_ref(&our_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: HEAD is unborn\n"); return 1; }
+    memcpy(our_orig_oid.bytes, our_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+
+    if (resolve_object(&upstream_oid, &repo, upstream_arg)) {
+        fprintf(stderr, "fatal: invalid upstream '%s'\n", upstream_arg);
+        return 1;
+    }
+    oid_to_hex_n(upstream_short, &upstream_oid, hex_len);
+    upstream_short[hex_len] = 0;
+
+    oid_compare(&cmp, &our_oid, &upstream_oid);
+    if (cmp == 0) { printf("Current branch already up to date.\n"); return 0; }
+
+    if (find_merge_base(&base_oid, &repo.odb, &our_oid, &upstream_oid)) {
+        fprintf(stderr, "fatal: no common ancestor with '%s'\n", upstream_arg);
+        return 1;
+    }
+
+    /* For -i we specifically walk HEAD..base (not HEAD..upstream); the
+     * user may want to just reorder/squash their local commits without
+     * rebasing onto a divergent upstream. But if merge-base != upstream,
+     * we still reset to upstream after the todo edit (so the rebase
+     * actually relocates on top of upstream's tip). */
+
+    /* Collect picks: walk first-parent from HEAD to base, refuse merges. */
+    {
+        gut_oid cur;
+        memcpy(cur.bytes, our_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        for (;;) {
+            gut_object obj;
+            gut_commit c;
+            long is_base;
+            oid_compare(&is_base, &cur, &base_oid);
+            if (is_base == 0) break;
+            if (odb_read(&obj, &repo.odb, &cur)) {
+                fprintf(stderr, "error: broken history\n");
+                free(picks);
+                return 1;
+            }
+            if (commit_parse(&c, obj.data.data, obj.data.len)) {
+                object_destroy(&obj);
+                free(picks);
+                return 1;
+            }
+            object_destroy(&obj);
+            if (c.parent_count > 1) {
+                char hex[GUT_OID_MAX_HEX_SIZE + 1];
+                oid_to_hex_n(hex, &cur, hex_len);
+                hex[hex_len] = 0;
+                fprintf(stderr,
+                        "error: cannot rebase merge commit %.*s\n", 7, hex);
+                commit_destroy(&c);
+                free(picks);
+                return 1;
+            }
+            if (c.parent_count == 0) {
+                commit_destroy(&c);
+                fprintf(stderr, "error: hit root before merge-base\n");
+                free(picks);
+                return 1;
+            }
+            if (n_picks == cap) {
+                cap = cap ? cap * 2 : 16;
+                picks = (gut_oid *)realloc(picks,
+                                           (size_t)cap * sizeof(gut_oid));
+                if (!picks) { commit_destroy(&c); return 1; }
+            }
+            memcpy(picks[n_picks].bytes, cur.bytes, GUT_OID_MAX_RAW_SIZE);
+            n_picks++;
+            memcpy(cur.bytes, c.parent_oids[0].bytes, GUT_OID_MAX_RAW_SIZE);
+            commit_destroy(&c);
+        }
+    }
+
+    if (n_picks == 0) {
+        printf("Nothing to rebase.\n");
+        free(picks);
+        return 0;
+    }
+
+    /* Reverse into oldest-first. */
+    for (i = 0; i < n_picks / 2; i++) {
+        gut_oid tmp;
+        memcpy(tmp.bytes, picks[i].bytes, GUT_OID_MAX_RAW_SIZE);
+        memcpy(picks[i].bytes, picks[n_picks - 1 - i].bytes, GUT_OID_MAX_RAW_SIZE);
+        memcpy(picks[n_picks - 1 - i].bytes, tmp.bytes, GUT_OID_MAX_RAW_SIZE);
+    }
+
+    /* Ensure .git/rebase-merge/ exists and write the todo-script. */
+    snprintf(rebase_dir, sizeof(rebase_dir), "%s/rebase-merge", repo.git_dir);
+#ifdef _WIN32
+    _mkdir(rebase_dir);
+#else
+    mkdir(rebase_dir, 0755);
+#endif
+    snprintf(todo_path, sizeof(todo_path), "%s/git-rebase-todo", rebase_dir);
+    fp = fopen(todo_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "error: cannot create %s\n", todo_path);
+        free(picks);
+        return 1;
+    }
+    for (i = 0; i < n_picks; i++) {
+        gut_object obj;
+        gut_commit c;
+        char short_hex[GUT_OID_MAX_HEX_SIZE + 1];
+        char subject[160] = "";
+        if (odb_read(&obj, &repo.odb, &picks[i]) == 0) {
+            if (commit_parse(&c, obj.data.data, obj.data.len) == 0) {
+                commit_subject_for_todo(subject, sizeof(subject), c.message);
+                commit_destroy(&c);
+            }
+            object_destroy(&obj);
+        }
+        oid_to_hex_n(short_hex, &picks[i], hex_len);
+        short_hex[hex_len] = 0;
+        fprintf(fp, "pick %.*s %s\n", 7, short_hex, subject);
+    }
+    fprintf(fp, "\n# Rebase onto %.*s — %llu commit%s.\n",
+            7, upstream_short,
+            (unsigned long long)n_picks, n_picks == 1 ? "" : "s");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# Commands:\n");
+    fprintf(fp, "#   p, pick   = use commit\n");
+    fprintf(fp, "#   r, reword = use commit, but edit the message\n");
+    fprintf(fp, "#   s, squash = use commit, but meld into previous commit\n");
+    fprintf(fp, "#   f, fixup  = like squash, but discard this commit's message\n");
+    fprintf(fp, "#   d, drop   = remove commit\n");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# Blank lines and '#' comments are ignored.\n");
+    fprintf(fp, "# 'edit' + --continue state machine is not yet implemented.\n");
+    fclose(fp);
+
+    if (edit_file_via_env_or_editor(todo_path, "GUT_REBASE_TODO_INLINE")) {
+        fprintf(stderr, "error: editor exited non-zero; aborting rebase\n");
+        free(picks);
+        return 1;
+    }
+
+    if (slurp_into(&todo_text, &todo_text_len, todo_path)) {
+        fprintf(stderr, "error: cannot re-read todo after edit\n");
+        free(picks);
+        return 1;
+    }
+    free(picks);
+    picks = NULL;
+
+    if (parse_todo_script(&todos, &n_todos, todo_text, todo_text_len, &repo)) {
+        free(todo_text);
+        return 1;
+    }
+    free(todo_text);
+
+    if (n_todos == 0) {
+        printf("No todo entries — nothing to do.\n");
+        free(todos);
+        return 0;
+    }
+
+    /* Move HEAD to the merge-base (so the first pick lands on top of
+     * it). This matches git's -i semantics when rebasing onto the
+     * same upstream; if the user wanted a different base they'd pass
+     * --onto (deferred). For MVP: -i always re-parents onto upstream. */
+    {
+        char reflog_reason[256];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "rebase -i: start onto %s", upstream_arg);
+        if (rebase_hard_reset(&repo, &upstream_oid, head_ref, reflog_reason)) {
+            fprintf(stderr, "error: cannot move HEAD to upstream\n");
+            free(todos);
+            return 1;
+        }
+    }
+    memcpy(last_pick_oid.bytes, upstream_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+
+    /* Execute the todos in order. */
+    for (i = 0; i < n_todos; i++) {
+        todo_entry_t *e = &todos[i];
+        char src_short[GUT_OID_MAX_HEX_SIZE + 1];
+        char dest_short[GUT_OID_MAX_HEX_SIZE + 1];
+        oid_to_hex_n(src_short, &e->oid, hex_len);
+        src_short[hex_len] = 0;
+
+        if (e->action == TODO_DROP) {
+            printf("  [%llu/%llu] drop %.*s\n",
+                   (unsigned long long)(i + 1),
+                   (unsigned long long)n_todos,
+                   7, src_short);
+            continue;
+        }
+
+        /* For squash/fixup without a preceding pick-or-reword, git
+         * complains ("cannot squash onto nothing") — mirror that. */
+        if ((e->action == TODO_SQUASH || e->action == TODO_FIXUP) &&
+            !had_nonfixup_predecessor) {
+            fprintf(stderr,
+                    "error: cannot '%s' without a prior pick/reword\n",
+                    todo_action_word(e->action));
+            goto abort_rebase;
+        }
+
+        /* First step: apply the commit's diff onto current HEAD via
+         * three-way merge. */
+        {
+            gut_oid new_oid;
+            int conflict = 0;
+            char reflog_reason[256];
+            int apply_rc;
+            snprintf(reflog_reason, sizeof(reflog_reason),
+                     "rebase -i: %s %.*s",
+                     todo_action_word(e->action), 7, src_short);
+            apply_rc = rebase_apply_pick(&repo, &e->oid, head_ref,
+                                         reflog_reason, &new_oid, &conflict);
+            if (apply_rc || conflict) {
+                fprintf(stderr,
+                        "\nerror: stopped at %s %.*s (%llu/%llu)\n",
+                        todo_action_word(e->action), 7, src_short,
+                        (unsigned long long)(i + 1),
+                        (unsigned long long)n_todos);
+                goto abort_rebase;
+            }
+
+            /* Second step: mode-specific post-processing. */
+            if (e->action == TODO_PICK) {
+                memcpy(last_pick_oid.bytes, new_oid.bytes,
+                       GUT_OID_MAX_RAW_SIZE);
+                had_nonfixup_predecessor = 1;
+            } else if (e->action == TODO_REWORD) {
+                gut_oid reworded;
+                char reflog2[256];
+                snprintf(reflog2, sizeof(reflog2),
+                         "rebase -i: reword %.*s (message edit)",
+                         7, src_short);
+                if (reword_commit(&repo, head_ref, &new_oid, &reworded,
+                                  reflog2) != 0) {
+                    fprintf(stderr, "error: reword failed for %.*s\n",
+                            7, src_short);
+                    goto abort_rebase;
+                }
+                memcpy(last_pick_oid.bytes, reworded.bytes, GUT_OID_MAX_RAW_SIZE);
+                memcpy(new_oid.bytes, reworded.bytes, GUT_OID_MAX_RAW_SIZE);
+                had_nonfixup_predecessor = 1;
+            } else if (e->action == TODO_SQUASH || e->action == TODO_FIXUP) {
+                gut_oid melded;
+                char reflog2[256];
+                int fixup = (e->action == TODO_FIXUP);
+                snprintf(reflog2, sizeof(reflog2),
+                         "rebase -i: %s %.*s (meld into %.*s)",
+                         fixup ? "fixup" : "squash", 7, src_short,
+                         7, (oid_to_hex_n(dest_short, &last_pick_oid, hex_len),
+                             dest_short[hex_len] = 0, dest_short));
+                if (meld_commits(&repo, head_ref, &last_pick_oid, &new_oid,
+                                 fixup, &melded, reflog2) != 0) {
+                    fprintf(stderr, "error: meld failed for %.*s\n",
+                            7, src_short);
+                    goto abort_rebase;
+                }
+                memcpy(last_pick_oid.bytes, melded.bytes, GUT_OID_MAX_RAW_SIZE);
+                memcpy(new_oid.bytes, melded.bytes, GUT_OID_MAX_RAW_SIZE);
+            }
+
+            oid_to_hex_n(dest_short, &new_oid, hex_len);
+            dest_short[hex_len] = 0;
+            printf("  [%llu/%llu] %s %.*s -> %.*s\n",
+                   (unsigned long long)(i + 1),
+                   (unsigned long long)n_todos,
+                   todo_action_word(e->action),
+                   7, src_short, 7, dest_short);
+        }
+    }
+
+    /* Clean up rebase-merge state. */
+    remove(todo_path);
+#ifdef _WIN32
+    _rmdir(rebase_dir);
+#else
+    rmdir(rebase_dir);
+#endif
+
+    printf("Successfully rebased %s (interactively) onto %.*s.\n",
+           strncmp(head_ref, "refs/heads/", 11) == 0 ? head_ref + 11 : head_ref,
+           7, upstream_short);
+    free(todos);
+    return 0;
+
+abort_rebase:
+    {
+        char abort_reason[256];
+        fprintf(stderr, "Rolling back to original state.\n");
+        snprintf(abort_reason, sizeof(abort_reason),
+                 "rebase -i: abort — restore original %s",
+                 strncmp(head_ref, "refs/heads/", 11) == 0
+                     ? head_ref + 11 : head_ref);
+        rebase_hard_reset(&repo, &our_orig_oid, head_ref, abort_reason);
+        remove(todo_path);
+#ifdef _WIN32
+        _rmdir(rebase_dir);
+#else
+        rmdir(rebase_dir);
+#endif
+        free(todos);
+        return 1;
+    }
 }
 
 int main(int argc, char **argv) {
