@@ -72,6 +72,7 @@ static void usage(void) {
         "  checkout        Switch branches\n"
         "  merge           Merge a branch into HEAD\n"
         "  cherry-pick <c> Apply one commit's diff onto HEAD\n"
+        "  rebase <up>     Replay current branch's commits onto <upstream>\n"
         "  worktree        Manage linked worktrees (add <path> <branch> | list)\n"
         "  reset           Move HEAD (--soft or --hard)\n"
         "  stash           Snapshot working tree, reset to HEAD\n"
@@ -121,7 +122,7 @@ static void suggest_command(const char *typo) {
         "ask", "offer", "offers", "sos", "feeling", "login",
         "add", "unstage", "rm", "mv", "ls-files", "config",
         "branch", "branches", "tag", "tags",
-        "checkout", "merge", "cherry-pick", "worktree", "diff", "commit", "wip", "squash",
+        "checkout", "merge", "cherry-pick", "rebase", "worktree", "diff", "commit", "wip", "squash",
         "log", "reflog", "show", "status", "last", "amend", "undo", "restore",
         "reset", "stash", "blame", "bisect", "revert-file",
         "hash-object", "cat-file", "server", "help", NULL
@@ -10623,6 +10624,625 @@ static int cmd_cherry_pick(int argc, char **argv) {
     return 0;
 }
 
+/* ---- gut rebase ----
+ *
+ * MVP: gut rebase <upstream>
+ *
+ * Replay the current branch's commits on top of <upstream>. Semantics
+ * match git's non-interactive rebase for the common case:
+ *
+ *   Before:  A-B-C-D  (main/upstream)
+ *                \-E-F-G  (feature — HEAD)
+ *   After:   A-B-C-D-E'-F'-G'  (feature — HEAD)
+ *
+ * Finds the merge base of HEAD and upstream, collects our commits
+ * (walking first-parent from HEAD down to but not including the base),
+ * hard-resets to upstream, then applies each pick in order using the
+ * existing three-way-merge engine (base = parent(pick),
+ * ours = current HEAD, theirs = pick — identical to cherry-pick).
+ *
+ * Limitations in this MVP:
+ *   - Refuses to rebase merge commits (parent_count > 1) in the replay
+ *     range; git has non-trivial `--rebase-merges` semantics that are
+ *     out of scope for now.
+ *   - No `--continue` / `--abort` state machine: on the first conflict
+ *     we roll back to the original HEAD and print instructions. The
+ *     state-file-backed interactive flow is a separate follow-up.
+ *   - No `--onto`, `--root`, `-i` (interactive) — first two are easy
+ *     adds, `-i` is its own milestone.
+ */
+
+/* Apply one pick onto HEAD. Closely mirrors cmd_cherry_pick's inner
+ * 3-way merge loop, but without the "(cherry picked from commit ...)"
+ * trailer and with a caller-supplied reflog reason. On content
+ * conflict, writes the partial merge + diff3 markers into the working
+ * tree and index (so the user could manually resolve + commit if they
+ * wanted), and returns >0 with *had_conflicts=1. */
+static int rebase_apply_pick(gut_repo *repo,
+                             const gut_oid *pick_oid,
+                             const char *head_ref,
+                             const char *reflog_reason,
+                             gut_oid *out_new_oid,
+                             int *had_conflicts) {
+    gut_object their_obj;
+    gut_commit their_commit;
+    gut_oid their_tree, base_oid, our_oid;
+    char *pick_author = NULL;
+    char *pick_message = NULL;
+    u64 pick_author_len = 0;
+    u64 pick_message_len = 0;
+    unsigned hex_len = gut_oid_hex_size(repo->hash_algo);
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+    unsigned long rc;
+
+    *had_conflicts = 0;
+
+    /* Resolve current HEAD (the moving target of the rebase). */
+    if (repo_resolve_ref(&our_oid, repo, head_ref)) return 2;
+
+    /* Load the pick commit, snapshot its tree + parent + author +
+     * message. */
+    if (odb_read(&their_obj, &repo->odb, pick_oid)) return 2;
+    if (commit_parse(&their_commit, their_obj.data.data, their_obj.data.len)) {
+        object_destroy(&their_obj);
+        return 2;
+    }
+    object_destroy(&their_obj);
+    if (their_commit.parent_count == 0) {
+        commit_destroy(&their_commit);
+        fprintf(stderr, "error: cannot rebase a root commit\n");
+        return 2;
+    }
+    memcpy(their_tree.bytes, their_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+    memcpy(base_oid.bytes,  their_commit.parent_oids[0].bytes, GUT_OID_MAX_RAW_SIZE);
+    if (their_commit.author) {
+        pick_author_len = strlen(their_commit.author);
+        pick_author = (char *)malloc(pick_author_len + 1);
+        if (pick_author) memcpy(pick_author, their_commit.author, pick_author_len + 1);
+    }
+    if (their_commit.message) {
+        pick_message_len = strlen(their_commit.message);
+        pick_message = (char *)malloc(pick_message_len + 1);
+        if (pick_message) memcpy(pick_message, their_commit.message, pick_message_len + 1);
+    }
+    commit_destroy(&their_commit);
+
+    /* Three-way merge: base=parent(pick), ours=HEAD, theirs=pick. */
+    {
+        gut_object our_commit_obj, base_commit_obj;
+        gut_commit our_commit, base_commit;
+        gut_oid our_tree, base_tree;
+        gut_index base_idx, our_idx, their_idx, merged_idx;
+        char index_path[2048];
+        char obj_dir[2048];
+        gut_oid merge_tree_oid, new_commit_oid;
+        int has_conflicts = 0;
+        u64 i;
+
+        if (odb_read(&our_commit_obj, &repo->odb, &our_oid) ||
+            commit_parse(&our_commit,
+                         our_commit_obj.data.data, our_commit_obj.data.len)) {
+            free(pick_author); free(pick_message);
+            return 2;
+        }
+        memcpy(our_tree.bytes, our_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        commit_destroy(&our_commit);
+        object_destroy(&our_commit_obj);
+
+        if (odb_read(&base_commit_obj, &repo->odb, &base_oid) ||
+            commit_parse(&base_commit,
+                         base_commit_obj.data.data, base_commit_obj.data.len)) {
+            free(pick_author); free(pick_message);
+            return 2;
+        }
+        memcpy(base_tree.bytes, base_commit.tree_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        commit_destroy(&base_commit);
+        object_destroy(&base_commit_obj);
+
+        index_read_tree(&base_idx, &repo->odb, &base_tree);
+        index_read_tree(&our_idx,  &repo->odb, &our_tree);
+        index_read_tree(&their_idx, &repo->odb, &their_tree);
+        index_init(&merged_idx);
+
+        for (i = 0; i < our_idx.count; i++) {
+            const char *path = our_idx.entries[i].path;
+            u64 base_pos, their_pos;
+            int in_base, in_theirs;
+            gut_oid *our_blob = &our_idx.entries[i].oid;
+
+            index_find(&base_pos, &base_idx, path);
+            in_base = (base_pos < base_idx.count &&
+                       strcmp(base_idx.entries[base_pos].path, path) == 0);
+            index_find(&their_pos, &their_idx, path);
+            in_theirs = (their_pos < their_idx.count &&
+                         strcmp(their_idx.entries[their_pos].path, path) == 0);
+
+            if (!in_theirs) {
+                if (in_base) {
+                    long c;
+                    oid_compare(&c, our_blob, &base_idx.entries[base_pos].oid);
+                    if (c == 0) continue;
+                    fprintf(stderr, "CONFLICT (modify/delete): %s\n", path);
+                    has_conflicts = 1;
+                    index_add(&merged_idx, path, our_blob,
+                              our_idx.entries[i].mode, 0, 0);
+                } else {
+                    index_add(&merged_idx, path, our_blob,
+                              our_idx.entries[i].mode, 0, 0);
+                }
+                continue;
+            }
+
+            {
+                gut_oid *their_blob = &their_idx.entries[their_pos].oid;
+                long c_ot, c_ob;
+                oid_compare(&c_ot, our_blob, their_blob);
+                if (c_ot == 0) {
+                    index_add(&merged_idx, path, our_blob,
+                              our_idx.entries[i].mode, 0, 0);
+                    continue;
+                }
+                if (!in_base) {
+                    fprintf(stderr, "CONFLICT (add/add): %s\n", path);
+                    has_conflicts = 1;
+                    index_add(&merged_idx, path, our_blob,
+                              our_idx.entries[i].mode, 0, 0);
+                    continue;
+                }
+                oid_compare(&c_ob, our_blob, &base_idx.entries[base_pos].oid);
+                if (c_ob == 0) {
+                    index_add(&merged_idx, path, their_blob,
+                              their_idx.entries[their_pos].mode, 0, 0);
+                    continue;
+                }
+                {
+                    long c_tb;
+                    oid_compare(&c_tb, their_blob,
+                                &base_idx.entries[base_pos].oid);
+                    if (c_tb == 0) {
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+                }
+                {
+                    gut_object b_obj, o_obj, t_obj;
+                    diff_merge_result mr;
+                    if (odb_read(&b_obj, &repo->odb,
+                                 &base_idx.entries[base_pos].oid) ||
+                        odb_read(&o_obj, &repo->odb, our_blob) ||
+                        odb_read(&t_obj, &repo->odb, their_blob)) {
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        continue;
+                    }
+                    rc = diff_three_way(&mr,
+                        (const char *)b_obj.data.data, b_obj.data.len,
+                        (const char *)o_obj.data.data, o_obj.data.len,
+                        (const char *)t_obj.data.data, t_obj.data.len,
+                        "HEAD", "rebase",
+                        DIFF_MERGE_STYLE_STANDARD);
+                    object_destroy(&b_obj);
+                    object_destroy(&o_obj);
+                    object_destroy(&t_obj);
+                    if (rc) {
+                        has_conflicts = 1;
+                        index_add(&merged_idx, path, our_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                    } else {
+                        gut_oid merged_blob;
+                        odb_write(&merged_blob, &repo->odb, GUT_OBJ_BLOB,
+                                  (u8 *)mr.data, mr.len);
+                        index_add(&merged_idx, path, &merged_blob,
+                                  our_idx.entries[i].mode, 0, 0);
+                        if (mr.has_conflicts) {
+                            fprintf(stderr,
+                                    "CONFLICT (content): merge conflict in %s\n",
+                                    path);
+                            has_conflicts = 1;
+                        }
+                        diff_merge_destroy(&mr);
+                    }
+                }
+            }
+        }
+        /* Files new in the pick. */
+        for (i = 0; i < their_idx.count; i++) {
+            const char *path = their_idx.entries[i].path;
+            u64 our_pos;
+            index_find(&our_pos, &our_idx, path);
+            if (our_pos < our_idx.count &&
+                strcmp(our_idx.entries[our_pos].path, path) == 0)
+                continue;
+            index_add(&merged_idx, path, &their_idx.entries[i].oid,
+                      their_idx.entries[i].mode, 0, 0);
+        }
+
+        index_destroy(&base_idx);
+        index_destroy(&our_idx);
+        index_destroy(&their_idx);
+
+        snprintf(index_path, sizeof(index_path), "%s/index", repo->git_dir);
+        {
+            gut_index old_idx;
+            index_read(&old_idx, index_path);
+            workdir_remove_stale(repo, &old_idx, &merged_idx);
+            index_destroy(&old_idx);
+        }
+        workdir_write_from_index(repo, &merged_idx);
+
+        if (has_conflicts) {
+            index_write(&merged_idx, index_path);
+            index_destroy(&merged_idx);
+            free(pick_author); free(pick_message);
+            *had_conflicts = 1;
+            return 1;
+        }
+
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo->git_dir);
+        index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
+        index_write(&merged_idx, index_path);
+        index_destroy(&merged_idx);
+
+        /* Build the new commit. */
+        {
+            buf commit_buf;
+            const char *cn, *ce;
+            char cn_buf[256], ce_buf[256];
+            char timestamp[128];
+            time_t now = time(NULL);
+            gut_config cfg;
+            int have_cfg = 0;
+
+            cn = getenv("GUT_COMMITTER_NAME");
+            if (!cn) cn = getenv("GUT_AUTHOR_NAME");
+            if (!cn) cn = getenv("GIT_COMMITTER_NAME");
+            if (!cn) cn = getenv("GIT_AUTHOR_NAME");
+            ce = getenv("GUT_COMMITTER_EMAIL");
+            if (!ce) ce = getenv("GUT_AUTHOR_EMAIL");
+            if (!ce) ce = getenv("GIT_COMMITTER_EMAIL");
+            if (!ce) ce = getenv("GIT_AUTHOR_EMAIL");
+            if (!cn || !ce) {
+                char cp[2048];
+                snprintf(cp, sizeof(cp), "%s/config", repo->git_dir);
+                if (config_read(&cfg, cp) == 0) {
+                    const char *v;
+                    have_cfg = 1;
+                    if (!cn && config_get(&v, &cfg, "user", "name") == 0) cn = v;
+                    if (!ce && config_get(&v, &cfg, "user", "email") == 0) ce = v;
+                }
+            }
+            if (!cn) cn = "Unknown";
+            if (!ce) ce = "unknown@example.com";
+            snprintf(cn_buf, sizeof(cn_buf), "%s", cn);
+            snprintf(ce_buf, sizeof(ce_buf), "%s", ce);
+            if (have_cfg) config_destroy(&cfg);
+
+            {
+                long tz = 0;
+#ifdef _WIN32
+                TIME_ZONE_INFORMATION tzi;
+                if (GetTimeZoneInformation(&tzi) != TIME_ZONE_ID_INVALID)
+                    tz = -(long)tzi.Bias;
+#else
+                struct tm *lt = localtime(&now);
+                if (lt) tz = lt->tm_gmtoff / 60;
+#endif
+                snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
+                         (long long)now, tz / 60, labs(tz) % 60);
+            }
+
+            buf_create(&commit_buf, 512);
+            oid_to_hex_n(hex, &merge_tree_oid, hex_len);
+            buf_append(&commit_buf, (u8 *)"tree ", 5);
+            buf_append(&commit_buf, (u8 *)hex, hex_len);
+            buf_append_byte(&commit_buf, '\n');
+
+            oid_to_hex_n(hex, &our_oid, hex_len);
+            buf_append(&commit_buf, (u8 *)"parent ", 7);
+            buf_append(&commit_buf, (u8 *)hex, hex_len);
+            buf_append_byte(&commit_buf, '\n');
+
+            if (pick_author) {
+                buf_append(&commit_buf, (u8 *)"author ", 7);
+                buf_append(&commit_buf, (u8 *)pick_author, pick_author_len);
+                buf_append_byte(&commit_buf, '\n');
+            } else {
+                char line[512];
+                int n = snprintf(line, sizeof(line), "author %s <%s> %s\n",
+                                 cn_buf, ce_buf, timestamp);
+                buf_append(&commit_buf, (u8 *)line, (u64)n);
+            }
+            {
+                char line[512];
+                int n = snprintf(line, sizeof(line), "committer %s <%s> %s\n",
+                                 cn_buf, ce_buf, timestamp);
+                buf_append(&commit_buf, (u8 *)line, (u64)n);
+            }
+            buf_append_byte(&commit_buf, '\n');
+            if (pick_message) {
+                buf_append(&commit_buf, (u8 *)pick_message, pick_message_len);
+                if (pick_message_len == 0 ||
+                    pick_message[pick_message_len - 1] != '\n')
+                    buf_append_byte(&commit_buf, '\n');
+            }
+
+            odb_write(&new_commit_oid, &repo->odb, GUT_OBJ_COMMIT,
+                      commit_buf.data, commit_buf.len);
+            buf_destroy(&commit_buf);
+
+            repo_update_ref(repo, head_ref, &new_commit_oid, reflog_reason);
+            memcpy(out_new_oid->bytes, new_commit_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        }
+
+        free(pick_author);
+        free(pick_message);
+        return 0;
+    }
+}
+
+/* Hard-reset HEAD + index + working tree to `target`. Used both at
+ * the start of a rebase (jump to upstream) and on abort (restore the
+ * original branch tip). */
+static int rebase_hard_reset(gut_repo *repo,
+                             const gut_oid *target,
+                             const char *head_ref,
+                             const char *reflog_reason) {
+    gut_object commit_obj;
+    gut_commit commit;
+    gut_index old_idx, new_idx;
+    char index_path[2048];
+    unsigned long rc;
+
+    rc = repo_update_ref(repo, head_ref, (gut_oid *)target, reflog_reason);
+    if (rc) return 1;
+
+    rc = odb_read(&commit_obj, &repo->odb, target);
+    if (rc) return 1;
+    rc = commit_parse(&commit, commit_obj.data.data, commit_obj.data.len);
+    object_destroy(&commit_obj);
+    if (rc) return 1;
+
+    snprintf(index_path, sizeof(index_path), "%s/index", repo->git_dir);
+    index_read(&old_idx, index_path);
+
+    rc = index_read_tree(&new_idx, &repo->odb, &commit.tree_oid);
+    commit_destroy(&commit);
+    if (rc) { index_destroy(&old_idx); return 1; }
+
+    workdir_remove_stale(repo, &old_idx, &new_idx);
+    index_destroy(&old_idx);
+    workdir_write_from_index(repo, &new_idx);
+    rc = index_write(&new_idx, index_path);
+    index_destroy(&new_idx);
+    return rc ? 1 : 0;
+}
+
+static int cmd_rebase(int argc, char **argv) {
+    gut_repo repo;
+    gut_oid our_oid, our_orig_oid, upstream_oid, base_oid;
+    char cwd[2048];
+    char head_ref[256];
+    char upstream_short[GUT_OID_MAX_HEX_SIZE + 1];
+    char final_short[GUT_OID_MAX_HEX_SIZE + 1];
+    unsigned long rc;
+    long cmp;
+    const char *upstream_arg;
+    gut_oid *picks = NULL;
+    u64 n_picks = 0;
+    u64 cap = 0;
+    u64 i;
+    unsigned hex_len;
+
+    if (argc < 1) {
+        fprintf(stderr, "usage: gut rebase <upstream>\n");
+        return 1;
+    }
+    upstream_arg = argv[0];
+
+    if (!gut_getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "error: cannot get current directory\n");
+        return 1;
+    }
+    rc = repo_open(&repo, cwd);
+    if (rc) {
+        fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n");
+        return 1;
+    }
+    hex_len = gut_oid_hex_size(repo.hash_algo);
+
+    /* Resolve HEAD and upstream. */
+    rc = repo_head_ref(head_ref, sizeof(head_ref), &repo);
+    if (rc) { fprintf(stderr, "error: cannot read HEAD\n"); return 1; }
+    rc = repo_resolve_ref(&our_oid, &repo, head_ref);
+    if (rc) { fprintf(stderr, "fatal: HEAD is unborn\n"); return 1; }
+    memcpy(our_orig_oid.bytes, our_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+
+    if (resolve_object(&upstream_oid, &repo, upstream_arg)) {
+        fprintf(stderr, "fatal: invalid upstream '%s'\n", upstream_arg);
+        return 1;
+    }
+    oid_to_hex_n(upstream_short, &upstream_oid, hex_len);
+    upstream_short[hex_len] = 0;
+
+    /* Already-up-to-date: HEAD == upstream. */
+    oid_compare(&cmp, &our_oid, &upstream_oid);
+    if (cmp == 0) {
+        printf("Current branch already up to date.\n");
+        return 0;
+    }
+
+    /* Find merge base. */
+    if (find_merge_base(&base_oid, &repo.odb, &our_oid, &upstream_oid)) {
+        fprintf(stderr, "fatal: no common ancestor with '%s'\n", upstream_arg);
+        return 1;
+    }
+
+    /* Fast-forward case: our branch is an ancestor of upstream. */
+    oid_compare(&cmp, &base_oid, &our_oid);
+    if (cmp == 0) {
+        char reflog_reason[256];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "rebase: fast-forward onto %s", upstream_arg);
+        rc = rebase_hard_reset(&repo, &upstream_oid, head_ref, reflog_reason);
+        if (rc) { fprintf(stderr, "error: cannot fast-forward\n"); return 1; }
+        printf("Fast-forwarded %s to %.*s.\n",
+               strncmp(head_ref, "refs/heads/", 11) == 0 ? head_ref + 11 : head_ref,
+               7, upstream_short);
+        return 0;
+    }
+
+    /* No-op case: upstream is an ancestor of us — nothing to do. */
+    oid_compare(&cmp, &base_oid, &upstream_oid);
+    if (cmp == 0) {
+        printf("Current branch is ahead of '%s'; nothing to rebase.\n",
+               upstream_arg);
+        return 0;
+    }
+
+    /* Diverged: collect our commits from HEAD down to base. Walk
+     * first-parent; refuse merge commits for MVP. */
+    {
+        gut_oid cur;
+        memcpy(cur.bytes, our_oid.bytes, GUT_OID_MAX_RAW_SIZE);
+        for (;;) {
+            gut_object obj;
+            gut_commit c;
+            long is_base;
+
+            oid_compare(&is_base, &cur, &base_oid);
+            if (is_base == 0) break;
+
+            if (odb_read(&obj, &repo.odb, &cur)) {
+                fprintf(stderr, "error: broken history at %s\n", upstream_arg);
+                free(picks);
+                return 1;
+            }
+            if (commit_parse(&c, obj.data.data, obj.data.len)) {
+                object_destroy(&obj);
+                free(picks);
+                return 1;
+            }
+            object_destroy(&obj);
+
+            if (c.parent_count > 1) {
+                char hex[GUT_OID_MAX_HEX_SIZE + 1];
+                oid_to_hex_n(hex, &cur, hex_len);
+                hex[hex_len] = 0;
+                fprintf(stderr,
+                        "error: cannot rebase merge commit %.*s "
+                        "(merge-rebase not yet supported)\n", 7, hex);
+                commit_destroy(&c);
+                free(picks);
+                return 1;
+            }
+            if (c.parent_count == 0) {
+                /* Root before base — shouldn't happen if find_merge_base
+                 * succeeded. */
+                commit_destroy(&c);
+                fprintf(stderr, "error: hit root commit during walk\n");
+                free(picks);
+                return 1;
+            }
+            if (n_picks == cap) {
+                cap = cap ? cap * 2 : 16;
+                picks = (gut_oid *)realloc(picks, (size_t)cap * sizeof(gut_oid));
+                if (!picks) { commit_destroy(&c); return 1; }
+            }
+            memcpy(picks[n_picks].bytes, cur.bytes, GUT_OID_MAX_RAW_SIZE);
+            n_picks++;
+            memcpy(cur.bytes, c.parent_oids[0].bytes, GUT_OID_MAX_RAW_SIZE);
+            commit_destroy(&c);
+        }
+    }
+
+    /* Reverse: we collected newest-first, replay needs oldest-first. */
+    for (i = 0; i < n_picks / 2; i++) {
+        gut_oid tmp;
+        memcpy(tmp.bytes, picks[i].bytes, GUT_OID_MAX_RAW_SIZE);
+        memcpy(picks[i].bytes, picks[n_picks - 1 - i].bytes, GUT_OID_MAX_RAW_SIZE);
+        memcpy(picks[n_picks - 1 - i].bytes, tmp.bytes, GUT_OID_MAX_RAW_SIZE);
+    }
+
+    printf("Rebasing %llu commit%s onto %.*s...\n",
+           (unsigned long long)n_picks, n_picks == 1 ? "" : "s",
+           7, upstream_short);
+
+    /* Move HEAD (+index +workdir) to upstream. */
+    {
+        char reflog_reason[256];
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "rebase: start onto %s", upstream_arg);
+        if (rebase_hard_reset(&repo, &upstream_oid, head_ref, reflog_reason)) {
+            fprintf(stderr, "error: cannot move HEAD to upstream\n");
+            free(picks);
+            return 1;
+        }
+    }
+
+    /* Apply each pick in order. */
+    for (i = 0; i < n_picks; i++) {
+        gut_oid new_oid;
+        char src_hex[GUT_OID_MAX_HEX_SIZE + 1];
+        char reflog_reason[256];
+        int conflict = 0;
+        int apply_rc;
+
+        oid_to_hex_n(src_hex, &picks[i], hex_len);
+        src_hex[hex_len] = 0;
+
+        snprintf(reflog_reason, sizeof(reflog_reason),
+                 "rebase: apply %.*s", 7, src_hex);
+
+        apply_rc = rebase_apply_pick(&repo, &picks[i], head_ref,
+                                     reflog_reason, &new_oid, &conflict);
+        if (apply_rc != 0 || conflict) {
+            char abort_reason[256];
+            fprintf(stderr,
+                    "\nerror: rebase stopped at commit %.*s (%llu/%llu). "
+                    "Rolling back to original state.\n",
+                    7, src_hex,
+                    (unsigned long long)(i + 1),
+                    (unsigned long long)n_picks);
+            snprintf(abort_reason, sizeof(abort_reason),
+                     "rebase: abort — restore original %s",
+                     strncmp(head_ref, "refs/heads/", 11) == 0
+                         ? head_ref + 11 : head_ref);
+            if (rebase_hard_reset(&repo, &our_orig_oid, head_ref, abort_reason)) {
+                fprintf(stderr, "error: abort-restore failed; "
+                                "branch may be left partially rebased\n");
+            } else {
+                fprintf(stderr,
+                        "Restored %s to the original commit.\n",
+                        strncmp(head_ref, "refs/heads/", 11) == 0
+                            ? head_ref + 11 : head_ref);
+            }
+            free(picks);
+            return 1;
+        }
+        {
+            char new_short[GUT_OID_MAX_HEX_SIZE + 1];
+            oid_to_hex_n(new_short, &new_oid, hex_len);
+            new_short[hex_len] = 0;
+            printf("  Applied [%llu/%llu]: %.*s -> %.*s\n",
+                   (unsigned long long)(i + 1),
+                   (unsigned long long)n_picks,
+                   7, src_hex, 7, new_short);
+            if (i == n_picks - 1) {
+                memcpy(final_short, new_short, sizeof(final_short));
+            }
+        }
+    }
+
+    free(picks);
+    printf("Successfully rebased %s onto %.*s.\n",
+           strncmp(head_ref, "refs/heads/", 11) == 0 ? head_ref + 11 : head_ref,
+           7, upstream_short);
+    (void)final_short;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage();
@@ -10734,6 +11354,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "cherry-pick") == 0) {
         return cmd_cherry_pick(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "rebase") == 0) {
+        return cmd_rebase(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "worktree") == 0) {
         return cmd_worktree(argc - 2, argv + 2);

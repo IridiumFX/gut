@@ -89,13 +89,30 @@ not just a command glued on top of existing primitives.
       Eight apennines iterations (000120→000128) over one evening
       got this to green.
 
-- [ ] **Interactive rebase** — `gut rebase -i <upstream>`. We have
-      `gut squash N` and `gut amend` as partial building blocks.
-      Needs: a "todo script" (pick/reword/edit/squash/fixup/drop per
-      commit), an editor-launcher, and the replay loop that walks
-      commits in order, stopping on conflict and letting the user
-      `--continue`/`--abort`. Non-interactive `gut rebase <upstream>`
-      (just replay) is a useful intermediate milestone.
+- [x] **Non-interactive rebase** — `gut rebase <upstream>` replays
+      the current branch's commits on top of `<upstream>` via the
+      three-way-merge engine. Finds merge-base, collects picks by
+      walking first-parent from HEAD down to (but not including) the
+      base, hard-resets to upstream, applies each pick via
+      `rebase_apply_pick` (preserves the original author line,
+      current-user committer, no cherry-pick trailer). Four paths
+      verified: linear-diverged replay (`A-B-E-F-G + A-B-C-D →
+      A-B-C-D-E'-F'-G'`), fast-forward (HEAD is ancestor of
+      upstream), already-up-to-date, and conflict-abort (on any
+      content conflict, rolls back to the original HEAD so the
+      branch is never left in a half-rebased state). **Real git**
+      reads the rebased history cleanly (`git log`, `git cat-file
+      -p`, `git fsck`).
+      MVP limitations: refuses merge commits in the replay range
+      (git's `--rebase-merges` semantics are substantial); no
+      `--continue`/`--abort` state machine yet (the rollback on
+      conflict is more conservative than git's "fix and continue"
+      flow); no `--onto`, `--root`, `-i`.
+- [ ] **Interactive rebase** — `gut rebase -i <upstream>`. Building
+      blocks all shipped now: non-interactive rebase above,
+      `gut squash` for squash/fixup, `gut amend` for reword. Needs
+      a todo-script editor-launch loop, state file under
+      `.git/rebase-merge/` for `--continue`/`--abort`.
 
 - [x] **Cherry-pick** — `gut cherry-pick <commit>` replays one
       commit's diff (commit − parent(commit)) onto HEAD via the
