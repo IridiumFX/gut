@@ -16,10 +16,10 @@
  */
 
 #include "gut/remote.h"
+#include "gut/known_hosts.h"
 #include "apennines/ssh.h"
 #include "apennines/buf.h"
 #include "apennines/pem.h"
-#include "apennines/ec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -456,12 +456,11 @@ static int has_pktline_flush(const u8 *buf_data, u64 len) {
  *   mode = DRAIN_UNTIL_PKTLINE_FLUSH — stop when a pkt-line flush
  *     packet (0000) is found in the accumulated stdout buffer (used
  *     for the refs advertisement phase)
- *   mode = DRAIN_UNTIL_CLOSED — stop after several consecutive empty
- *     reads (best heuristic we have while apennines doesn't expose a
- *     channel-closed accessor; used for the pack data phase where the
- *     server closes when done)
- * stderr is always polled and written to the user's stderr, so git-
- * upload-pack error messages aren't lost. */
+ *   mode = DRAIN_UNTIL_CLOSED — stop when ssh_channel_is_closed
+ *     reports 1 (CHANNEL_EOF or CHANNEL_CLOSE arrived), used for the
+ *     pack data phase
+ * stderr is always polled and written to the user's stderr, so
+ * git-upload-pack error messages aren't lost. */
 #define DRAIN_UNTIL_PKTLINE_FLUSH  1
 #define DRAIN_UNTIL_CLOSED         2
 
@@ -471,19 +470,14 @@ static unsigned long drain_channel_until(u8 **out, u64 *out_len,
     u8 chunk[8192];
     u64 n;
     unsigned long rc;
-    int empty_strikes = 0;
-    const int MAX_EMPTY_STRIKES = 8;
 
     if (buf_create(&b, 8192)) return __LINE__;
 
     for (;;) {
-        int got_something = 0;
-
         rc = ssh_channel_read(&n, ch, chunk, sizeof(chunk));
         if (rc) break;
         if (n > 0) {
             if (buf_append(&b, chunk, n)) { buf_destroy(&b); return __LINE__; }
-            got_something = 1;
         }
 
         {
@@ -492,7 +486,6 @@ static unsigned long drain_channel_until(u8 **out, u64 *out_len,
             if (ssh_channel_read_stderr(&en, ch, echunk, sizeof(echunk)) == 0 &&
                 en > 0) {
                 fwrite(echunk, 1, (size_t)en, stderr);
-                got_something = 1;
             }
         }
 
@@ -501,12 +494,9 @@ static unsigned long drain_channel_until(u8 **out, u64 *out_len,
              * accumulated buffer, we're done with this phase — the
              * server is now waiting for our wants/haves/done. */
             if (has_pktline_flush(b.data, b.len)) break;
-        }
-
-        if (got_something) {
-            empty_strikes = 0;
-        } else {
-            if (++empty_strikes >= MAX_EMPTY_STRIKES) break;
+        } else /* DRAIN_UNTIL_CLOSED */ {
+            int closed = 0;
+            if (ssh_channel_is_closed(&closed, ch) == 0 && closed) break;
         }
     }
 
@@ -525,6 +515,91 @@ static unsigned long drain_channel(u8 **out, u64 *out_len, ssh_channel *ch) {
  *  Low-level: open ssh conn, auth, channel, exec <command>
  * ==================================================================== */
 
+/* Verifier context — passed through ssh_conn_create_ex to our
+ * host-key-pinning callback. Carries the parsed known_hosts plus an
+ * opt-in TOFU flag (when set, unknown hosts are accepted on first
+ * use and appended to the known_hosts file). */
+typedef struct {
+    gut_khosts *khosts;
+    char        path[1024];   /* known_hosts path we loaded from */
+    int         tofu_accept;  /* non-zero → accept UNKNOWN and append */
+    int         verbose;
+} verify_ctx_t;
+
+/* Verifier called by apennines during KEX, after the server's sig
+ * is verified and before transport keys derive. Returning non-zero
+ * aborts ssh_conn_create_ex with hatch 5 sub 8.
+ *
+ * hostkey_blob is the SSH wire blob: string("ssh-ed25519") + string(pub).
+ * We only support ed25519 here — other key types are treated as
+ * UNKNOWN (equivalent to TOFU). */
+static unsigned long gut_ssh_verifier(void *ctx, const char *host, u16 port,
+                                      const u8 *hostkey_blob, u64 blob_len) {
+    verify_ctx_t *v = (verify_ctx_t *)ctx;
+    gut_khosts_match m;
+    const u8 *pub;
+
+    if (!v || !v->khosts) return 0;  /* no pinning configured → accept */
+
+    /* Crack the blob: 4B len(11) "ssh-ed25519" 4B len(32) 32B pub */
+    if (blob_len != 4 + 11 + 4 + 32) {
+        if (v->verbose) fprintf(stderr,
+            "[ssh] host key is not ssh-ed25519 (blob_len=%llu) — accepting under TOFU\n",
+            (unsigned long long)blob_len);
+        return 0;
+    }
+    {
+        u32 tlen = ((u32)hostkey_blob[0] << 24) |
+                   ((u32)hostkey_blob[1] << 16) |
+                   ((u32)hostkey_blob[2] << 8)  | (u32)hostkey_blob[3];
+        if (tlen != 11 || memcmp(hostkey_blob + 4, "ssh-ed25519", 11) != 0) {
+            if (v->verbose) fprintf(stderr,
+                "[ssh] host key type not ssh-ed25519 — accepting under TOFU\n");
+            return 0;
+        }
+    }
+    pub = hostkey_blob + 4 + 11 + 4;
+
+    if (khosts_lookup_ed25519(&m, v->khosts, host, port, pub) != 0) {
+        fprintf(stderr, "error: khosts_lookup_ed25519 failed\n");
+        return 1;
+    }
+
+    switch (m) {
+        case KHOSTS_MATCH_PINNED:
+            if (v->verbose)
+                fprintf(stderr, "[ssh] host key PINNED for %s:%u\n", host, port);
+            return 0;
+        case KHOSTS_MATCH_MISMATCH:
+            fprintf(stderr,
+                "error: host key mismatch for %s:%u — possible MITM, "
+                "refusing connection\n", host, port);
+            fprintf(stderr,
+                "  if the remote legitimately rotated its key, remove the "
+                "old entry from %s first\n", v->path);
+            return 2;
+        case KHOSTS_MATCH_REVOKED:
+            fprintf(stderr,
+                "error: host key for %s:%u is @revoked — refusing connection\n",
+                host, port);
+            return 3;
+        case KHOSTS_MATCH_UNKNOWN:
+        default:
+            if (v->tofu_accept) {
+                if (v->verbose || 1)
+                    fprintf(stderr,
+                        "warning: unknown host %s:%u — pinning key on first use\n",
+                        host, port);
+                (void)khosts_append_ed25519(v->path, host, port, pub);
+                return 0;
+            }
+            fprintf(stderr,
+                "error: unknown host %s:%u — refusing (set GUT_SSH_TOFU=1 to "
+                "accept-and-pin on first use)\n", host, port);
+            return 4;
+    }
+}
+
 static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                                    const ssh_url_parts *u, const char *cmd) {
     u8 seed[32];
@@ -533,9 +608,13 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                              getenv("GUT_SSH_PRIVKEY_FILE"));
     int force_agent = (getenv("GUT_SSH_USE_AGENT") != NULL);
     int verbose = getenv("GUT_SSH_DEBUG") != NULL;
+    int no_pin = (getenv("GUT_SSH_NO_PIN") != NULL);
+    int tofu = (getenv("GUT_SSH_TOFU") != NULL);
     ssh_conn *c = NULL;
     ssh_channel *ch = NULL;
     unsigned long rc;
+    verify_ctx_t vctx;
+    gut_khosts *k = NULL;
 
     /* Key-file path is opt-in for testing: only try to load a seed
      * from disk if the caller explicitly pointed us at one. Otherwise
@@ -552,9 +631,35 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
         }
     }
 
-    /* ssh_conn_create handles DNS internally since apennines 000121 —
-     * pass the hostname directly. */
-    rc = ssh_conn_create(&c, u->host, u->port);
+    /* Host-key pinning via known_hosts + apennines' verifier callback.
+     * Opt out via GUT_SSH_NO_PIN=1 (back to pure TOFU from apennines). */
+    memset(&vctx, 0, sizeof(vctx));
+    vctx.verbose = verbose;
+    vctx.tofu_accept = tofu;
+    if (!no_pin) {
+        const char *override = getenv("GUT_KHOSTS_FILE");
+        if (override) {
+            snprintf(vctx.path, sizeof(vctx.path), "%s", override);
+        } else if (khosts_default_path(vctx.path, sizeof(vctx.path)) != 0) {
+            vctx.path[0] = '\0';
+        }
+        if (vctx.path[0]) {
+            if (khosts_open(&k, vctx.path) == 0) {
+                vctx.khosts = k;
+                if (verbose)
+                    fprintf(stderr, "[ssh] loaded known_hosts from %s\n", vctx.path);
+            }
+        }
+    }
+
+    /* ssh_conn_create_ex handles DNS internally since apennines 000121
+     * and runs our verifier callback after the server's hostkey sig
+     * is verified — if the verifier returns non-zero, the connection
+     * is torn down before any encrypted data flows. Passing NULL
+     * verifier = TOFU (apennines 000128 behavior). */
+    rc = ssh_conn_create_ex(&c, u->host, u->port,
+                            vctx.khosts ? gut_ssh_verifier : NULL,
+                            vctx.khosts ? &vctx : NULL);
     if (rc) {
         unsigned long sub = 0;
         const char *where = "(unknown)";
@@ -567,7 +672,7 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                 case 5: where = "kex: recv/parse ECDH_REPLY"; break;
                 case 6: where = "kex: x25519 DH"; break;
                 case 7: where = "kex: exchange-hash sha256"; break;
-                case 8: where = "kex: host-key signature verify"; break;
+                case 8: where = "kex: host-key verifier rejected"; break;
                 case 9: where = "kex: derive transport keys"; break;
                 case 10: where = "kex: send NEWKEYS"; break;
                 case 11: where = "kex: recv NEWKEYS"; break;
@@ -575,26 +680,22 @@ static unsigned long ssh_exec_open(ssh_conn **conn_out, ssh_channel **ch_out,
                 default: break;
             }
         }
-        fprintf(stderr, "error: ssh_conn_create failed (rc=%lu sub=%lu) — "
-                "%s — host=%s port=%u\n",
-                rc, sub, where, u->host, u->port);
+        if (rc != 5 || sub != 8) {  /* sub=8 already printed its own message */
+            fprintf(stderr, "error: ssh_conn_create failed (rc=%lu sub=%lu) — "
+                    "%s — host=%s port=%u\n",
+                    rc, sub, where, u->host, u->port);
+        }
+        khosts_close(k);
         return __LINE__;
     }
+    khosts_close(k);
+    vctx.khosts = NULL;
     if (have_seed) {
-        /* Expand the 32-byte seed into apennines' 64-byte expanded
-         * form (scalar || prefix = SHA-512(seed) with the standard
-         * ed25519 bit-pruning). ssh_conn_auth_pubkey expects the
-         * expanded shape, not the raw seed. */
-        ed25519_seed s;
-        ed25519_keypair kp;
-        memcpy(s.data, seed, 32);
-        if (ed25519_keygen_from_seed(&kp, &s)) {
-            fprintf(stderr, "error: ed25519_keygen_from_seed failed\n");
-            ssh_conn_destroy(c);
-            return __LINE__;
-        }
-        if (verbose) fprintf(stderr, "[ssh] auth: pubkey (env-provided seed, expanded)\n");
-        rc = ssh_conn_auth_pubkey(c, u->user, kp.priv.data, ED25519_PRIVKEY_LEN);
+        /* Since apennines 000129, ssh_conn_auth_pubkey accepts either
+         * the 32-byte raw seed or the 64-byte expanded form; we pass
+         * the seed directly and let it expand internally. */
+        if (verbose) fprintf(stderr, "[ssh] auth: pubkey (env-provided seed)\n");
+        rc = ssh_conn_auth_pubkey(c, u->user, seed, 32);
     } else {
         if (verbose) fprintf(stderr, "[ssh] auth: ssh-agent\n");
         rc = ssh_conn_auth_agent(c, u->user);

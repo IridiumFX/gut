@@ -145,6 +145,17 @@ struct ssh_conn {
      * replaces HMAC). */
     u64           gcm_ctr_c2s;
     u64           gcm_ctr_s2c;
+
+    /* Host-key verifier (set by ssh_conn_create_ex; NULL means TOFU
+     * accept). Called inside KEX after sig verification succeeds but
+     * before we commit transport keys. Return non-zero to reject. */
+    ssh_hostkey_verifier_fn verifier_fn;
+    void                   *verifier_ctx;
+    /* Copy of the host string passed to create_ex — needed because
+     * the verifier is invoked inside ssh_key_exchange, long after the
+     * caller's pointer may have been freed. */
+    char                    verify_host[256];
+    u16                     verify_port;
 };
 
 /* ================================================================
@@ -967,6 +978,20 @@ static unsigned long ssh_key_exchange_impl(ssh_conn *conn) {
                     if (vrc != 0) return 8;
                     if (!valid)   return 8;
                 }
+
+                /* Host-key verifier hook. Runs here — after sig verify
+                 * confirms the server owns K_S, but BEFORE we derive
+                 * transport keys or send NEWKEYS. A rejection aborts
+                 * the handshake with no encrypted data leaked. */
+                if (conn->verifier_fn) {
+                    unsigned long vok = conn->verifier_fn(conn->verifier_ctx,
+                                                           conn->verify_host,
+                                                           conn->verify_port,
+                                                           host_key_blob,
+                                                           hk_len);
+                    SSH_DBG("KEX: hostkey_verifier rc=%lu\n", vok);
+                    if (vok != 0) return 8;
+                }
             }
         }
     }
@@ -1022,8 +1047,10 @@ static unsigned long ssh_key_exchange_impl(ssh_conn *conn) {
  *  ssh_conn_create
  * ================================================================ */
 
-unsigned long ssh_conn_create(ssh_conn **out,
-                                             const char *host, u16 port) {
+unsigned long ssh_conn_create_ex(ssh_conn **out,
+                                                const char *host, u16 port,
+                                                ssh_hostkey_verifier_fn verifier,
+                                                void *verifier_ctx) {
     ssh_conn *conn;
     net_sock_addr addr;
     unsigned long rc;
@@ -1033,6 +1060,15 @@ unsigned long ssh_conn_create(ssh_conn **out,
 
     conn = (ssh_conn *)calloc(1, sizeof(ssh_conn));
     if (!conn) return 6;
+
+    /* Stash verifier + host/port for the KEX hook. Host is copied (the
+     * caller's string could be freed before KEX runs — unlikely in
+     * practice but the copy is cheap and the rule is clear). */
+    conn->verifier_fn  = verifier;
+    conn->verifier_ctx = verifier_ctx;
+    strncpy(conn->verify_host, host, sizeof(conn->verify_host) - 1);
+    conn->verify_host[sizeof(conn->verify_host) - 1] = '\0';
+    conn->verify_port = port;
 
     /* Resolve host to an IP and connect via TCP. addr_sockaddr_create only
      * accepts literal IPv4/IPv6, so if that fails (hostname was passed),
@@ -1076,7 +1112,7 @@ unsigned long ssh_conn_create(ssh_conn **out,
         return 4;
     }
 
-    /* Key exchange */
+    /* Key exchange (invokes the host-key verifier internally if set) */
     rc = ssh_key_exchange(conn);
     if (rc != 0) {
         tcp_conn_destroy(&conn->tcp);
@@ -1095,6 +1131,11 @@ unsigned long ssh_conn_create(ssh_conn **out,
 
     *out = conn;
     return 0;
+}
+
+unsigned long ssh_conn_create(ssh_conn **out,
+                                             const char *host, u16 port) {
+    return ssh_conn_create_ex(out, host, port, NULL, NULL);
 }
 
 /* ================================================================
@@ -1203,13 +1244,32 @@ unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
     if (!conn)    return 1;
     if (!username) return 2;
     if (!privkey)  return 3;
-    if (privkey_len != ED25519_PRIVKEY_LEN) return 3;
+    /* Accept either 32-byte raw seed (we expand internally) or 64-byte
+     * pre-expanded ed25519 private key. Most users have raw seeds from
+     * OpenSSH-format private keys; making them call ed25519_keygen_from_seed
+     * first was a needless integration step. */
+    if (privkey_len != ED25519_SEED_LEN &&
+        privkey_len != ED25519_PRIVKEY_LEN) return 3;
 
     /* RFC 4253 §10 — ssh-userauth service negotiation. */
     if (ssh_request_userauth_service(conn) != 0) return 6;
 
-    memcpy(epriv.data, privkey, ED25519_PRIVKEY_LEN);
-    if (ed25519_pubkey_from_privkey(&epub, &epriv) != 0) return 5;
+    if (privkey_len == ED25519_SEED_LEN) {
+        ed25519_seed    seed;
+        ed25519_keypair kp;
+        memcpy(seed.data, privkey, ED25519_SEED_LEN);
+        if (ed25519_keygen_from_seed(&kp, &seed) != 0) {
+            memset(seed.data, 0, ED25519_SEED_LEN);
+            return 5;
+        }
+        memcpy(epriv.data, kp.priv.data, ED25519_PRIVKEY_LEN);
+        memcpy(epub.data,  kp.pub.data,  ED25519_PUBKEY_LEN);
+        memset(seed.data, 0, ED25519_SEED_LEN);
+        memset(&kp, 0, sizeof(kp));
+    } else {
+        memcpy(epriv.data, privkey, ED25519_PRIVKEY_LEN);
+        if (ed25519_pubkey_from_privkey(&epub, &epriv) != 0) return 5;
+    }
 
     /* Build public key blob: "ssh-ed25519" + raw pubkey */
     pb_init(&pkb, pubkey_blob, sizeof(pubkey_blob));
@@ -1944,6 +2004,22 @@ unsigned long ssh_channel_read_stderr(u64 *bytes_read,
         *bytes_read = copy;
     }
 
+    return 0;
+}
+
+/* ================================================================
+ *  ssh_channel_is_closed — non-blocking accessor for the channel's
+ *  close state. True (1) once we've received CHANNEL_EOF (96) or
+ *  CHANNEL_CLOSE (97) from the server, or sent our own CHANNEL_CLOSE.
+ *
+ *  Lets a drain loop return as soon as the server signals EOF,
+ *  without a consecutive-empty-reads heuristic.
+ * ================================================================ */
+
+unsigned long ssh_channel_is_closed(int *out, ssh_channel *ch) {
+    if (!out) return 1;
+    if (!ch)  return 2;
+    *out = ch->closed;
     return 0;
 }
 

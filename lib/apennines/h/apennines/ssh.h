@@ -10,9 +10,35 @@
 typedef struct ssh_conn    ssh_conn;
 typedef struct ssh_channel ssh_channel;
 
+/* ---- Host-key verifier callback ----
+ *
+ * Invoked inside KEX after the server's host key signature verifies
+ * (so we know the server genuinely owns K_S) but before we commit
+ * transport keys (so a rejection can abort the handshake before any
+ * encrypted data flows). The caller wires in e.g. a known_hosts
+ * lookup to enforce TOFU + pinning semantics.
+ *
+ *   ctx:              arbitrary user pointer (from ssh_conn_create_ex)
+ *   host:             unresolved hostname string as passed to create
+ *   port:             TCP port
+ *   hostkey_blob:     SSH wire blob — string("ssh-ed25519") + string(pub)
+ *   hostkey_blob_len: blob length
+ *
+ * Return 0 to accept, any non-zero to reject. Rejection causes
+ * ssh_conn_create / _ex to fail with hatch 5 (kex), and
+ * ssh_last_kex_sub_hatch() returns 8 (sig/host-key rejected). */
+typedef unsigned long (*ssh_hostkey_verifier_fn)(
+    void *ctx,
+    const char *host,
+    u16 port,
+    const u8 *hostkey_blob,
+    u64 hostkey_blob_len);
+
 /* ---- Connection ---- */
 
 /* ssh_conn_create — create SSH connection (TCP + key exchange).
+ * Equivalent to ssh_conn_create_ex with a NULL verifier (= TOFU).
+ *
  *   out:   receives connection handle
  *   host:  server hostname
  *   port:  server port (usually 22)
@@ -23,6 +49,18 @@ typedef struct ssh_channel ssh_channel;
 unsigned long ssh_conn_create(ssh_conn **out,
                                              const char *host, u16 port);
 
+/* ssh_conn_create_ex — like ssh_conn_create but with a host-key
+ * verifier callback. If `verifier` is NULL, behaves identically to
+ * ssh_conn_create (TOFU accept). If non-NULL, KEX rejects any host
+ * the verifier doesn't accept.
+ *
+ * Same hatches as ssh_conn_create. When verifier rejects, returns 5
+ * and ssh_last_kex_sub_hatch() returns 8. */
+unsigned long ssh_conn_create_ex(ssh_conn **out,
+                                                const char *host, u16 port,
+                                                ssh_hostkey_verifier_fn verifier,
+                                                void *verifier_ctx);
+
 /* ssh_conn_auth_password — authenticate with password.
  * Hatches: 1=null conn, 2=null username, 3=null password,
  *          4=auth rejected, 5=protocol error */
@@ -30,8 +68,16 @@ unsigned long ssh_conn_auth_password(ssh_conn *conn,
                                                     const char *username,
                                                     const char *password);
 
-/* ssh_conn_auth_pubkey — authenticate with public key.
- * Hatches: 1=null conn, 2=null username, 3=null privkey,
+/* ssh_conn_auth_pubkey — authenticate with ed25519 public key.
+ *
+ * privkey may be either:
+ *   - 32 bytes: raw ed25519 seed (we expand internally)
+ *   - 64 bytes: pre-expanded ed25519 private key (scalar || prefix)
+ *
+ * OpenSSH-format private keys yield the 32-byte seed; TLS-style
+ * expanded forms yield 64. Either works.
+ *
+ * Hatches: 1=null conn, 2=null username, 3=null privkey or wrong length,
  *          4=auth rejected, 5=sign failure, 6=protocol error */
 unsigned long ssh_conn_auth_pubkey(ssh_conn *conn,
                                                   const char *username,
@@ -105,6 +151,14 @@ unsigned long ssh_channel_read(u64 *bytes_read, ssh_channel *ch,
 unsigned long ssh_channel_read_stderr(u64 *bytes_read,
                                                      ssh_channel *ch,
                                                      u8 *buf, u64 len);
+
+/* ssh_channel_is_closed — non-blocking accessor for close state.
+ * *out is set to 1 after CHANNEL_EOF (96) / CHANNEL_CLOSE (97) is
+ * received, or after we've sent our own CHANNEL_CLOSE; 0 otherwise.
+ * Lets drain loops avoid strike-count heuristics.
+ *
+ * Hatches: 1=null out, 2=null ch */
+unsigned long ssh_channel_is_closed(int *out, ssh_channel *ch);
 
 unsigned long ssh_channel_write(u64 *bytes_written, ssh_channel *ch,
                                                const u8 *data, u64 len);
