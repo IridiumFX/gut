@@ -1,4 +1,5 @@
 #include "gut/remote.h"
+#include "gut/cred_helper.h"
 #include "apennines/https_client.h"
 #include "apennines/http_client.h"
 #include "apennines/buf.h"
@@ -182,6 +183,245 @@ static unsigned long http_post(u8 **resp_body, u64 *resp_body_len,
     return 0;
 }
 
+/* ====================================================================
+ *  Credential-helper integration
+ *
+ *  When an HTTPS smart-protocol call returns 401 Unauthorized, resolve
+ *  the configured credential helper (via GUT_CREDENTIAL_HELPER env, a
+ *  `credential.helper` config key in the hinted git dir, or nothing),
+ *  run `<helper> get` for the URL, and retry the request with HTTP
+ *  Basic auth.
+ *
+ *  A module-local cache keeps the creds once obtained so the next HTTP
+ *  call in the same flow (e.g. fetch-pack after discover-refs) doesn't
+ *  re-invoke the helper.
+ * ==================================================================== */
+
+typedef struct {
+    int      valid;
+    char     scheme_host[320];   /* "https://github.com" — cache key */
+    char     username[256];
+    char     password[512];
+} cred_cache_t;
+
+static cred_cache_t g_cred_cache = {0};
+/* Git dir hint for where to look for `credential.helper`. Set by a
+ * repo-aware caller before it makes HTTP calls; NULL for `gut clone`. */
+static const char *g_git_dir_hint = NULL;
+
+/* Called by cmd_fetch / cmd_push before issuing HTTP calls; lets us
+ * find `credential.helper` in the current repo's .git/config. For
+ * `gut clone` the repo doesn't exist yet, so this stays NULL and we
+ * fall through to GUT_CREDENTIAL_HELPER only. */
+void remote_set_cred_git_dir(const char *git_dir) {
+    g_git_dir_hint = git_dir;
+}
+
+/* Extract "<scheme>://<host>" from a full URL for cache keying.
+ * Ignores port, path, userinfo. */
+static void make_cache_key(char *out, u64 out_sz, const char *url) {
+    const char *scheme_end;
+    const char *authority;
+    const char *at;
+    const char *p;
+    const char *host_end;
+
+    out[0] = '\0';
+    scheme_end = strstr(url, "://");
+    if (!scheme_end) return;
+    authority = scheme_end + 3;
+    at = authority;
+    p = authority;
+    while (*p && *p != '/' && *p != '@') p++;
+    authority = (*p == '@') ? p + 1 : at;
+    host_end = authority;
+    while (*host_end && *host_end != '/' && *host_end != ':') host_end++;
+    snprintf(out, (size_t)out_sz, "%.*s://%.*s",
+             (int)(scheme_end - url), url,
+             (int)(host_end - authority), authority);
+}
+
+static unsigned long resolve_cred_helper_name(char *out, u64 out_sz) {
+    const char *env = getenv("GUT_CREDENTIAL_HELPER");
+    if (env && *env) {
+        if (strlen(env) >= out_sz) return __LINE__;
+        snprintf(out, (size_t)out_sz, "%s", env);
+        return 0;
+    }
+    if (g_git_dir_hint) {
+        return cred_helper_from_config(out, out_sz, g_git_dir_hint);
+    }
+    return __LINE__;
+}
+
+/* Try to fill (user_out, pass_out) from the credential helper for
+ * the given URL. Returns 0 on success. Consults the in-flight cache
+ * first. */
+static unsigned long resolve_credentials_for_url(const char *url,
+                                                 char *user_out, u64 user_sz,
+                                                 char *pass_out, u64 pass_sz) {
+    char helper[256];
+    gut_cred_request req;
+    gut_cred_response resp;
+    char key[320];
+
+    make_cache_key(key, sizeof(key), url);
+    if (g_cred_cache.valid &&
+        strcmp(g_cred_cache.scheme_host, key) == 0) {
+        snprintf(user_out, (size_t)user_sz, "%s", g_cred_cache.username);
+        snprintf(pass_out, (size_t)pass_sz, "%s", g_cred_cache.password);
+        return 0;
+    }
+
+    if (resolve_cred_helper_name(helper, sizeof(helper)) != 0) return __LINE__;
+    if (cred_request_from_url(&req, url) != 0) return __LINE__;
+    if (cred_helper_get(&resp, helper, &req) != 0) return __LINE__;
+
+    snprintf(user_out, (size_t)user_sz, "%s", resp.username);
+    snprintf(pass_out, (size_t)pass_sz, "%s", resp.password);
+
+    /* Cache for subsequent calls in the same flow. */
+    g_cred_cache.valid = 1;
+    snprintf(g_cred_cache.scheme_host, sizeof(g_cred_cache.scheme_host),
+             "%s", key);
+    snprintf(g_cred_cache.username, sizeof(g_cred_cache.username),
+             "%s", resp.username);
+    snprintf(g_cred_cache.password, sizeof(g_cred_cache.password),
+             "%s", resp.password);
+    return 0;
+}
+
+/* HTTPS GET that retries with credential-helper creds on 401.
+ * For non-HTTPS URLs, falls through to plain http_get unchanged. */
+static unsigned long http_get_auth_aware(u8 **body, u64 *body_len,
+                                         const char *url) {
+    https_client *c;
+    https_response resp;
+    unsigned long rc;
+    int retried = 0;
+    char user[256];
+    char pass[512];
+
+    if (!is_https(url)) return http_get(body, body_len, url);
+
+    rc = https_client_create(&c);
+    if (rc) return __LINE__;
+
+    /* Preemptively attach cached creds if we have them — saves the
+     * 401 roundtrip on the second and subsequent calls of a flow. */
+    if (g_cred_cache.valid) {
+        char key[320];
+        make_cache_key(key, sizeof(key), url);
+        if (strcmp(g_cred_cache.scheme_host, key) == 0) {
+            https_client_set_auth_basic(c, g_cred_cache.username,
+                                        g_cred_cache.password);
+            retried = 1;   /* don't loop if the cached creds happen to fail */
+        }
+    }
+
+    rc = https_client_get(&resp, c, url);
+    if (rc) { https_client_destroy(c); return __LINE__; }
+
+    if (resp.status == 401 && !retried) {
+        https_response_free(&resp);
+        if (resolve_credentials_for_url(url, user, sizeof(user),
+                                        pass, sizeof(pass)) != 0) {
+            https_client_destroy(c);
+            return __LINE__;
+        }
+        https_client_set_auth_basic(c, user, pass);
+        rc = https_client_get(&resp, c, url);
+        if (rc) { https_client_destroy(c); return __LINE__; }
+    }
+
+    if (resp.status < 200 || resp.status >= 300) {
+        fprintf(stderr, "error: HTTP %u from %s\n", (unsigned)resp.status, url);
+        https_response_free(&resp);
+        https_client_destroy(c);
+        return __LINE__;
+    }
+
+    *body = (u8 *)malloc((size_t)resp.body_len);
+    if (!*body) {
+        https_response_free(&resp);
+        https_client_destroy(c);
+        return __LINE__;
+    }
+    memcpy(*body, resp.body, (size_t)resp.body_len);
+    *body_len = resp.body_len;
+
+    https_response_free(&resp);
+    https_client_destroy(c);
+    return 0;
+}
+
+/* HTTPS POST that retries with credential-helper creds on 401.
+ * For non-HTTPS URLs, falls through to plain http_post. */
+static unsigned long http_post_auth_aware(u8 **resp_body, u64 *resp_body_len,
+                                          const char *url,
+                                          const u8 *req_body, u64 req_body_len,
+                                          const char *content_type) {
+    https_client *c;
+    https_response resp;
+    unsigned long rc;
+    int retried = 0;
+    char user[256];
+    char pass[512];
+
+    if (!is_https(url)) {
+        return http_post(resp_body, resp_body_len, url,
+                         req_body, req_body_len, content_type);
+    }
+
+    rc = https_client_create(&c);
+    if (rc) return __LINE__;
+
+    if (g_cred_cache.valid) {
+        char key[320];
+        make_cache_key(key, sizeof(key), url);
+        if (strcmp(g_cred_cache.scheme_host, key) == 0) {
+            https_client_set_auth_basic(c, g_cred_cache.username,
+                                        g_cred_cache.password);
+            retried = 1;
+        }
+    }
+
+    rc = https_client_post(&resp, c, url, req_body, req_body_len, content_type);
+    if (rc) { https_client_destroy(c); return __LINE__; }
+
+    if (resp.status == 401 && !retried) {
+        https_response_free(&resp);
+        if (resolve_credentials_for_url(url, user, sizeof(user),
+                                        pass, sizeof(pass)) != 0) {
+            https_client_destroy(c);
+            return __LINE__;
+        }
+        https_client_set_auth_basic(c, user, pass);
+        rc = https_client_post(&resp, c, url, req_body, req_body_len, content_type);
+        if (rc) { https_client_destroy(c); return __LINE__; }
+    }
+
+    if (resp.status < 200 || resp.status >= 300) {
+        fprintf(stderr, "error: HTTP %u from %s\n", (unsigned)resp.status, url);
+        https_response_free(&resp);
+        https_client_destroy(c);
+        return __LINE__;
+    }
+
+    *resp_body = (u8 *)malloc((size_t)resp.body_len);
+    if (!*resp_body) {
+        https_response_free(&resp);
+        https_client_destroy(c);
+        return __LINE__;
+    }
+    memcpy(*resp_body, resp.body, (size_t)resp.body_len);
+    *resp_body_len = resp.body_len;
+
+    https_response_free(&resp);
+    https_client_destroy(c);
+    return 0;
+}
+
 /* ---- HTTP chunked transfer-encoding dechunker ----
  * If the body is chunked ("1BC\r\n<data>\r\n...0\r\n\r\n"), dechunks in place.
  * If not chunked, leaves body untouched. */
@@ -276,7 +516,7 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url) {
         snprintf(info_url, sizeof(info_url), "%s/info/refs?service=git-upload-pack", clean_url);
     }
 
-    rc = http_get(&body, &body_len, info_url);
+    rc = http_get_auth_aware(&body, &body_len, info_url);
     if (rc) return __LINE__;
 
     rc = dechunk_if_needed(&body, &body_len);
@@ -468,9 +708,9 @@ unsigned long remote_fetch_pack_algo(const char *url,
     if (rc) { buf_destroy(&request); return __LINE__; }
 
     /* POST to git-upload-pack */
-    rc = http_post(&resp_body, &resp_len, post_url,
-                   request.data, request.len,
-                   "application/x-git-upload-pack-request");
+    rc = http_post_auth_aware(&resp_body, &resp_len, post_url,
+                              request.data, request.len,
+                              "application/x-git-upload-pack-request");
     buf_destroy(&request);
     if (rc) return __LINE__;
 

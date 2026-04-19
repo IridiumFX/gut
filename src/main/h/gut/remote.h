@@ -97,4 +97,11 @@ unsigned long remote_send_pack_algo(char **server_msg, const char *url,
                                     u8 *pack_data, u64 pack_len,
                                     gut_hash_algo algo);
 
+/* Hint the HTTPS auth path where to look for `credential.helper` when
+ * the server returns 401. Pass the open repo's `git_dir` for fetch/
+ * push; leave NULL for `gut clone` (no repo yet — falls back to
+ * the GUT_CREDENTIAL_HELPER env var). Internal state only; the
+ * hint applies to subsequent calls on the current thread. */
+void remote_set_cred_git_dir(const char *git_dir);
+
 #endif /* GUT_REMOTE_H */

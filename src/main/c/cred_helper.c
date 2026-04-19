@@ -445,3 +445,76 @@ unsigned long cred_helper_get(gut_cred_response *out,
     if (parse_reply(out, reply, reply_len) != 0) return __LINE__;
     return 0;
 }
+
+/* Shared by store + erase. Build the payload including the username/
+ * password (for store) or just the identifying fields (for erase),
+ * spawn the helper with the given subcommand, expect no output. */
+static unsigned long run_sideeffect(const char *helper_name,
+                                    const char *subcmd,
+                                    const gut_cred_request *req,
+                                    const char *username,
+                                    const char *password) {
+    char command[1024];
+    char payload[2560];
+    char reply[256];   /* Store/erase produce no output, but keep a
+                        * small buffer so stdout isn't blocked. */
+    u64 reply_len = 0;
+    unsigned long rc;
+
+    rc = resolve_helper_command(command, sizeof(command), helper_name);
+    if (rc) return rc;
+
+    /* Start from the standard request payload, then append
+     * username/password if given (store). erase sends only the
+     * request fields + blank line. */
+    build_payload(payload, sizeof(payload), req);
+    if (username && *username) {
+        u64 off = strlen(payload);
+        /* build_payload already wrote the terminating blank line —
+         * we need to back up over the trailing "\n" to insert more
+         * fields before it. */
+        if (off >= 1 && payload[off - 1] == '\n') {
+            off -= 1;
+            if (off >= 1 && payload[off - 1] == '\n') off -= 1;
+            /* Now off points at the start of the blank terminator. */
+        }
+        off += (u64)snprintf(payload + off, sizeof(payload) - off,
+                             "username=%s\n", username);
+        if (password) {
+            off += (u64)snprintf(payload + off, sizeof(payload) - off,
+                                 "password=%s\n", password);
+        }
+        /* Re-terminate. */
+        if (off + 1 < sizeof(payload)) {
+            payload[off++] = '\n';
+            payload[off] = '\0';
+        }
+    }
+
+#ifdef _WIN32
+    rc = run_helper_win(command, subcmd,
+                        payload, strlen(payload),
+                        reply, sizeof(reply), &reply_len);
+#else
+    rc = run_helper_posix(command, subcmd,
+                          payload, strlen(payload),
+                          reply, sizeof(reply), &reply_len);
+#endif
+    (void)reply_len;
+    return rc;
+}
+
+unsigned long cred_helper_store(const char *helper_name,
+                                const gut_cred_request *req,
+                                const char *username,
+                                const char *password) {
+    if (!req) return __LINE__;
+    if (!username || !password) return __LINE__;
+    return run_sideeffect(helper_name, "store", req, username, password);
+}
+
+unsigned long cred_helper_erase(const char *helper_name,
+                                const gut_cred_request *req) {
+    if (!req) return __LINE__;
+    return run_sideeffect(helper_name, "erase", req, NULL, NULL);
+}

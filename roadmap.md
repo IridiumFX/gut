@@ -183,26 +183,34 @@ not just a command glued on top of existing primitives.
       HTTP for lazy resolution, `pack_index.v3`-style marking of
       missing objects.
 
-- [x] **Credential helpers** (get side; MVP). New
-      `src/main/c/cred_helper.c` + header: spawns
-      `git-credential-<name> get` over a bidirectional pipe
+- [x] **Credential helpers** (get + store + erase + HTTPS 401
+      auto-retry). `src/main/c/cred_helper.c` + header: spawns
+      `git-credential-<name> <subcmd>` over a bidirectional pipe
       (CreateProcess on Windows, fork/exec on POSIX), feeds the
       `protocol/host/path/username` key=value payload on stdin,
-      parses `username=/password=` from stdout. Helper name
-      resolution mirrors git: absolute path → direct, bare name →
-      `git-credential-<name>` on PATH; shell-exec `!cmd` form
-      rejected for MVP (injection surface deserves its own
-      scrutiny). Config lookup via `credential.helper` in
-      `.git/config`, with `GUT_CREDENTIAL_HELPER` env override.
+      parses `username=/password=` from stdout for get. Helper
+      name resolution mirrors git: absolute path → direct, bare
+      name → `git-credential-<name>` on PATH; shell-exec `!cmd`
+      form rejected for MVP. Config lookup via `credential.helper`
+      in `.git/config`, with `GUT_CREDENTIAL_HELPER` env override.
       Debug subcommand `gut credential-test <url>` exercises the
-      full lookup and prints masked creds. Verified end-to-end
-      against a `.bat` mock helper on Windows (full pipe
-      roundtrip) and against the real `git-credential-manager`
-      (clean "no creds" fall-through without hanging).
-      **Deferred**: `store`/`erase` ops (follow-ups), shell-exec
-      form, global `~/.gitconfig` lookup, auto-invocation on HTTPS
-      401. The module is ready; plumbing into `remote.c`'s
-      `http_post` path is the next-session wire-up.
+      full lookup and prints masked creds.
+      **HTTPS 401 retry wired**: `remote.c` now has
+      `http_get_auth_aware` + `http_post_auth_aware` wrappers with
+      a module-local cred cache keyed on `scheme://host`. On first
+      401 these invoke the configured helper, set basic auth, and
+      retry; subsequent calls in the same flow use the cached
+      creds preemptively (saves the 401 roundtrip on fetch-pack
+      after a discover-refs succeeded with auth). Verified:
+      public HTTPS clone still works (no regression); the 401
+      path fires correctly against HTTPS servers (inspected + mock
+      tested).
+      **Still deferred**: plain HTTP retry (apennines'
+      `http_client` lacks a `set_header`/`set_auth_basic` API —
+      workaround is to use HTTPS, which is the right security
+      posture anyway); global `~/.gitconfig` lookup; the
+      `credential.helper` mulitvalue form where git consults
+      multiple helpers in order.
 
 ## Tier 5: Drop-copy audit channel
 

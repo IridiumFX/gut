@@ -54,6 +54,25 @@ unsigned long cred_helper_get(gut_cred_response *out,
                               const char *helper_name,
                               const gut_cred_request *req);
 
+/* `store` — persist the username/password pair so future `get` calls
+ * against the same (protocol, host, path) can retrieve them without
+ * prompting. Called after a successful authentication.
+ *
+ * `erase` — tell the helper to forget credentials for (host, path).
+ * Called after the server rejects what the helper handed us,
+ * preventing us from re-using a stale token on the next attempt.
+ *
+ * Both return 0 on success (helper exited cleanly); non-zero
+ * otherwise. Neither returns output; the protocol just expects the
+ * helper to do its side-effect and exit. */
+unsigned long cred_helper_store(const char *helper_name,
+                                const gut_cred_request *req,
+                                const char *username,
+                                const char *password);
+
+unsigned long cred_helper_erase(const char *helper_name,
+                                const gut_cred_request *req);
+
 /* Read `credential.helper` from `<git_dir>/config`. Writes the helper
  * name into `out`. Returns 0 on success, non-zero if the key isn't
  * set or the config can't be read. */
