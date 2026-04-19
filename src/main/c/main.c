@@ -9,6 +9,7 @@
 #include "gut/leech.h"
 #include "gut/login.h"
 #include "gut/submodule.h"
+#include "gut/known_hosts.h"
 #include <dirent.h>
 #include "apennines/diff.h"
 #include "apennines/base.h"
@@ -6967,6 +6968,103 @@ static int cmd_reflog(int argc, char **argv) {
     return 0;
 }
 
+/* ---- gut khosts-check — debug helper for the known_hosts parser ----
+ *
+ * Usage:
+ *   gut khosts-check <host> [<port>] <pubkey-hex>
+ *
+ * <pubkey-hex> is the 64-char hex of the server's ed25519 pubkey
+ * (the same 32 bytes apennines' KEX trace logs as "host pub=<64 hex>").
+ * Reads ~/.ssh/known_hosts (or $GUT_KHOSTS_FILE if set) and prints
+ * the match outcome: PINNED / MISMATCH / REVOKED / UNKNOWN.
+ *
+ * Not documented in help/usage — this is an integration-test tool
+ * until we wire the lookup into the SSH path via apennines' verifier
+ * hook. */
+static int cmd_khosts_check(int argc, char **argv) {
+    gut_khosts *k = NULL;
+    char path[1024];
+    const char *host;
+    u16 port = 22;
+    const char *hex;
+    u8 pub[32];
+    gut_khosts_match m;
+    unsigned long rc;
+    const char *env;
+    int i;
+
+    if (argc < 2) {
+        fprintf(stderr,
+                "usage: gut khosts-check <host> [<port>] <pubkey-hex>\n");
+        return 1;
+    }
+
+    host = argv[0];
+    if (argc >= 3) {
+        /* With port: host port hex */
+        port = (u16)atoi(argv[1]);
+        hex = argv[2];
+    } else {
+        /* Without port: host hex */
+        hex = argv[1];
+    }
+
+    if (strlen(hex) != 64) {
+        fprintf(stderr, "error: pubkey-hex must be 64 chars (32 bytes)\n");
+        return 1;
+    }
+    for (i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1) {
+            fprintf(stderr, "error: malformed pubkey-hex at byte %d\n", i);
+            return 1;
+        }
+        pub[i] = (u8)v;
+    }
+
+    env = getenv("GUT_KHOSTS_FILE");
+    if (env) {
+        snprintf(path, sizeof(path), "%s", env);
+    } else {
+        rc = khosts_default_path(path, sizeof(path));
+        if (rc) {
+            fprintf(stderr, "error: cannot resolve ~/.ssh/known_hosts\n");
+            return 1;
+        }
+    }
+
+    rc = khosts_open(&k, path);
+    if (rc) {
+        fprintf(stderr, "error: khosts_open failed (line %lu)\n", rc);
+        return 1;
+    }
+
+    rc = khosts_lookup_ed25519(&m, k, host, port, pub);
+    khosts_close(k);
+    if (rc) {
+        fprintf(stderr, "error: khosts_lookup_ed25519 failed (line %lu)\n", rc);
+        return 1;
+    }
+
+    switch (m) {
+        case KHOSTS_MATCH_PINNED:
+            printf("PINNED   %s:%u  (known, key matches)\n", host, port);
+            return 0;
+        case KHOSTS_MATCH_MISMATCH:
+            printf("MISMATCH %s:%u  (known, key DIFFERS — possible MITM)\n",
+                   host, port);
+            return 2;
+        case KHOSTS_MATCH_REVOKED:
+            printf("REVOKED  %s:%u  (entry explicitly @revoked)\n", host, port);
+            return 3;
+        case KHOSTS_MATCH_UNKNOWN:
+        default:
+            printf("UNKNOWN  %s:%u  (no ed25519 entry — TOFU on first use)\n",
+                   host, port);
+            return 4;
+    }
+}
+
 static int cmd_diff(int argc, char **argv) {
     gut_repo repo;
     gut_index idx;
@@ -10236,6 +10334,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "reflog") == 0) {
         return cmd_reflog(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "khosts-check") == 0) {
+        return cmd_khosts_check(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "status") == 0) {
         return cmd_status(argc - 2, argv + 2);
