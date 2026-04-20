@@ -81,7 +81,7 @@ static void usage(void) {
         "  revert-file <c> <path>  Restore a file from any commit\n"
         "\n"
         "Remote / packing\n"
-        "  clone           Clone from a smart-HTTP remote (--depth N)\n"
+        "  clone           Clone from a smart-HTTP remote (--depth N | --filter=<spec>)\n"
         "  fetch           Incremental fetch from remote\n"
         "  push            Upload pack to remote\n"
         "  remote          add / remove / list / set-url named remotes\n"
@@ -262,6 +262,7 @@ static int cmd_clone(int argc, char **argv) {
     char head_target_ref[256];
     int depth = 0;
     int recurse_submodules = 0;
+    const char *filter_spec = NULL;
     int ai;
 
     /* Parse flags first, then positional */
@@ -274,6 +275,15 @@ static int cmd_clone(int argc, char **argv) {
         } else if (strcmp(argv[ai], "--recurse-submodules") == 0 ||
                    strcmp(argv[ai], "--recursive") == 0) {
             recurse_submodules = 1;
+        } else if (strncmp(argv[ai], "--filter=", 9) == 0) {
+            filter_spec = argv[ai] + 9;
+            if (strcmp(filter_spec, "blob:none") != 0 &&
+                strcmp(filter_spec, "tree:0") != 0) {
+                fprintf(stderr,
+                    "error: unsupported filter '%s' "
+                    "(supported: blob:none, tree:0)\n", filter_spec);
+                return 1;
+            }
         } else if (argv[ai][0] != '-') {
             if (!url)      url = argv[ai];
             else if (!dir) dir = argv[ai];
@@ -281,7 +291,8 @@ static int cmd_clone(int argc, char **argv) {
     }
 
     if (!url) {
-        fprintf(stderr, "usage: gut clone [--depth N] [--recurse-submodules] <url> [<directory>]\n");
+        fprintf(stderr, "usage: gut clone [--depth N] [--filter=<spec>] "
+                        "[--recurse-submodules] <url> [<directory>]\n");
         return 1;
     }
 
@@ -338,10 +349,11 @@ static int cmd_clone(int argc, char **argv) {
 
     printf("Found %llu refs\n", (unsigned long long)refs.count);
 
-    /* If the remote advertised sha256, flip this repo to sha256 before we
-     * write any refs or fetch a pack. Git requires repositoryformatversion=1
-     * whenever an extensions section is present. */
-    if (refs.hash_algo == GUT_HASH_SHA256) {
+    /* If the remote advertised sha256 OR we were asked for a partial clone,
+     * write an extensions block. Git requires repositoryformatversion=1
+     * whenever any extensions section is present, so we rewrite the full
+     * config here rather than patching it. */
+    if (refs.hash_algo == GUT_HASH_SHA256 || filter_spec) {
         char cfg_path[2048];
         FILE *cf;
         snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.git_dir);
@@ -351,13 +363,20 @@ static int cmd_clone(int argc, char **argv) {
                   "\trepositoryformatversion = 1\n"
                   "\tfilemode = false\n"
                   "\tbare = false\n"
-                  "[extensions]\n"
-                  "\tobjectformat = sha256\n", cf);
+                  "[extensions]\n", cf);
+            if (refs.hash_algo == GUT_HASH_SHA256) {
+                fputs("\tobjectformat = sha256\n", cf);
+            }
+            if (filter_spec) {
+                fputs("\tpartialclone = origin\n", cf);
+            }
             fclose(cf);
         }
-        repo.hash_algo = GUT_HASH_SHA256;
-        repo.odb.hash_algo = GUT_HASH_SHA256;
-        printf("Remote uses SHA-256 object format\n");
+        if (refs.hash_algo == GUT_HASH_SHA256) {
+            repo.hash_algo = GUT_HASH_SHA256;
+            repo.odb.hash_algo = GUT_HASH_SHA256;
+            printf("Remote uses SHA-256 object format\n");
+        }
     }
 
     /* Collect unique want OIDs */
@@ -392,9 +411,11 @@ static int cmd_clone(int argc, char **argv) {
             return 0;
         }
 
-        printf("Fetching objects (%llu wants%s)...\n",
+        printf("Fetching objects (%llu wants%s%s%s)...\n",
                (unsigned long long)want_count,
-               depth > 0 ? ", shallow" : "");
+               depth > 0 ? ", shallow" : "",
+               filter_spec ? ", filter=" : "",
+               filter_spec ? filter_spec : "");
         snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-clone.pack",
                  repo.git_dir);
 
@@ -404,7 +425,7 @@ static int cmd_clone(int argc, char **argv) {
 
             rc = remote_fetch_pack_algo(url, wants, want_count, NULL, 0, pack_path,
                                         depth, &shallows, &n_shallows,
-                                        repo.hash_algo);
+                                        repo.hash_algo, filter_spec);
             free(wants);
 
             if (rc) {
@@ -445,6 +466,17 @@ static int cmd_clone(int argc, char **argv) {
                  "%s/objects/pack/gut-clone.pack", repo.git_dir);
         if (pack_index_create_algo(pack_to_index, NULL, repo.hash_algo) != 0) {
             fprintf(stderr, "warning: pack indexing failed\n");
+        }
+        /* Mark the pack as promisor-owned so readers know missing deltas
+         * should be resolved via the promisor remote rather than treated
+         * as repository corruption. */
+        if (filter_spec) {
+            char promisor_path[2048];
+            FILE *mf;
+            snprintf(promisor_path, sizeof(promisor_path),
+                     "%s/objects/pack/gut-clone.promisor", repo.git_dir);
+            mf = fopen(promisor_path, "w");
+            if (mf) fclose(mf);
         }
     }
 
@@ -532,7 +564,22 @@ static int cmd_clone(int argc, char **argv) {
         fp = fopen(config_path, "a");
         if (fp) {
             fprintf(fp, "[remote \"origin\"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n", url);
+            if (filter_spec) {
+                fprintf(fp, "\tpromisor = true\n\tpartialclonefilter = %s\n",
+                        filter_spec);
+            }
             fclose(fp);
+        }
+    }
+
+    /* Make the in-memory ODB aware of the promisor remote so that the
+     * post-clone checkout below transparently lazy-fetches missing blobs
+     * via odb_read. (repo_open would populate this from config, but the
+     * clone flow uses the ODB opened by repo_init before we wrote config.) */
+    if (filter_spec) {
+        size_t ulen = strlen(url);
+        if (ulen < sizeof(repo.odb.promisor_url)) {
+            memcpy(repo.odb.promisor_url, url, ulen + 1);
         }
     }
 
@@ -4560,9 +4607,24 @@ static int cmd_fetch(int argc, char **argv) {
     char pack_path[2048];
     unsigned long rc;
     u64 i, j;
+    const char *filter_spec = NULL;
+    char filter_buf[64];
+    int ai;
 
-    if (argc > 0) {
-        url = argv[0];
+    /* Parse flags first, then the optional URL positional. */
+    for (ai = 0; ai < argc; ai++) {
+        if (strncmp(argv[ai], "--filter=", 9) == 0) {
+            filter_spec = argv[ai] + 9;
+            if (strcmp(filter_spec, "blob:none") != 0 &&
+                strcmp(filter_spec, "tree:0") != 0) {
+                fprintf(stderr,
+                    "error: unsupported filter '%s' "
+                    "(supported: blob:none, tree:0)\n", filter_spec);
+                return 1;
+            }
+        } else if (argv[ai][0] != '-' && !url) {
+            url = argv[ai];
+        }
     }
 
     if (!gut_getcwd(cwd, sizeof(cwd))) {
@@ -4573,19 +4635,27 @@ static int cmd_fetch(int argc, char **argv) {
     rc = repo_open(&repo, cwd);
     if (rc) { fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n"); return 1; }
 
-    /* Read URL from config if not provided */
-    if (!url) {
+    /* Read URL from config if not provided; likewise inherit the stored
+     * partialclonefilter from this repo's origin when --filter wasn't set
+     * explicitly, so subsequent fetches on a partial clone stay partial. */
+    {
         gut_config cfg;
         char config_path[2048];
         const char *v;
         snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
-        rc = config_read(&cfg, config_path);
-        if (rc) { fprintf(stderr, "error: cannot read config\n"); return 1; }
-        if (config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
-            snprintf(url_buf, sizeof(url_buf), "%s", v);
-            url = url_buf;
+        if (config_read(&cfg, config_path) == 0) {
+            if (!url && config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
+                snprintf(url_buf, sizeof(url_buf), "%s", v);
+                url = url_buf;
+            }
+            if (!filter_spec &&
+                config_get(&v, &cfg, "remote \"origin\"", "partialclonefilter") == 0 &&
+                v && v[0]) {
+                snprintf(filter_buf, sizeof(filter_buf), "%s", v);
+                filter_spec = filter_buf;
+            }
+            config_destroy(&cfg);
         }
-        config_destroy(&cfg);
         if (!url) {
             fprintf(stderr,
                 "error: no remote configured\n"
@@ -4680,7 +4750,7 @@ static int cmd_fetch(int argc, char **argv) {
 
     snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-fetch.pack", repo.git_dir);
     rc = remote_fetch_pack_algo(url, wants, want_count, haves, have_count, pack_path,
-                                0, NULL, NULL, repo.hash_algo);
+                                0, NULL, NULL, repo.hash_algo, filter_spec);
     free(wants);
     free(haves);
     if (rc) {
@@ -4692,6 +4762,14 @@ static int cmd_fetch(int argc, char **argv) {
     printf("Indexing pack...\n");
     if (pack_index_create_algo(pack_path, NULL, repo.hash_algo) != 0) {
         fprintf(stderr, "warning: pack indexing failed\n");
+    }
+    if (filter_spec) {
+        char promisor_path[2048];
+        FILE *mf;
+        snprintf(promisor_path, sizeof(promisor_path),
+                 "%s/objects/pack/gut-fetch.promisor", repo.git_dir);
+        mf = fopen(promisor_path, "w");
+        if (mf) fclose(mf);
     }
 
     /* Update remote tracking refs: refs/remotes/origin/* */

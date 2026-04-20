@@ -49,7 +49,12 @@ unsigned long remote_discover_refs(gut_remote_refs *out, const char *url);
  * depth > 0 requests a shallow fetch (depth N commits). Server responds
  * with a list of boundary OIDs that become the caller's .git/shallow.
  * If shallow_out is non-NULL, the caller receives the malloc'd boundary
- * OID array; the caller must free it. Pass depth=0 / NULLs to skip. */
+ * OID array; the caller must free it. Pass depth=0 / NULLs to skip.
+ *
+ * filter_spec (optional; NULL to disable) requests a partial pack per
+ * git's object-filter syntax. Supported values: "blob:none" (omit all
+ * blobs) and "tree:0" (omit all trees and blobs, root tree only).
+ * Requires server support for the `filter` upload-pack capability. */
 unsigned long remote_fetch_pack(const char *url,
                                 gut_oid *want_oids, u64 want_count,
                                 gut_oid *have_oids, u64 have_count,
@@ -58,7 +63,8 @@ unsigned long remote_fetch_pack(const char *url,
                                 gut_oid **shallow_out,
                                 u64     *shallow_count_out);
 
-/* Same as remote_fetch_pack, but hex width follows `algo`. */
+/* Same as remote_fetch_pack, but hex width follows `algo` and accepts
+ * a `filter_spec` (NULL = no filter — equivalent to remote_fetch_pack). */
 unsigned long remote_fetch_pack_algo(const char *url,
                                      gut_oid *want_oids, u64 want_count,
                                      gut_oid *have_oids, u64 have_count,
@@ -66,7 +72,8 @@ unsigned long remote_fetch_pack_algo(const char *url,
                                      int depth,
                                      gut_oid **shallow_out,
                                      u64     *shallow_count_out,
-                                     gut_hash_algo algo);
+                                     gut_hash_algo algo,
+                                     const char *filter_spec);
 
 /* Discover refs via git-receive-pack endpoint (used for push). */
 unsigned long remote_discover_refs_for_push(gut_remote_refs *out, const char *url,

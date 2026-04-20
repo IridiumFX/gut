@@ -340,7 +340,7 @@ static unsigned long clone_submodule(const char *url,
     snprintf(pack_path, sizeof(pack_path),
              "%s/objects/pack/gut-submodule.pack", git_dir);
     rc = remote_fetch_pack_algo(url, wants, want_count, NULL, 0, pack_path,
-                                0, NULL, NULL, algo);
+                                0, NULL, NULL, algo, NULL);
     free(wants);
     if (rc) return __LINE__;
 

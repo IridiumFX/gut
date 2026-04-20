@@ -16,6 +16,11 @@ typedef struct {
     u32           pack_count;
     u32           packs_loaded;
     gut_hash_algo hash_algo;  /* default SHA-1; repo_open sets this from .git/config */
+    /* Partial-clone promisor remote URL. Non-empty if this repo was cloned
+     * with --filter=... and the promisor remote is still reachable. When set,
+     * odb_read falls back to an on-demand fetch for missing objects. */
+    char          promisor_url[1024];
+    u32           in_lazy_fetch;  /* recursion guard */
 } gut_odb;
 
 /* Initialize ODB with the path to the objects directory (e.g., ".git/objects") */

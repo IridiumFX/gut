@@ -1,5 +1,6 @@
 #include "gut/odb.h"
 #include "gut/pack.h"
+#include "gut/remote.h"
 #include "apennines/zlib_wrap.h"
 #include "apennines/hash.h"
 #include <stdio.h>
@@ -7,6 +8,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <time.h>
 
 static u32 rd32_be(const u8 *p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
@@ -28,6 +30,8 @@ unsigned long odb_open(gut_odb *out, const char *objects_dir) {
     out->pack_count = 0;
     out->packs_loaded = 0;
     out->hash_algo = GUT_HASH_SHA1;  /* repo_open overrides if config says sha256 */
+    out->promisor_url[0] = '\0';
+    out->in_lazy_fetch = 0;
     return 0;
 }
 
@@ -65,8 +69,8 @@ static unsigned long odb_load_packs(gut_odb *odb) {
     return 0;
 }
 
-/* Try to read an object from packfiles */
-static unsigned long odb_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid) {
+/* Try to read an object from packfiles. Returns 0 on hit, non-zero on miss. */
+static unsigned long odb_try_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid) {
     u32 i;
     unsigned long rc;
 
@@ -87,6 +91,101 @@ static unsigned long odb_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid
     }
 
     return __LINE__; /* not found in any pack */
+}
+
+/* On a partial clone, fetch a single missing object from the promisor remote,
+ * land it as a new pack in objects/pack/, mark it .promisor, and load the
+ * pack into the ODB so subsequent lookups succeed.
+ *
+ * Returns 0 if the pack was fetched, indexed, and loaded (regardless of
+ * whether `oid` ended up in it — the caller retries the lookup). Non-zero
+ * on any failure (no promisor, network error, pack corrupt, etc.) so the
+ * caller can surface a "missing object" error. */
+static unsigned long odb_lazy_fetch(gut_odb *odb, gut_oid *oid) {
+    static u32 lazy_counter = 0;
+    char pack_dir[2048];
+    char pack_path[2048];
+    char promisor_path[2048];
+    char hex[GUT_OID_MAX_HEX_SIZE + 1];
+    unsigned long rc;
+    FILE *pf;
+
+    if (!odb->promisor_url[0]) return __LINE__;   /* not a partial clone */
+    if (odb->in_lazy_fetch) return __LINE__;      /* recursion guard */
+    if (odb->pack_count >= GUT_ODB_MAX_PACKS) return __LINE__;
+
+    odb->in_lazy_fetch = 1;
+
+    rc = oid_to_hex_n(hex, oid, gut_oid_hex_size(odb->hash_algo));
+    if (rc) { odb->in_lazy_fetch = 0; return __LINE__; }
+
+    snprintf(pack_dir, sizeof(pack_dir), "%s/pack", odb->objects_dir);
+    gut_mkdir(pack_dir);
+
+    snprintf(pack_path, sizeof(pack_path), "%s/gut-lazy-%lu-%u.pack",
+             pack_dir, (unsigned long)time(NULL), lazy_counter++);
+
+    rc = remote_fetch_pack_algo(odb->promisor_url, oid, 1, NULL, 0,
+                                pack_path, 0, NULL, NULL,
+                                odb->hash_algo, NULL);
+    if (rc) {
+        remove(pack_path);
+        odb->in_lazy_fetch = 0;
+        return __LINE__;
+    }
+
+    rc = pack_index_create_algo(pack_path, NULL, odb->hash_algo);
+    if (rc) {
+        remove(pack_path);
+        odb->in_lazy_fetch = 0;
+        return __LINE__;
+    }
+
+    /* Write the .promisor marker alongside the .pack/.idx. Git treats any
+     * pack with a .promisor sibling as one whose objects may have deltas
+     * against objects held only by the promisor remote. */
+    {
+        size_t plen = strlen(pack_path);
+        if (plen < sizeof(promisor_path) - 2 && plen > 5) {
+            memcpy(promisor_path, pack_path, plen - 4);
+            memcpy(promisor_path + plen - 4, "promisor", 9);
+            pf = fopen(promisor_path, "w");
+            if (pf) fclose(pf);
+        }
+    }
+
+    /* Open the pack and append to the ODB's pack array so the retry hits. */
+    {
+        gut_pack *p = (gut_pack *)malloc(sizeof(gut_pack));
+        if (!p) { odb->in_lazy_fetch = 0; return __LINE__; }
+        if (pack_open_algo(p, pack_path, odb->hash_algo) == 0) {
+            odb->packs[odb->pack_count++] = (void *)p;
+        } else {
+            free(p);
+            odb->in_lazy_fetch = 0;
+            return __LINE__;
+        }
+    }
+
+    odb->in_lazy_fetch = 0;
+    return 0;
+}
+
+static unsigned long odb_read_packed(gut_object *out, gut_odb *odb, gut_oid *oid) {
+    unsigned long rc;
+
+    rc = odb_try_read_packed(out, odb, oid);
+    if (rc == 0) return 0;
+
+    /* Packfile miss. If this is a partial clone, ask the promisor remote
+     * for the object, land the returned pack, and retry. */
+    if (odb->promisor_url[0] && !odb->in_lazy_fetch) {
+        if (odb_lazy_fetch(odb, oid) == 0) {
+            return odb_try_read_packed(out, odb, oid);
+        }
+    }
+
+    return __LINE__;
 }
 
 unsigned long odb_object_path(char *out, u64 out_size, gut_odb *odb, gut_oid *oid) {

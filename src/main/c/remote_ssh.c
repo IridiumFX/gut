@@ -872,7 +872,8 @@ unsigned long ssh_fetch_pack_algo(const char *url,
                                   int depth,
                                   gut_oid **shallow_out,
                                   u64     *shallow_count_out,
-                                  gut_hash_algo algo) {
+                                  gut_hash_algo algo,
+                                  const char *filter_spec) {
     ssh_url_parts u;
     ssh_conn *c = NULL;
     ssh_channel *ch = NULL;
@@ -926,9 +927,11 @@ unsigned long ssh_fetch_pack_algo(const char *url,
         if (i == 0) {
             const char *fmt_cap = (algo == GUT_HASH_SHA256)
                 ? " object-format=sha256" : "";
+            const char *filter_cap = (filter_spec && filter_spec[0])
+                ? " filter" : "";
             snprintf(line, sizeof(line),
-                     "want %s multi_ack_detailed side-band-64k ofs-delta shallow%s",
-                     hex, fmt_cap);
+                     "want %s multi_ack_detailed side-band-64k ofs-delta shallow%s%s",
+                     hex, fmt_cap, filter_cap);
         } else {
             snprintf(line, sizeof(line), "want %s", hex);
         }
@@ -939,6 +942,12 @@ unsigned long ssh_fetch_pack_algo(const char *url,
     if (depth > 0) {
         char line[32];
         snprintf(line, sizeof(line), "deepen %d", depth);
+        rc = pktline_write_ch(ch, line);
+        if (rc) goto out;
+    }
+    if (filter_spec && filter_spec[0]) {
+        char line[128];
+        snprintf(line, sizeof(line), "filter %s", filter_spec);
         rc = pktline_write_ch(ch, line);
         if (rc) goto out;
     }

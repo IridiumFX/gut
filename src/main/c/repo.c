@@ -99,6 +99,36 @@ static gut_hash_algo read_hash_algo(const char *git_dir) {
     return algo;
 }
 
+/* Read .git/config and, if this repo is a partial clone, copy the promisor
+ * remote's URL into `out` (empty string if none). The flow is:
+ *   [extensions] partialclone = <remote-name>
+ *   [remote "<remote-name>"] url = <url>
+ *   [remote "<remote-name>"] promisor = true   (for sanity)
+ */
+static void read_promisor_url(char *out, u64 out_size, const char *git_dir) {
+    char cfg_path[2048];
+    char remote_section[128];
+    gut_config cfg;
+    const char *remote_name = NULL;
+    const char *url = NULL;
+
+    out[0] = '\0';
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", git_dir);
+    if (config_read(&cfg, cfg_path) != 0) return;
+
+    if (config_get(&remote_name, &cfg, "extensions", "partialclone") != 0 || !remote_name) {
+        config_destroy(&cfg);
+        return;
+    }
+
+    snprintf(remote_section, sizeof(remote_section), "remote \"%s\"", remote_name);
+    if (config_get(&url, &cfg, remote_section, "url") == 0 && url) {
+        size_t ulen = strlen(url);
+        if (ulen < out_size) memcpy(out, url, ulen + 1);
+    }
+    config_destroy(&cfg);
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
@@ -294,6 +324,8 @@ unsigned long repo_open(gut_repo *out, const char *path) {
         if (rc) return __LINE__;
         out->hash_algo = read_hash_algo(out->git_dir);
         out->odb.hash_algo = out->hash_algo;
+        read_promisor_url(out->odb.promisor_url, sizeof(out->odb.promisor_url),
+                          out->git_dir);
         return 0;
     }
 

@@ -19,7 +19,8 @@ unsigned long ssh_fetch_pack_algo(const char *url,
                                   int depth,
                                   gut_oid **shallow_out,
                                   u64     *shallow_count_out,
-                                  gut_hash_algo algo);
+                                  gut_hash_algo algo,
+                                  const char *filter_spec);
 unsigned long ssh_discover_refs_for_push(gut_remote_refs *out, const char *url);
 unsigned long ssh_send_pack_algo(char **server_msg, const char *url,
                                  gut_remote_update *updates, u64 update_count,
@@ -623,7 +624,8 @@ unsigned long remote_fetch_pack_algo(const char *url,
                                      int depth,
                                      gut_oid **shallow_out,
                                      u64     *shallow_count_out,
-                                     gut_hash_algo algo) {
+                                     gut_hash_algo algo,
+                                     const char *filter_spec) {
     char post_url[2048];
     buf request;
     u8 *resp_body = NULL;
@@ -644,7 +646,8 @@ unsigned long remote_fetch_pack_algo(const char *url,
         return ssh_fetch_pack_algo(url, want_oids, want_count,
                                    have_oids, have_count,
                                    pack_path, depth,
-                                   shallow_out, shallow_count_out, algo);
+                                   shallow_out, shallow_count_out, algo,
+                                   filter_spec);
     }
 
     {
@@ -669,12 +672,17 @@ unsigned long remote_fetch_pack_algo(const char *url,
         if (i == 0) {
             /* First want includes capabilities. Advertise `shallow` so the
              * server knows we can handle shallow/unshallow lines (it will
-             * ignore `deepen` if we don't advertise it). */
+             * ignore `deepen` if we don't advertise it). Advertise `filter`
+             * only when the caller asked for a partial clone — servers that
+             * don't support it would otherwise silently ignore the cap, but
+             * advertising it unconditionally flags the request as partial. */
             const char *fmt_cap = (algo == GUT_HASH_SHA256)
                 ? " object-format=sha256" : "";
+            const char *filter_cap = (filter_spec && filter_spec[0])
+                ? " filter" : "";
             snprintf(line, sizeof(line),
-                     "want %s multi_ack_detailed side-band-64k ofs-delta shallow%s",
-                     hex, fmt_cap);
+                     "want %s multi_ack_detailed side-band-64k ofs-delta shallow%s%s",
+                     hex, fmt_cap, filter_cap);
         } else {
             snprintf(line, sizeof(line), "want %s", hex);
         }
@@ -686,6 +694,14 @@ unsigned long remote_fetch_pack_algo(const char *url,
     if (depth > 0) {
         char line[32];
         snprintf(line, sizeof(line), "deepen %d", depth);
+        rc = pktline_write(&request, line);
+        if (rc) { buf_destroy(&request); return __LINE__; }
+    }
+
+    /* filter line — same placement as deepen, after wants + before flush */
+    if (filter_spec && filter_spec[0]) {
+        char line[128];
+        snprintf(line, sizeof(line), "filter %s", filter_spec);
         rc = pktline_write(&request, line);
         if (rc) { buf_destroy(&request); return __LINE__; }
     }
@@ -849,7 +865,7 @@ unsigned long remote_fetch_pack(const char *url,
                                    have_oids, have_count,
                                    pack_path, depth,
                                    shallow_out, shallow_count_out,
-                                   GUT_HASH_SHA1);
+                                   GUT_HASH_SHA1, NULL);
 }
 
 /* ====================================================================
