@@ -7355,9 +7355,17 @@ static int cmd_commit(int argc, char **argv) {
     }
 
     oid_to_hex_n(hex, &commit_oid, hex_len);
-    printf("[%s %.*s] %s\n",
-           has_parent ? "main" : "(root-commit)",
-           7, hex, message);
+    {
+        const char *branch_label = (strncmp(head_ref, "refs/heads/", 11) == 0)
+            ? head_ref + 11
+            : "detached HEAD";
+        if (has_parent) {
+            printf("[%s %.*s] %s\n", branch_label, 7, hex, message);
+        } else {
+            printf("[%s (root-commit) %.*s] %s\n",
+                   branch_label, 7, hex, message);
+        }
+    }
 
     /* Post-commit hook — advisory, can't abort (we've already committed). */
     run_hook(&repo, "post-commit", 0);
