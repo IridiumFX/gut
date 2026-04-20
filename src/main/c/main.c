@@ -74,7 +74,7 @@ static void usage(void) {
         "  merge           Merge a branch into HEAD\n"
         "  cherry-pick <c> Apply one commit's diff onto HEAD\n"
         "  rebase <up>     Replay current branch's commits onto <upstream>\n"
-        "  worktree        Manage linked worktrees (add <path> <branch> | list)\n"
+        "  worktree        Manage linked worktrees (add | list | remove | prune)\n"
         "  reset           Move HEAD (--soft or --hard)\n"
         "  stash           Snapshot working tree, reset to HEAD\n"
         "                    subcommands: pop, list\n"
@@ -664,22 +664,24 @@ static int cmd_submodule(int argc, char **argv) {
 
 /* ---- gut worktree ----
  *
- * MVP scope:
- *   gut worktree add <path> <branch>   create a secondary worktree
- *   gut worktree list                   list main + secondary worktrees
+ * Scope:
+ *   gut worktree add <path> <branch>     create a secondary worktree
+ *   gut worktree list                     list main + secondary worktrees
+ *   gut worktree remove [--force] <path>  tear down a secondary worktree
+ *   gut worktree prune                    drop metadata for gone worktrees
  *
- * The `add` subcommand writes all state needed for real `git` to
- * accept the new worktree: the `.git/worktrees/<id>/` metadata dir
- * inside the main repo (HEAD, commondir, gitdir files) plus the
- * `.git` gitfile inside the new worktree's path.
+ * `add` writes all state needed for real `git` to accept the new worktree:
+ * the `.git/worktrees/<id>/` metadata dir inside the main repo (HEAD,
+ * commondir, gitdir files) plus the `.git` gitfile inside the worktree's
+ * path. `remove` undoes that symmetrically with a cleanliness check
+ * (refuses to trash modifications without --force); `prune` drops stale
+ * metadata whose target directory is gone.
  *
- * `repo_open` on a secondary worktree is a separate concern because
+ * `repo_open` on a secondary worktree is still a separate concern because
  * it requires a `common_dir` field on gut_repo so refs/objects/config
  * resolve against the main `.git/` while HEAD/index resolve against
  * the per-worktree `.git/worktrees/<id>/`. Tracked for follow-up;
- * the worktree created here is fully usable with real `git` today,
- * and by gut tools that don't cross the commondir boundary (i.e.
- * anything reading HEAD and index only).
+ * worktrees created here remain fully usable with real `git` today.
  */
 
 /* Sanitize a basename into a worktree id: replace each non-
@@ -1055,6 +1057,258 @@ static int cmd_worktree_list(gut_repo *repo) {
     return 0;
 }
 
+/* Recursively delete a directory and its contents. Best-effort on
+ * permission errors — we continue rather than abort so callers that
+ * invoke this during teardown still make forward progress. Returns 0
+ * if the target is gone when we finish, non-zero if something is left. */
+static int rm_rf_dir(const char *path) {
+    DIR *d;
+    struct dirent *de;
+    struct stat st;
+
+    if (stat(path, &st) != 0) return 0;   /* already gone */
+    if (!(st.st_mode & S_IFDIR)) {
+        return (remove(path) == 0) ? 0 : 1;
+    }
+
+    d = opendir(path);
+    if (!d) {
+#ifdef _WIN32
+        return _rmdir(path) == 0 ? 0 : 1;
+#else
+        return rmdir(path) == 0 ? 0 : 1;
+#endif
+    }
+    while ((de = readdir(d)) != NULL) {
+        char child[2048];
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == 0 ||
+             (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
+        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        rm_rf_dir(child);
+    }
+    closedir(d);
+#ifdef _WIN32
+    return _rmdir(path) == 0 ? 0 : 1;
+#else
+    return rmdir(path) == 0 ? 0 : 1;
+#endif
+}
+
+/* Find the `.git/worktrees/<id>/` entry whose `gitdir` file points to a
+ * gitfile under `target`. Sets `wt_id` on hit. Returns 0 on match, 1
+ * on miss. `target` should already be absolute + forward-slash normalized. */
+static int worktree_find_by_path(char *wt_id, u64 wt_id_size,
+                                 gut_repo *repo, const char *target) {
+    char wt_base[2048];
+    char gd_path[2048];
+    char line[2048];
+    char expected[2048];
+    DIR *d;
+    struct dirent *de;
+    FILE *fp;
+
+    snprintf(expected, sizeof(expected), "%s/.git", target);
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    d = opendir(wt_base);
+    if (!d) return 1;
+
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        snprintf(gd_path, sizeof(gd_path), "%s/%s/gitdir", wt_base, de->d_name);
+        fp = fopen(gd_path, "r");
+        if (!fp) continue;
+        if (fgets(line, sizeof(line), fp)) {
+            u64 L = strlen(line);
+            while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+            {
+                char *p;
+                for (p = line; *p; p++) if (*p == '\\') *p = '/';
+            }
+            if (strcmp(line, expected) == 0) {
+                fclose(fp);
+                closedir(d);
+                snprintf(wt_id, wt_id_size, "%s", de->d_name);
+                return 0;
+            }
+        }
+        fclose(fp);
+    }
+    closedir(d);
+    return 1;
+}
+
+/* Compare every file recorded in `wt_index` against the file on disk
+ * under `root`, hashing the file and checking its OID matches the
+ * index entry. Returns 0 if every entry matches (clean), non-zero
+ * (the line of the first divergence) otherwise. Uses `odb_write_file`
+ * to hash — the shared ODB de-dupes, so matching blobs are no-ops and
+ * a mismatched file leaks one blob object (acceptable for the teardown
+ * path; a dirty worktree isn't going to be removed without --force
+ * anyway). */
+static unsigned long worktree_is_clean(gut_repo *repo,
+                                       const char *root,
+                                       gut_index *wt_index) {
+    u64 i;
+    for (i = 0; i < wt_index->count; i++) {
+        gut_index_entry *e = &wt_index->entries[i];
+        char full[2048];
+        struct stat st;
+        gut_oid disk_oid;
+        snprintf(full, sizeof(full), "%s/%s", root, e->path);
+        if (stat(full, &st) != 0) return __LINE__;   /* missing */
+        if (odb_write_file(&disk_oid, &repo->odb, full) != 0) return __LINE__;
+        if (memcmp(disk_oid.bytes, e->oid.bytes,
+                   gut_oid_raw_size(repo->hash_algo)) != 0) return __LINE__;
+    }
+    return 0;
+}
+
+static int cmd_worktree_remove(gut_repo *repo, const char *path, int force) {
+    char abs_target[2048];
+    char wt_id[256];
+    char wt_dir[2048];
+    char idx_path[2048];
+    gut_index wt_index;
+    struct stat st;
+
+    /* 1. Resolve path to absolute + normalize separators. */
+    if (path[0] == '/' || (path[0] != '\0' && path[1] == ':')) {
+        snprintf(abs_target, sizeof(abs_target), "%s", path);
+    } else {
+        char cwd[2048];
+        if (!gut_getcwd(cwd, sizeof(cwd))) {
+            fprintf(stderr, "error: cannot get current directory\n");
+            return 1;
+        }
+        snprintf(abs_target, sizeof(abs_target), "%s/%s", cwd, path);
+    }
+    {
+        char *p;
+        u64 L;
+        for (p = abs_target; *p; p++) if (*p == '\\') *p = '/';
+        L = strlen(abs_target);
+        while (L > 1 && abs_target[L - 1] == '/') abs_target[--L] = 0;
+    }
+
+    /* 2. Refuse to nuke the main worktree. */
+    if (strcmp(abs_target, repo->root_dir) == 0) {
+        fprintf(stderr, "error: '%s' is the main worktree; cannot remove\n",
+                abs_target);
+        return 1;
+    }
+
+    /* 3. Locate the matching metadata dir by gitdir backreference. */
+    if (worktree_find_by_path(wt_id, sizeof(wt_id), repo, abs_target) != 0) {
+        fprintf(stderr,
+                "error: '%s' is not a registered worktree of this repository\n"
+                "  (expected %s/worktrees/<id>/gitdir to reference it)\n",
+                abs_target, repo->git_dir);
+        return 1;
+    }
+    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->git_dir, wt_id);
+
+    /* 4. Cleanliness check unless forced. Reads the per-worktree index
+     *    and verifies every tracked file on disk still hashes to its
+     *    indexed OID. Doesn't check for untracked files — real `git
+     *    worktree remove` does, but for MVP we trust the user to pass
+     *    --force when they intentionally leave stray files behind. */
+    if (!force && stat(abs_target, &st) == 0) {
+        snprintf(idx_path, sizeof(idx_path), "%s/index", wt_dir);
+        if (stat(idx_path, &st) == 0 &&
+            index_read(&wt_index, idx_path) == 0) {
+            unsigned long clean = worktree_is_clean(repo, abs_target, &wt_index);
+            index_destroy(&wt_index);
+            if (clean != 0) {
+                fprintf(stderr,
+                    "error: worktree at '%s' has modifications "
+                    "(line %lu); pass --force to remove anyway\n",
+                    abs_target, clean);
+                return 1;
+            }
+        }
+    }
+
+    /* 5. Delete the working directory first (files + .git gitfile), then
+     *    the metadata dir. Order matters: if the gitfile is gone before
+     *    the metadata, we might confuse `list` in the unlikely window.
+     *    Both operations are best-effort; we report if either leaves
+     *    residue. */
+    if (stat(abs_target, &st) == 0) {
+        if (rm_rf_dir(abs_target) != 0) {
+            fprintf(stderr,
+                "warning: could not fully remove '%s' "
+                "(files may remain — check permissions)\n", abs_target);
+        }
+    }
+    if (rm_rf_dir(wt_dir) != 0) {
+        fprintf(stderr,
+            "warning: could not fully remove metadata at '%s'\n", wt_dir);
+        return 1;
+    }
+
+    printf("Removed worktree '%s' (%s)\n", abs_target, wt_id);
+    return 0;
+}
+
+static int cmd_worktree_prune(gut_repo *repo) {
+    char wt_base[2048];
+    char wt_dir[2048];
+    char gd_path[2048];
+    char line[2048];
+    DIR *d;
+    struct dirent *de;
+    FILE *fp;
+    struct stat st;
+    u64 pruned = 0;
+
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    d = opendir(wt_base);
+    if (!d) {
+        printf("No worktrees to prune.\n");
+        return 0;
+    }
+
+    while ((de = readdir(d)) != NULL) {
+        int stale = 0;
+        if (de->d_name[0] == '.') continue;
+        snprintf(wt_dir, sizeof(wt_dir), "%s/%s", wt_base, de->d_name);
+        snprintf(gd_path, sizeof(gd_path), "%s/gitdir", wt_dir);
+
+        fp = fopen(gd_path, "r");
+        if (!fp) {
+            /* Metadata with no gitdir pointer — broken entry, prune it. */
+            stale = 1;
+        } else {
+            if (fgets(line, sizeof(line), fp)) {
+                u64 L = strlen(line);
+                while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+                /* The gitdir file points at `<target>/.git` — if the
+                 * gitfile is gone (worktree deleted by hand), the
+                 * metadata is stale. */
+                if (line[0] && stat(line, &st) != 0) stale = 1;
+            } else {
+                stale = 1;   /* empty gitdir file */
+            }
+            fclose(fp);
+        }
+
+        if (stale) {
+            if (rm_rf_dir(wt_dir) == 0) {
+                printf("Pruned stale worktree metadata: %s\n", de->d_name);
+                pruned++;
+            } else {
+                fprintf(stderr,
+                    "warning: could not remove %s (files may remain)\n", wt_dir);
+            }
+        }
+    }
+    closedir(d);
+
+    if (pruned == 0) printf("Nothing to prune.\n");
+    return 0;
+}
+
 static int cmd_worktree(int argc, char **argv) {
     gut_repo repo;
     char cwd[2048];
@@ -1063,7 +1317,7 @@ static int cmd_worktree(int argc, char **argv) {
 
     if (argc == 0) {
         fprintf(stderr, "usage: gut worktree <subcommand> [args]\n"
-                        "  subcommands: add <path> <branch> | list\n");
+                        "  subcommands: add <path> <branch> | list | remove [--force] <path> | prune\n");
         return 1;
     }
     sub = argv[0];
@@ -1088,9 +1342,29 @@ static int cmd_worktree(int argc, char **argv) {
     if (strcmp(sub, "list") == 0) {
         return cmd_worktree_list(&repo);
     }
+    if (strcmp(sub, "remove") == 0) {
+        int force = 0;
+        const char *target = NULL;
+        int i;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) {
+                force = 1;
+            } else if (!target) {
+                target = argv[i];
+            }
+        }
+        if (!target) {
+            fprintf(stderr, "usage: gut worktree remove [--force] <path>\n");
+            return 1;
+        }
+        return cmd_worktree_remove(&repo, target, force);
+    }
+    if (strcmp(sub, "prune") == 0) {
+        return cmd_worktree_prune(&repo);
+    }
 
     fprintf(stderr, "usage: gut worktree <subcommand> [args]\n"
-                    "  subcommands: add <path> <branch> | list\n");
+                    "  subcommands: add <path> <branch> | list | remove [--force] <path> | prune\n");
     return 1;
 }
 
