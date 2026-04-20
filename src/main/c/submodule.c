@@ -508,7 +508,7 @@ unsigned long submodules_update_all(gut_repo *parent, int recursive) {
         }
 
         snprintf(sub_git_dir, sizeof(sub_git_dir),
-                 "%s/modules/%s", parent->git_dir, list[i].name);
+                 "%s/modules/%s", parent->common_dir, list[i].name);
         snprintf(sub_work_dir, sizeof(sub_work_dir),
                  "%s/%s", parent->root_dir, list[i].path);
         rc = build_gitfile_relative(gitfile_rel, sizeof(gitfile_rel),
@@ -528,7 +528,7 @@ unsigned long submodules_update_all(gut_repo *parent, int recursive) {
         {
             char cfg_path[2048];
             FILE *cf;
-            snprintf(cfg_path, sizeof(cfg_path), "%s/config", parent->git_dir);
+            snprintf(cfg_path, sizeof(cfg_path), "%s/config", parent->common_dir);
             cf = fopen(cfg_path, "a");
             if (cf) {
                 fprintf(cf, "[submodule \"%s\"]\n\turl = %s\n",

@@ -73,11 +73,12 @@ unsigned long cred_helper_store(const char *helper_name,
 unsigned long cred_helper_erase(const char *helper_name,
                                 const gut_cred_request *req);
 
-/* Read `credential.helper` from `<git_dir>/config`. Writes the helper
+/* Read `credential.helper` from `<common_dir>/config`. Writes the helper
  * name into `out`. Returns 0 on success, non-zero if the key isn't
- * set or the config can't be read. */
+ * set or the config can't be read. Pass `repo.common_dir` (not git_dir)
+ * since config is shared across worktrees. */
 unsigned long cred_helper_from_config(char *out, u64 out_sz,
-                                      const char *git_dir);
+                                      const char *common_dir);
 
 /* Parse a URL like "https://github.com/user/repo" into the fields of
  * a gut_cred_request. The `username` field is filled if the URL

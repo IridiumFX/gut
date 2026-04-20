@@ -7,7 +7,12 @@
 
 typedef struct {
     char          root_dir[1024];     /* working directory */
-    char          git_dir[1024];      /* .git directory */
+    char          git_dir[1024];      /* per-worktree git dir: HEAD, index, logs/HEAD,
+                                       * rebase/bisect state, *_HEAD markers */
+    char          common_dir[1024];   /* shared git dir: refs, objects, config, hooks,
+                                       * info, packed-refs, logs/refs, worktrees/. Equals
+                                       * git_dir for the main worktree; for secondary
+                                       * worktrees, points at the main repo's .git/. */
     gut_odb       odb;
     gut_hash_algo hash_algo;          /* read from [extensions] objectformat; SHA-1 default */
 } gut_repo;

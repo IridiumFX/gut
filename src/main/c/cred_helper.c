@@ -107,15 +107,15 @@ unsigned long cred_request_from_url(gut_cred_request *out, const char *url) {
  * ==================================================================== */
 
 unsigned long cred_helper_from_config(char *out, u64 out_sz,
-                                      const char *git_dir) {
+                                      const char *common_dir) {
     char cp[2048];
     gut_config cfg;
     const char *v = NULL;
 
     if (!out) return __LINE__;
-    if (!git_dir) return __LINE__;
+    if (!common_dir) return __LINE__;
 
-    snprintf(cp, sizeof(cp), "%s/config", git_dir);
+    snprintf(cp, sizeof(cp), "%s/config", common_dir);
     if (config_read(&cfg, cp)) return __LINE__;
 
     if (config_get(&v, &cfg, "credential", "helper") != 0 || !v) {

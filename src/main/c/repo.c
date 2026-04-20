@@ -83,14 +83,31 @@ static unsigned long resolve_git_dir(char *out, u64 out_size,
     return 0;
 }
 
-/* Read .git/config and return the configured object hash algo, or
- * GUT_HASH_SHA1 if not set. */
-static gut_hash_algo read_hash_algo(const char *git_dir) {
+/* Return the correct base directory for a ref filename. Refs under
+ * `refs/...` live in the shared common_dir (all worktrees see the same
+ * branches/tags). Everything else — HEAD, ORIG_HEAD, FETCH_HEAD,
+ * MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD — is per-worktree state
+ * and lives in git_dir. */
+static const char *ref_base_dir(gut_repo *repo, const char *ref) {
+    if (strncmp(ref, "refs/", 5) == 0) return repo->common_dir;
+    return repo->git_dir;
+}
+
+/* Same for reflogs. logs/HEAD is per-worktree; logs/refs/... is shared. */
+static const char *reflog_base_dir(gut_repo *repo, const char *ref_path_rel) {
+    if (strncmp(ref_path_rel, "refs/", 5) == 0) return repo->common_dir;
+    return repo->git_dir;
+}
+
+/* Read <common_dir>/config and return the configured object hash algo, or
+ * GUT_HASH_SHA1 if not set. Takes common_dir because config is shared across
+ * worktrees. */
+static gut_hash_algo read_hash_algo(const char *common_dir) {
     char cfg_path[2048];
     gut_config cfg;
     const char *v = NULL;
     gut_hash_algo algo = GUT_HASH_SHA1;
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config", git_dir);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", common_dir);
     if (config_read(&cfg, cfg_path) != 0) return algo;
     if (config_get(&v, &cfg, "extensions", "objectformat") == 0 && v) {
         if (strcmp(v, "sha256") == 0) algo = GUT_HASH_SHA256;
@@ -99,13 +116,83 @@ static gut_hash_algo read_hash_algo(const char *git_dir) {
     return algo;
 }
 
+/* Resolve a secondary worktree's commondir pointer. If `<git_dir>/commondir`
+ * exists, it contains a (usually relative) path to the main `.git/`. Returns
+ * 0 on success with the resolved absolute path in `out`; returns non-zero
+ * if there's no commondir file (i.e., this is the main worktree — the
+ * caller should alias common_dir to git_dir in that case). */
+static unsigned long read_commondir(char *out, u64 out_size, const char *git_dir) {
+    char cd_path[2048];
+    FILE *fp;
+    char line[1024];
+    u64 L;
+
+    snprintf(cd_path, sizeof(cd_path), "%s/commondir", git_dir);
+    fp = fopen(cd_path, "r");
+    if (!fp) return __LINE__;
+    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return __LINE__; }
+    fclose(fp);
+
+    L = strlen(line);
+    while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+    if (L == 0) return __LINE__;
+
+    /* Absolute path (Unix-style leading /, or Windows drive letter). */
+    if (line[0] == '/' || (L > 1 && line[1] == ':')) {
+        if (L >= out_size) return __LINE__;
+        memcpy(out, line, L + 1);
+    } else {
+        /* Relative: rooted at git_dir. */
+        int n = snprintf(out, (size_t)out_size, "%s/%s", git_dir, line);
+        if (n < 0 || (u64)n >= out_size) return __LINE__;
+    }
+
+    /* Normalize separators. */
+    {
+        char *p;
+        for (p = out; *p; p++) if (*p == '\\') *p = '/';
+    }
+
+    /* Collapse `/x/..` segments in place. Each iteration finds the
+     * leftmost `..` with a non-`..` predecessor and removes both.
+     * This lets paths printed to users look sane (.git instead of
+     * .git/worktrees/<id>/../..) and keeps all downstream snprintf
+     * concatenations shorter. */
+    {
+        for (;;) {
+            char *dd = strstr(out, "/..");
+            char *prev_start;
+            char *p;
+            if (!dd) break;
+            if (dd[3] != '/' && dd[3] != '\0') break;
+            /* Find the start of the segment preceding `/..` */
+            if (dd == out) break;
+            prev_start = dd - 1;
+            while (prev_start > out && *prev_start != '/') prev_start--;
+            if (*prev_start != '/') break;
+            /* Don't collapse if the segment itself is ".." */
+            if (dd - prev_start == 3 &&
+                prev_start[1] == '.' && prev_start[2] == '.') break;
+            /* Shift everything from dd+3 onward to prev_start. */
+            p = dd + 3;
+            while ((*prev_start++ = *p++) != '\0') {}
+        }
+        /* Drop trailing slash (if any) unless the whole path is "/". */
+        {
+            u64 L = strlen(out);
+            if (L > 1 && out[L - 1] == '/') out[L - 1] = '\0';
+        }
+    }
+    return 0;
+}
+
 /* Read .git/config and, if this repo is a partial clone, copy the promisor
  * remote's URL into `out` (empty string if none). The flow is:
  *   [extensions] partialclone = <remote-name>
  *   [remote "<remote-name>"] url = <url>
  *   [remote "<remote-name>"] promisor = true   (for sanity)
  */
-static void read_promisor_url(char *out, u64 out_size, const char *git_dir) {
+static void read_promisor_url(char *out, u64 out_size, const char *common_dir) {
     char cfg_path[2048];
     char remote_section[128];
     gut_config cfg;
@@ -113,7 +200,7 @@ static void read_promisor_url(char *out, u64 out_size, const char *git_dir) {
     const char *url = NULL;
 
     out[0] = '\0';
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config", git_dir);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", common_dir);
     if (config_read(&cfg, cfg_path) != 0) return;
 
     if (config_get(&remote_name, &cfg, "extensions", "partialclone") != 0 || !remote_name) {
@@ -290,6 +377,9 @@ unsigned long repo_init(gut_repo *out, const char *path) {
     if (strlen(git_dir) >= sizeof(out->git_dir)) return __LINE__;
     memcpy(out->git_dir, git_dir, strlen(git_dir) + 1);
 
+    /* Main-worktree case: common_dir aliases git_dir. */
+    memcpy(out->common_dir, git_dir, strlen(git_dir) + 1);
+
     snprintf(sub, sizeof(sub), "%s/objects", git_dir);
     rc = odb_open(&out->odb, sub);
     if (rc) return __LINE__;
@@ -319,13 +409,21 @@ unsigned long repo_open(gut_repo *out, const char *path) {
         rc = resolve_git_dir(out->git_dir, sizeof(out->git_dir), candidate);
         if (rc) return __LINE__;
 
-        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->git_dir);
+        /* If `<git_dir>/commondir` exists, this is a secondary worktree;
+         * shared state lives in the pointed-to main .git/. Otherwise
+         * common_dir aliases git_dir. */
+        if (read_commondir(out->common_dir, sizeof(out->common_dir),
+                           out->git_dir) != 0) {
+            memcpy(out->common_dir, out->git_dir, strlen(out->git_dir) + 1);
+        }
+
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->common_dir);
         rc = odb_open(&out->odb, obj_dir);
         if (rc) return __LINE__;
-        out->hash_algo = read_hash_algo(out->git_dir);
+        out->hash_algo = read_hash_algo(out->common_dir);
         out->odb.hash_algo = out->hash_algo;
         read_promisor_url(out->odb.promisor_url, sizeof(out->odb.promisor_url),
-                          out->git_dir);
+                          out->common_dir);
         return 0;
     }
 
@@ -346,11 +444,18 @@ unsigned long repo_open(gut_repo *out, const char *path) {
                                      candidate);
                 if (rc) return __LINE__;
 
-                snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->git_dir);
+                if (read_commondir(out->common_dir, sizeof(out->common_dir),
+                                   out->git_dir) != 0) {
+                    memcpy(out->common_dir, out->git_dir, strlen(out->git_dir) + 1);
+                }
+
+                snprintf(obj_dir, sizeof(obj_dir), "%s/objects", out->common_dir);
                 rc = odb_open(&out->odb, obj_dir);
                 if (rc) return __LINE__;
-                out->hash_algo = read_hash_algo(out->git_dir);
+                out->hash_algo = read_hash_algo(out->common_dir);
                 out->odb.hash_algo = out->hash_algo;
+                read_promisor_url(out->odb.promisor_url, sizeof(out->odb.promisor_url),
+                                  out->common_dir);
                 return 0;
             }
 
@@ -421,8 +526,8 @@ unsigned long repo_resolve_ref(gut_oid *out, gut_repo *repo, const char *ref) {
         if (rc == 0) return 0;
     }
 
-    /* Try as a file under .git/ */
-    n = snprintf(path, sizeof(path), "%s/%s", repo->git_dir, ref);
+    /* Try as a file under .git/ or the shared common_dir, depending on ref. */
+    n = snprintf(path, sizeof(path), "%s/%s", ref_base_dir(repo, ref), ref);
     if (n < 0 || (u64)n >= sizeof(path)) return __LINE__;
 
     fp = fopen(path, "r");
@@ -481,7 +586,7 @@ static void resolve_identity(char *name, u64 name_sz,
     if (!e) e = getenv("GIT_AUTHOR_EMAIL");
 
     if (!n || !e) {
-        snprintf(config_path, sizeof(config_path), "%s/config", repo->git_dir);
+        snprintf(config_path, sizeof(config_path), "%s/config", repo->common_dir);
         if (config_read(&cfg, config_path) == 0) {
             have_cfg = 1;
             if (!n) {
@@ -550,7 +655,7 @@ static unsigned long reflog_append_one(gut_repo *repo, const char *ref_path_rel,
     int line_len;
 
     n = snprintf(log_path, sizeof(log_path), "%s/logs/%s",
-                 repo->git_dir, ref_path_rel);
+                 reflog_base_dir(repo, ref_path_rel), ref_path_rel);
     if (n < 0 || (u64)n >= sizeof(log_path)) return __LINE__;
 
     /* Ensure parent directory exists (e.g. logs/refs/heads/). */
@@ -655,7 +760,7 @@ unsigned long repo_update_ref(gut_repo *repo, const char *ref,
         (void)have_old;
     }
 
-    n = snprintf(path, sizeof(path), "%s/%s", repo->git_dir, ref);
+    n = snprintf(path, sizeof(path), "%s/%s", ref_base_dir(repo, ref), ref);
     if (n < 0 || (u64)n >= sizeof(path)) return __LINE__;
     n = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
     if (n < 0 || (u64)n >= sizeof(lock_path)) return __LINE__;

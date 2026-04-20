@@ -133,9 +133,9 @@ static unsigned long take_snapshot(ref_snapshot *out, gut_repo *repo) {
     const char *ref_prefixes[3];
     int i;
 
-    snprintf(base_dirs[0], sizeof(base_dirs[0]), "%s/refs/heads",   repo->git_dir);
-    snprintf(base_dirs[1], sizeof(base_dirs[1]), "%s/refs/tags",    repo->git_dir);
-    snprintf(base_dirs[2], sizeof(base_dirs[2]), "%s/refs/remotes", repo->git_dir);
+    snprintf(base_dirs[0], sizeof(base_dirs[0]), "%s/refs/heads",   repo->common_dir);
+    snprintf(base_dirs[1], sizeof(base_dirs[1]), "%s/refs/tags",    repo->common_dir);
+    snprintf(base_dirs[2], sizeof(base_dirs[2]), "%s/refs/remotes", repo->common_dir);
     ref_prefixes[0] = "refs/heads";
     ref_prefixes[1] = "refs/tags";
     ref_prefixes[2] = "refs/remotes";
@@ -894,7 +894,7 @@ static int peer_handshake_step(int idx, const char *required_token) {
                     u64 n;
 
                     snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack",
-                             g_listen_repo->git_dir);
+                             g_listen_repo->common_dir);
                     if (pack_write(pack_hex, pack_dir, &g_listen_repo->odb,
                                    objects.items, objects.count) != 0) {
                         free(objects.items);
@@ -1521,7 +1521,7 @@ static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name
             char pack_path[2048];
             FILE *fp;
 
-            snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo->git_dir);
+            snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo->common_dir);
 #ifdef _WIN32
             _mkdir(pack_dir);
 #else
@@ -1554,9 +1554,9 @@ static unsigned long leech_fetch_and_store(gut_repo *repo, const char *peer_name
         if (strncmp(ref_name, "refs/heads/", 11) == 0) branch = ref_name + 11;
         else if (strncmp(ref_name, "refs/tags/", 10) == 0) branch = ref_name + 10;
 
-        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/leech/%s", repo->git_dir, peer_name);
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/leech/%s", repo->common_dir, peer_name);
         /* Recursive mkdir */
-        snprintf(tmp, sizeof(tmp), "%s/refs/leech", repo->git_dir);
+        snprintf(tmp, sizeof(tmp), "%s/refs/leech", repo->common_dir);
 #ifdef _WIN32
         _mkdir(tmp);
         _mkdir(ref_dir);

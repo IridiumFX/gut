@@ -228,7 +228,7 @@ static int cmd_init(int argc, char **argv) {
     if (algo == GUT_HASH_SHA256) {
         char cfg_path[2048];
         FILE *fp;
-        snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.git_dir);
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.common_dir);
         fp = fopen(cfg_path, "w");
         if (fp) {
             fputs("[core]\n"
@@ -356,7 +356,7 @@ static int cmd_clone(int argc, char **argv) {
     if (refs.hash_algo == GUT_HASH_SHA256 || filter_spec) {
         char cfg_path[2048];
         FILE *cf;
-        snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.git_dir);
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.common_dir);
         cf = fopen(cfg_path, "w");
         if (cf) {
             fputs("[core]\n"
@@ -417,7 +417,7 @@ static int cmd_clone(int argc, char **argv) {
                filter_spec ? ", filter=" : "",
                filter_spec ? filter_spec : "");
         snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-clone.pack",
-                 repo.git_dir);
+                 repo.common_dir);
 
         {
             gut_oid *shallows = NULL;
@@ -441,7 +441,7 @@ static int cmd_clone(int argc, char **argv) {
                 FILE *sf;
                 u64 si;
                 unsigned hex_len = gut_oid_hex_size(repo.hash_algo);
-                snprintf(sh_path, sizeof(sh_path), "%s/shallow", repo.git_dir);
+                snprintf(sh_path, sizeof(sh_path), "%s/shallow", repo.common_dir);
                 sf = fopen(sh_path, "w");
                 if (sf) {
                     for (si = 0; si < n_shallows; si++) {
@@ -463,7 +463,7 @@ static int cmd_clone(int argc, char **argv) {
     {
         char pack_to_index[2048];
         snprintf(pack_to_index, sizeof(pack_to_index),
-                 "%s/objects/pack/gut-clone.pack", repo.git_dir);
+                 "%s/objects/pack/gut-clone.pack", repo.common_dir);
         if (pack_index_create_algo(pack_to_index, NULL, repo.hash_algo) != 0) {
             fprintf(stderr, "warning: pack indexing failed\n");
         }
@@ -474,7 +474,7 @@ static int cmd_clone(int argc, char **argv) {
             char promisor_path[2048];
             FILE *mf;
             snprintf(promisor_path, sizeof(promisor_path),
-                     "%s/objects/pack/gut-clone.promisor", repo.git_dir);
+                     "%s/objects/pack/gut-clone.promisor", repo.common_dir);
             mf = fopen(promisor_path, "w");
             if (mf) fclose(mf);
         }
@@ -493,7 +493,7 @@ static int cmd_clone(int argc, char **argv) {
             FILE *fp;
 
             /* Remote tracking ref */
-            snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+            snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.common_dir);
             ensure_parent_dirs(ref_dir);
 #ifdef _WIN32
             _mkdir(ref_dir);
@@ -502,7 +502,7 @@ static int cmd_clone(int argc, char **argv) {
 #endif
 
             snprintf(ref_path, sizeof(ref_path), "%s/refs/remotes/origin/%s",
-                     repo.git_dir, refs.refs[i].name + 11);
+                     repo.common_dir, refs.refs[i].name + 11);
             oid_to_hex_n(ref_content, &refs.refs[i].oid, hex_len);
             ref_content[hex_len] = '\n';
             ref_content[hex_len + 1] = '\0';
@@ -522,7 +522,7 @@ static int cmd_clone(int argc, char **argv) {
                                      "%s", refs.refs[i].name + 11);
                             /* Create local branch */
                             snprintf(ref_path, sizeof(ref_path), "%s/%s",
-                                     repo.git_dir, refs.refs[i].name);
+                                     repo.common_dir, refs.refs[i].name);
                             fp = fopen(ref_path, "w");
                             if (fp) { fputs(ref_content, fp); fclose(fp); }
                             break;
@@ -535,7 +535,7 @@ static int cmd_clone(int argc, char **argv) {
             char ref_content[GUT_OID_MAX_HEX_SIZE + 2];
             FILE *fp;
 
-            snprintf(ref_path, sizeof(ref_path), "%s/%s", repo.git_dir, refs.refs[i].name);
+            snprintf(ref_path, sizeof(ref_path), "%s/%s", repo.common_dir, refs.refs[i].name);
             oid_to_hex_n(ref_content, &refs.refs[i].oid, hex_len);
             ref_content[hex_len] = '\n';
             ref_content[hex_len + 1] = '\0';
@@ -560,7 +560,7 @@ static int cmd_clone(int argc, char **argv) {
     {
         char config_path[2048];
         FILE *fp;
-        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
         fp = fopen(config_path, "a");
         if (fp) {
             fprintf(fp, "[remote \"origin\"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n", url);
@@ -724,7 +724,7 @@ static int worktree_branch_in_use(gut_repo *repo, const char *branch) {
     }
 
     /* Per-worktree HEADs under .git/worktrees/<id>/HEAD */
-    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->common_dir);
     d = opendir(wt_base);
     if (!d) return 0;
     while ((de = readdir(d)) != NULL) {
@@ -852,7 +852,7 @@ static int cmd_worktree_add(gut_repo *repo, const char *path,
         worktree_sanitize_id(wt_id);
         if (wt_id[0] == 0) snprintf(wt_id, sizeof(wt_id), "worktree");
     }
-    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->git_dir, wt_id);
+    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->common_dir, wt_id);
     if (stat(wt_dir, &st) == 0) {
         fprintf(stderr, "error: worktree id '%s' already exists at '%s' "
                         "(pick a different target path)\n",
@@ -970,28 +970,56 @@ static int cmd_worktree_list(gut_repo *repo) {
     struct dirent *de;
     FILE *fp;
 
-    /* Main worktree first. */
+    /* Main worktree first. `root_dir` is our own CWD's root, which is
+     * the secondary worktree when we're invoked from inside one — so we
+     * derive the main root from `common_dir` by stripping the trailing
+     * `/.git`. */
     {
+        char main_root[1024];
         char hex[GUT_OID_MAX_HEX_SIZE + 1];
-        char hr[256];
-        if (repo_head_ref(hr, sizeof(hr), repo) == 0) {
-            gut_oid o;
-            unsigned hlen = gut_oid_hex_size(repo->hash_algo);
-            if (repo_resolve_ref(&o, repo, hr) == 0) {
-                oid_to_hex_n(hex, &o, hlen);
-                hex[hlen] = 0;
-                printf("%-40s %.*s [%s]\n",
-                       repo->root_dir, 7, hex,
-                       strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
-            } else {
-                printf("%-40s <unborn> [%s]\n", repo->root_dir,
-                       strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
+        char main_head_path[2048];
+        char hr[256] = "";
+        gut_oid o;
+        unsigned hlen = gut_oid_hex_size(repo->hash_algo);
+        u64 cdL;
+
+        snprintf(main_root, sizeof(main_root), "%s", repo->common_dir);
+        cdL = strlen(main_root);
+        if (cdL >= 5 && strcmp(main_root + cdL - 5, "/.git") == 0) {
+            main_root[cdL - 5] = '\0';
+        }
+
+        /* Read the main worktree's HEAD directly from common_dir/HEAD
+         * rather than repo_head_ref (which reads our git_dir's HEAD). */
+        snprintf(main_head_path, sizeof(main_head_path), "%s/HEAD", repo->common_dir);
+        {
+            FILE *mhf = fopen(main_head_path, "r");
+            if (mhf) {
+                if (fgets(hr, sizeof(hr), mhf)) {
+                    u64 L = strlen(hr);
+                    while (L && (hr[L - 1] == '\n' || hr[L - 1] == '\r')) hr[--L] = 0;
+                    if (strncmp(hr, "ref: ", 5) == 0) {
+                        memmove(hr, hr + 5, strlen(hr + 5) + 1);
+                    }
+                }
+                fclose(mhf);
             }
+        }
+
+        if (hr[0] && repo_resolve_ref(&o, repo, hr) == 0) {
+            oid_to_hex_n(hex, &o, hlen);
+            hex[hlen] = 0;
+            printf("%-40s %.*s [%s]\n",
+                   main_root, 7, hex,
+                   strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
+        } else if (hr[0]) {
+            printf("%-40s <unborn> [%s]\n", main_root,
+                   strncmp(hr, "refs/heads/", 11) == 0 ? hr + 11 : hr);
         }
     }
 
     /* Secondary worktrees. */
-    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->common_dir);
     d = opendir(wt_base);
     if (!d) return 0;
     while ((de = readdir(d)) != NULL) {
@@ -1109,7 +1137,7 @@ static int worktree_find_by_path(char *wt_id, u64 wt_id_size,
     FILE *fp;
 
     snprintf(expected, sizeof(expected), "%s/.git", target);
-    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->common_dir);
     d = opendir(wt_base);
     if (!d) return 1;
 
@@ -1203,10 +1231,10 @@ static int cmd_worktree_remove(gut_repo *repo, const char *path, int force) {
         fprintf(stderr,
                 "error: '%s' is not a registered worktree of this repository\n"
                 "  (expected %s/worktrees/<id>/gitdir to reference it)\n",
-                abs_target, repo->git_dir);
+                abs_target, repo->common_dir);
         return 1;
     }
-    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->git_dir, wt_id);
+    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", repo->common_dir, wt_id);
 
     /* 4. Cleanliness check unless forced. Reads the per-worktree index
      *    and verifies every tracked file on disk still hashes to its
@@ -1262,7 +1290,7 @@ static int cmd_worktree_prune(gut_repo *repo) {
     struct stat st;
     u64 pruned = 0;
 
-    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->git_dir);
+    snprintf(wt_base, sizeof(wt_base), "%s/worktrees", repo->common_dir);
     d = opendir(wt_base);
     if (!d) {
         printf("No worktrees to prune.\n");
@@ -1675,7 +1703,7 @@ static void op_handle_offer_patch(u64 peer_id, const char *json) {
         time_t now_ts = time(NULL);
 
         snprintf(sent_dir, sizeof(sent_dir), "%s/offers-sent",
-                 g_op_repo->git_dir);
+                 g_op_repo->common_dir);
         sd = opendir(sent_dir);
         if (sd) {
             while ((sde = readdir(sd)) != NULL) {
@@ -1821,7 +1849,7 @@ static void op_handle_offer_patch(u64 peer_id, const char *json) {
         time_t now = time(NULL);
         FILE *ofp;
 
-        snprintf(offers_dir, sizeof(offers_dir), "%s/offers", g_op_repo->git_dir);
+        snprintf(offers_dir, sizeof(offers_dir), "%s/offers", g_op_repo->common_dir);
 #ifdef _WIN32
         _mkdir(offers_dir);
 #else
@@ -1965,7 +1993,7 @@ static void srv_collect_refs(srv_ref **out, u64 *count, gut_repo *repo,
     DIR *d;
     struct dirent *de;
     unsigned hex_len = gut_oid_hex_size(repo->hash_algo);
-    snprintf(dir, sizeof(dir), "%s/refs/%s", repo->git_dir, subdir);
+    snprintf(dir, sizeof(dir), "%s/refs/%s", repo->common_dir, subdir);
     d = opendir(dir);
     if (!d) return;
     while ((de = readdir(d)) != NULL) {
@@ -2295,7 +2323,7 @@ static int srv_handle_receive_pack(srv_io *io, gut_repo *repo,
                 FILE *fp;
 
                 snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack",
-                         repo->git_dir);
+                         repo->common_dir);
 #ifdef _WIN32
                 _mkdir(pack_dir);
 #else
@@ -2359,7 +2387,7 @@ static int srv_handle_receive_pack(srv_io *io, gut_repo *repo,
         if (c_new_zero == 0) {
             /* Delete */
             char ref_file[2048];
-            snprintf(ref_file, sizeof(ref_file), "%s/%s", repo->git_dir, u->name);
+            snprintf(ref_file, sizeof(ref_file), "%s/%s", repo->common_dir, u->name);
             if (remove(ref_file) == 0) {
                 u->ok = 1;
             } else {
@@ -2461,7 +2489,7 @@ static int srv_handle_upload_pack(srv_io *io, gut_repo *repo,
     }
 
     /* Write a temp pack */
-    snprintf(tmp_pack_dir, sizeof(tmp_pack_dir), "%s/objects/pack", repo->git_dir);
+    snprintf(tmp_pack_dir, sizeof(tmp_pack_dir), "%s/objects/pack", repo->common_dir);
     if (pack_write(pack_hex, tmp_pack_dir, &repo->odb,
                    closure.ids, closure.n) != 0) {
         free(closure.ids);
@@ -3720,7 +3748,7 @@ static int cmd_offer_patch(const char *url, const char *path,
         char sent_dir[2048];
         FILE *sfp;
         time_t now_ts = time(NULL);
-        snprintf(sent_dir, sizeof(sent_dir), "%s/offers-sent", repo.git_dir);
+        snprintf(sent_dir, sizeof(sent_dir), "%s/offers-sent", repo.common_dir);
 #ifdef _WIN32
         _mkdir(sent_dir);
 #else
@@ -3906,7 +3934,7 @@ static int cmd_offers(int argc, char **argv) {
     if (repo_open(&repo, cwd) != 0) {
         fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n"); return 1;
     }
-    snprintf(offers_dir, sizeof(offers_dir), "%s/offers", repo.git_dir);
+    snprintf(offers_dir, sizeof(offers_dir), "%s/offers", repo.common_dir);
 
     /* Subcommand: apply */
     if (sub && strcmp(sub, "apply") == 0) {
@@ -4179,7 +4207,7 @@ static int cmd_config(int argc, char **argv) {
     if (repo_open(&repo, cwd) != 0) {
         fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n"); return 1;
     }
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.git_dir);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.common_dir);
 
     /* --list: dump every key as section[.sub].name=value */
     if (list_mode) {
@@ -4415,7 +4443,7 @@ static int cmd_remote(int argc, char **argv) {
     if (repo_open(&repo, cwd) != 0) {
         fprintf(stderr, "error: not a gut repository (run 'gut init' to create one)\n"); return 1;
     }
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.git_dir);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo.common_dir);
 
     /* ---- list ---- */
     if (strcmp(sub, "list") == 0 || argc == 0) {
@@ -4678,7 +4706,7 @@ static int cmd_repack(int argc, char **argv) {
     hex_len = gut_oid_hex_size(repo.hash_algo);
     name_len = hex_len - 2; /* filename = full hex minus 2-char dir prefix */
 
-    snprintf(objects_dir, sizeof(objects_dir), "%s/objects", repo.git_dir);
+    snprintf(objects_dir, sizeof(objects_dir), "%s/objects", repo.common_dir);
     snprintf(pack_dir, sizeof(pack_dir), "%s/pack", objects_dir);
 
     /* Walk .git/objects/XX/YYY... directories collecting all loose OIDs */
@@ -4835,7 +4863,7 @@ static int cmd_pack_objects(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.git_dir);
+    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.common_dir);
     rc = pack_write(pack_hex, pack_dir, &repo.odb, oids, count);
     free(oids);
     if (rc) {
@@ -4916,7 +4944,7 @@ static int cmd_fetch(int argc, char **argv) {
         gut_config cfg;
         char config_path[2048];
         const char *v;
-        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
         if (config_read(&cfg, config_path) == 0) {
             if (!url && config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
                 snprintf(url_buf, sizeof(url_buf), "%s", v);
@@ -4959,7 +4987,7 @@ static int cmd_fetch(int argc, char **argv) {
         DIR *d;
         struct dirent *ent;
         u64 have_cap = 32;
-        snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.git_dir);
+        snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.common_dir);
         haves = (gut_oid *)malloc(have_cap * sizeof(gut_oid));
         if (!haves) return 1;
 
@@ -5022,7 +5050,7 @@ static int cmd_fetch(int argc, char **argv) {
     printf("Fetching %llu new commits (with %llu haves)...\n",
            (unsigned long long)want_count, (unsigned long long)have_count);
 
-    snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-fetch.pack", repo.git_dir);
+    snprintf(pack_path, sizeof(pack_path), "%s/objects/pack/gut-fetch.pack", repo.common_dir);
     rc = remote_fetch_pack_algo(url, wants, want_count, haves, have_count, pack_path,
                                 0, NULL, NULL, repo.hash_algo, filter_spec);
     free(wants);
@@ -5041,7 +5069,7 @@ static int cmd_fetch(int argc, char **argv) {
         char promisor_path[2048];
         FILE *mf;
         snprintf(promisor_path, sizeof(promisor_path),
-                 "%s/objects/pack/gut-fetch.promisor", repo.git_dir);
+                 "%s/objects/pack/gut-fetch.promisor", repo.common_dir);
         mf = fopen(promisor_path, "w");
         if (mf) fclose(mf);
     }
@@ -5049,7 +5077,7 @@ static int cmd_fetch(int argc, char **argv) {
     /* Update remote tracking refs: refs/remotes/origin/* */
     {
         char ref_dir[2048];
-        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.common_dir);
 #ifdef _WIN32
         _mkdir(ref_dir);
 #else
@@ -5295,7 +5323,7 @@ static int cmd_push(int argc, char **argv) {
         gut_config cfg;
         char config_path[2048];
         const char *v;
-        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
         if (config_read(&cfg, config_path) == 0) {
             if (config_get(&v, &cfg, "remote \"origin\"", "url") == 0) {
                 snprintf(url_buf, sizeof(url_buf), "%s", v);
@@ -5397,7 +5425,7 @@ static int cmd_push(int argc, char **argv) {
 
         /* Write pack to pack dir with path hints so basename clustering
          * improves delta compression across same-file versions. */
-        snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.git_dir);
+        snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", repo.common_dir);
         rc = pack_write_hinted(pack_hex, pack_dir, &repo.odb,
                                objects.items, (const char **)objects.paths,
                                objects.count);
@@ -5465,18 +5493,18 @@ static int cmd_push(int argc, char **argv) {
         FILE *fp;
         unsigned hex_len = gut_oid_hex_size(repo.hash_algo);
 
-        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.git_dir);
+        snprintf(ref_dir, sizeof(ref_dir), "%s/refs/remotes/origin", repo.common_dir);
 #ifdef _WIN32
         {
             char tmp[2048];
-            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.git_dir);
+            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.common_dir);
             _mkdir(tmp);
             _mkdir(ref_dir);
         }
 #else
         {
             char tmp[2048];
-            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.git_dir);
+            snprintf(tmp, sizeof(tmp), "%s/refs/remotes", repo.common_dir);
             mkdir(tmp, 0755);
             mkdir(ref_dir, 0755);
         }
@@ -6017,7 +6045,7 @@ static int cmd_branch(int argc, char **argv) {
             }
         }
 
-        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, name);
+        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.common_dir, name);
         if (remove(ref_path) != 0) {
             fprintf(stderr, "error: branch '%s' not found\n", name);
             return 1;
@@ -6031,7 +6059,7 @@ static int cmd_branch(int argc, char **argv) {
         const char *name = argv[0];
         struct stat st;
 
-        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, name);
+        snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.common_dir, name);
         if (stat(ref_path, &st) == 0) {
             fprintf(stderr, "fatal: a branch named '%s' already exists\n", name);
             return 1;
@@ -6109,7 +6137,7 @@ static int cmd_branches(int argc, char **argv) {
         ctx.current = head_ref + 11;
     }
 
-    snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.git_dir);
+    snprintf(heads_dir, sizeof(heads_dir), "%s/refs/heads", repo.common_dir);
     list_dir(heads_dir, print_branch, &ctx);
 
     return 0;
@@ -6142,7 +6170,7 @@ static int cmd_tag(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(ref_path, sizeof(ref_path), "%s/refs/tags/%s", repo.git_dir, argv[0]);
+    snprintf(ref_path, sizeof(ref_path), "%s/refs/tags/%s", repo.common_dir, argv[0]);
     if (stat(ref_path, &st) == 0) {
         fprintf(stderr, "fatal: tag '%s' already exists\n", argv[0]);
         return 1;
@@ -6208,7 +6236,7 @@ static int cmd_tags(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(tags_dir, sizeof(tags_dir), "%s/refs/tags", repo.git_dir);
+    snprintf(tags_dir, sizeof(tags_dir), "%s/refs/tags", repo.common_dir);
     list_dir(tags_dir, print_tag, NULL);
 
     return 0;
@@ -6350,7 +6378,7 @@ static int cmd_checkout(int argc, char **argv) {
     }
 
     /* Verify target branch exists */
-    snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.git_dir, argv[0]);
+    snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/%s", repo.common_dir, argv[0]);
     if (stat(ref_path, &st) != 0) {
         fprintf(stderr, "error: branch '%s' not found\n", argv[0]);
         return 1;
@@ -6524,9 +6552,9 @@ static unsigned long feeling_collect_walk(feeling_peer **out, u64 *count,
 
     if (rel_dir_after_leech && *rel_dir_after_leech) {
         snprintf(full_dir, sizeof(full_dir), "%s/refs/leech/%s",
-                 repo->git_dir, rel_dir_after_leech);
+                 repo->common_dir, rel_dir_after_leech);
     } else {
-        snprintf(full_dir, sizeof(full_dir), "%s/refs/leech", repo->git_dir);
+        snprintf(full_dir, sizeof(full_dir), "%s/refs/leech", repo->common_dir);
     }
 
     d = opendir(full_dir);
@@ -7200,7 +7228,7 @@ static int cmd_commit(int argc, char **argv) {
     }
 
     /* Write tree from index */
-    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.common_dir);
     rc = index_write_tree(&tree_oid, &idx, obj_dir);
     index_destroy(&idx);
     if (rc) {
@@ -7228,7 +7256,7 @@ static int cmd_commit(int argc, char **argv) {
     if (!author_name || !author_email) {
         gut_config cfg;
         char config_path[2048];
-        snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+        snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
         if (config_read(&cfg, config_path) == 0) {
             if (!author_name) {
                 const char *v;
@@ -7388,7 +7416,7 @@ static int cmd_log(int argc, char **argv) {
     {
         char sh_path[2048];
         FILE *sf;
-        snprintf(sh_path, sizeof(sh_path), "%s/shallow", repo.git_dir);
+        snprintf(sh_path, sizeof(sh_path), "%s/shallow", repo.common_dir);
         sf = fopen(sh_path, "r");
         if (sf) {
             char line[128];
@@ -7674,7 +7702,10 @@ static int cmd_reflog(int argc, char **argv) {
 
     hex_len = gut_oid_hex_size(repo.hash_algo);
 
-    snprintf(log_path, sizeof(log_path), "%s/logs/%s", repo.git_dir, ref);
+    /* logs/HEAD is per-worktree; logs/refs/... is shared. */
+    snprintf(log_path, sizeof(log_path), "%s/logs/%s",
+             strncmp(ref, "refs/", 5) == 0 ? repo.common_dir : repo.git_dir,
+             ref);
 
     fp = fopen(log_path, "rb");
     if (!fp) {
@@ -7802,7 +7833,7 @@ static int cmd_credential_test(int argc, char **argv) {
         snprintf(helper, sizeof(helper), "%s", env_helper);
     } else if (gut_getcwd(cwd, sizeof(cwd)) && repo_open(&repo, cwd) == 0) {
         in_repo = 1;
-        if (cred_helper_from_config(helper, sizeof(helper), repo.git_dir) != 0) {
+        if (cred_helper_from_config(helper, sizeof(helper), repo.common_dir) != 0) {
             helper[0] = '\0';
         }
     }
@@ -8426,7 +8457,7 @@ static int cmd_amend(int argc, char **argv) {
     rc = index_read(&idx, index_path);
     if (rc) { commit_destroy(&old_commit); return 1; }
 
-    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.common_dir);
     rc = index_write_tree(&tree_oid, &idx, obj_dir);
     index_destroy(&idx);
     if (rc) { commit_destroy(&old_commit); return 1; }
@@ -8600,7 +8631,7 @@ static int cmd_squash(int argc, char **argv) {
     if (index_read(&idx, index_path) != 0) {
         commit_destroy(&head_commit); buf_destroy(&msg_buf); return 1;
     }
-    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.common_dir);
     rc = index_write_tree(&tree_oid, &idx, obj_dir);
     index_destroy(&idx);
     if (rc) { commit_destroy(&head_commit); buf_destroy(&msg_buf); return 1; }
@@ -9371,7 +9402,7 @@ static int run_hook(gut_repo *repo, const char *name, int abort_on_fail) {
 
     if (getenv("GUT_SKIP_HOOKS")) return 0;
 
-    snprintf(path, sizeof(path), "%s/hooks/%s", repo->git_dir, name);
+    snprintf(path, sizeof(path), "%s/hooks/%s", repo->common_dir, name);
     if (stat(path, &st) != 0) return 0;
 #ifndef _WIN32
     if (!(st.st_mode & S_IXUSR)) return 0;
@@ -9470,7 +9501,7 @@ static int stash_save(gut_repo *repo) {
     }
 
     /* Check: if snapshot tree equals HEAD tree, nothing to stash. */
-    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo->git_dir);
+    snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo->common_dir);
     rc = index_write_tree(&tree_oid, &idx, obj_dir);
     if (rc) {
         index_destroy(&idx); commit_destroy(&head_commit);
@@ -9527,7 +9558,7 @@ static int stash_save(gut_repo *repo) {
     }
 
     /* Write refs/stashes/<ts> */
-    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->git_dir);
+    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->common_dir);
 #ifdef _WIN32
     _mkdir(stash_dir);
 #else
@@ -9581,7 +9612,7 @@ static int stash_find_latest(gut_repo *repo, char *name_out, u64 name_cap,
     long best_ts = -1;
     char best_name[128] = {0};
 
-    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->git_dir);
+    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->common_dir);
     d = opendir(stash_dir);
     if (!d) return 0;
     while ((de = readdir(d)) != NULL) {
@@ -9644,7 +9675,7 @@ static int stash_pop(gut_repo *repo) {
 
     /* Delete the stash ref */
     snprintf(ref_file, sizeof(ref_file), "%s/refs/stashes/%s",
-             repo->git_dir, name);
+             repo->common_dir, name);
     remove(ref_file);
 
     printf("popped stash %s — restored to working tree + index\n", name);
@@ -9657,7 +9688,7 @@ static int stash_list(gut_repo *repo) {
     struct dirent *de;
     int count = 0;
 
-    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->git_dir);
+    snprintf(stash_dir, sizeof(stash_dir), "%s/refs/stashes", repo->common_dir);
     d = opendir(stash_dir);
     if (!d) { printf("no stashes\n"); return 0; }
     while ((de = readdir(d)) != NULL) {
@@ -9747,7 +9778,9 @@ static int cmd_undo(int argc, char **argv) {
     if (commit.parent_count == 0) {
         /* Root commit — remove the ref to go back to unborn state */
         char ref_path[2048];
-        snprintf(ref_path, sizeof(ref_path), "%s/%s", repo.git_dir, head_ref);
+        snprintf(ref_path, sizeof(ref_path), "%s/%s",
+                 strncmp(head_ref, "refs/", 5) == 0 ? repo.common_dir : repo.git_dir,
+                 head_ref);
         remove(ref_path);
         commit_destroy(&commit);
         printf("Undone root commit. Branch is now empty.\n");
@@ -10497,7 +10530,7 @@ static int cmd_merge(int argc, char **argv) {
         }
 
         /* Write merge tree and commit */
-        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.common_dir);
         index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
         index_write(&merged_idx, index_path);
         index_destroy(&merged_idx);
@@ -10516,7 +10549,7 @@ static int cmd_merge(int argc, char **argv) {
             if (!author_name || !author_email) {
                 gut_config cfg;
                 char config_path[2048];
-                snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+                snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
                 if (config_read(&cfg, config_path) == 0) {
                     const char *v;
                     if (!author_name && config_get(&v, &cfg, "user", "name") == 0)
@@ -10917,7 +10950,7 @@ static int cmd_cherry_pick(int argc, char **argv) {
                 return 1;
             }
 
-            snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.git_dir);
+            snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo.common_dir);
             index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
             index_write(&merged_idx, index_path);
             index_destroy(&merged_idx);
@@ -10948,7 +10981,7 @@ static int cmd_cherry_pick(int argc, char **argv) {
                 if (!committer_email) committer_email = getenv("GIT_AUTHOR_EMAIL");
                 if (!committer_name || !committer_email) {
                     char config_path[2048];
-                    snprintf(config_path, sizeof(config_path), "%s/config", repo.git_dir);
+                    snprintf(config_path, sizeof(config_path), "%s/config", repo.common_dir);
                     if (config_read(&cfg, config_path) == 0) {
                         const char *v;
                         have_cfg = 1;
@@ -11338,7 +11371,7 @@ static int rebase_apply_pick(gut_repo *repo,
             return 1;
         }
 
-        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo->git_dir);
+        snprintf(obj_dir, sizeof(obj_dir), "%s/objects", repo->common_dir);
         index_write_tree(&merge_tree_oid, &merged_idx, obj_dir);
         index_write(&merged_idx, index_path);
         index_destroy(&merged_idx);
@@ -11363,7 +11396,7 @@ static int rebase_apply_pick(gut_repo *repo,
             if (!ce) ce = getenv("GIT_AUTHOR_EMAIL");
             if (!cn || !ce) {
                 char cp[2048];
-                snprintf(cp, sizeof(cp), "%s/config", repo->git_dir);
+                snprintf(cp, sizeof(cp), "%s/config", repo->common_dir);
                 if (config_read(&cfg, cp) == 0) {
                     const char *v;
                     have_cfg = 1;
@@ -12029,7 +12062,7 @@ static int meld_commits(gut_repo *repo, const char *head_ref,
     if (!ce) ce = getenv("GIT_AUTHOR_EMAIL");
     if (!cn || !ce) {
         char cp[2048];
-        snprintf(cp, sizeof(cp), "%s/config", repo->git_dir);
+        snprintf(cp, sizeof(cp), "%s/config", repo->common_dir);
         if (config_read(&cfg, cp) == 0) {
             const char *v;
             have_cfg = 1;
