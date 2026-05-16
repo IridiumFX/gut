@@ -29,6 +29,8 @@
 #define gut_getcwd(buf, size) _getcwd(buf, size)
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #define gut_getcwd(buf, size) getcwd(buf, size)
 #endif
 
@@ -7286,7 +7288,7 @@ static int cmd_commit(int argc, char **argv) {
             }
         }
 #else
-        tz_offset = tm_info->tm_gmtoff / 60;
+        { struct tm *tm_info = localtime(&now); if (tm_info) tz_offset = tm_info->tm_gmtoff / 60; }
 #endif
         snprintf(timestamp, sizeof(timestamp), "%lld %+03ld%02ld",
                  (long long)now, tz_offset / 60, labs(tz_offset) % 60);
