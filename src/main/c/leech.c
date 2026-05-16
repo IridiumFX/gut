@@ -12,6 +12,10 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
